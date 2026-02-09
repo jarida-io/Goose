@@ -1,0 +1,90 @@
+name: Upstream Drift Detection
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  drift-detection:
+    runs-on: ubuntu-latest
+    name: Detect Upstream Divergence
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config --global user.email "jarida-bot@example.com"
+          git config --global user.name "Jarida Bot"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/block/goose.git || true
+          git fetch upstream main
+          git fetch origin main
+
+      - name: Calculate drift metrics
+        id: drift
+        run: |
+          ahead=$(git rev-list --count upstream/main..origin/main)
+          behind=$(git rev-list --count origin/main..upstream/main)
+
+          echo "ahead=$ahead" >> $GITHUB_OUTPUT
+          echo "behind=$behind" >> $GITHUB_OUTPUT
+
+          echo "## Drift Detection Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commits ahead of upstream**: $ahead" >> $GITHUB_STEP_SUMMARY
+          echo "**Commits behind upstream**: $behind" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$behind" -gt 5 ]; then
+            echo "⚠️ **WARNING**: jarida/main is more than 5 commits behind upstream/main. Consider syncing." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: List commits ahead
+        run: |
+          echo "## Commits in jarida ahead of upstream:" >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+          git log --oneline upstream/main..origin/main >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+
+      - name: List commits behind
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Commits in upstream ahead of jarida:" >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+          git log --oneline origin/main..upstream/main | head -20 >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create issue if drift is significant
+        if: steps.drift.outputs.behind > 5
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const behind = ${{ steps.drift.outputs.behind }};
+
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔄 Upstream Drift Detected: ${behind} commits behind`,
+              body: `
+              ### Upstream Drift Alert
+              
+              The jarida/main branch is **${behind} commits behind** upstream/main.
+              
+              **Action Required**: Consider syncing with upstream to prevent merge conflicts.
+              
+              **How to sync**:
+              \`\`\`bash
+              git fetch upstream
+              git merge upstream/main
+              git push origin main
+              \`\`\`
+              `,
+              labels: ['maintenance', 'upstream-sync'],
+              assignees: ['Exile10']
+            });

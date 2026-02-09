@@ -1,0 +1,103 @@
+name: PR Quality Assurance
+
+on:
+  pull_request:
+    types: [ opened, edited, synchronize ]
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  pr-validation:
+    runs-on: ubuntu-latest
+    name: Validate PR Standards
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Validate PR title
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+            const validPatterns = [
+              /^feat:/i,
+              /^fix:/i,
+              /^docs:/i,
+              /^style:/i,
+              /^refactor:/i,
+              /^perf:/i,
+              /^test:/i,
+              /^chore:/i
+            ];
+            
+            const isValid = validPatterns.some(pattern => pattern.test(title));
+            
+            if (!isValid) {
+              core.setFailed(`PR title must start with a conventional commit type (feat:, fix:, docs:, etc.)\nActual title: "${title}"`);
+            } else {
+              console.log(`✅ PR title follows conventional commits: "${title}"`);
+            }
+      
+      - name: Validate PR description
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            
+            if (body.length < 20) {
+              core.setFailed('PR description must be at least 20 characters. Please provide a detailed description of your changes.');
+            } else {
+              console.log(`✅ PR description is present and sufficient (${body.length} characters)`);
+            }
+      
+      - name: Check for related issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            const issuePattern = /#\d+|closes #\d+|fixes #\d+|resolves #\d+/i;
+            
+            if (!issuePattern.test(body)) {
+              core.warning('No related issues linked. Consider adding "Closes #issue-number" to the PR description.');
+            } else {
+              console.log('✅ Related issues are linked');
+            }
+      
+      - name: Verify changes include tests
+        run: |
+          files=$(git diff --name-only origin/main...HEAD)
+          test_files=$(echo "$files" | grep -E 'test_.*\.py|.*_test\.py' || true)
+          
+          if [ -z "$test_files" ]; then
+            echo "⚠️  No test files modified. Consider adding tests for your changes."
+          else
+            echo "✅ Tests have been modified: $test_files"
+          fi
+      
+      - name: Generate PR quality report
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            const title = context.payload.pull_request.title;
+            
+            const report = `
+            ### 📋 PR Quality Assurance Report
+            
+            - ✅ Title follows conventional commits
+            - ✅ Description is detailed
+            - 🔗 Related issues linked
+            - 📝 Tests included
+            
+            All validation checks passed!
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });

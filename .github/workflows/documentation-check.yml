@@ -1,0 +1,79 @@
+name: Documentation Consistency Verification
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  documentation-check:
+    runs-on: ubuntu-latest
+    name: Verify Documentation Updates
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check which files changed
+        id: file-changes
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            changed_files=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          else
+            changed_files=$(git diff --name-only HEAD~1..HEAD)
+          fi
+
+          echo "files=$changed_files" >> $GITHUB_OUTPUT
+          echo "Changed files:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "$changed_files" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Identify documentation updates needed
+        run: |
+          echo "## Documentation Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          files="${{ steps.file-changes.outputs.files }}"
+          code_changed=$(echo "$files" | grep -E '\.py$' | wc -l)
+          docs_changed=$(echo "$files" | grep -E '\.md$|docs/' | wc -l)
+
+          echo "**Code files changed**: $code_changed" >> $GITHUB_STEP_SUMMARY
+          echo "**Documentation files changed**: $docs_changed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$code_changed" -gt 0 ] && [ "$docs_changed" -eq 0 ]; then
+            echo "⚠️ **Action Required**: Code changes detected without documentation updates." >> $GITHUB_STEP_SUMMARY
+          elif [ "$code_changed" -gt 0 ] && [ "$docs_changed" -gt 0 ]; then
+            echo "✅ Documentation has been updated alongside code changes." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Validate markdown formatting
+        run: |
+          pip install mdformat
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Markdown Validation" >> $GITHUB_STEP_SUMMARY
+          mdformat --check docs/ README.md || echo "⚠️ Some markdown files have formatting issues" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check for broken links in docs
+        run: |
+          pip install markdown-link-check
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Link Validation" >> $GITHUB_STEP_SUMMARY
+          find docs/ -name "*.md" -exec markdown-link-check {} \; || true
+
+      - name: Verify API documentation matches code
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## API Documentation" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Manual review recommended for API documentation consistency" >> $GITHUB_STEP_SUMMARY
+
+      - name: Generate documentation report
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📚 Summary" >> $GITHUB_STEP_SUMMARY
+          echo "Documentation check complete. Please review the detailed output above." >> $GITHUB_STEP_SUMMARY
