@@ -1,0 +1,148 @@
+name: Upstream Drift Detection
+
+on:
+  schedule:
+    # Run every Monday at 9 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  drift-detection:
+    runs-on: ubuntu-latest
+    name: Detect Upstream Divergence
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config --global user.email "ci-bot@jarida.io"
+          git config --global user.name "Jarida CI Bot"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/block/goose.git || true
+          git fetch upstream main
+          git fetch origin main
+
+      - name: Calculate drift metrics
+        id: drift
+        run: |
+          ahead=$(git rev-list --count upstream/main..origin/main)
+          behind=$(git rev-list --count origin/main..upstream/main)
+          
+          echo "ahead=$ahead" >> $GITHUB_OUTPUT
+          echo "behind=$behind" >> $GITHUB_OUTPUT
+          
+          echo "## Upstream Drift Detection Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date**: $(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commits ahead of upstream**: $ahead" >> $GITHUB_STEP_SUMMARY
+          echo "**Commits behind upstream**: $behind" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$behind" -gt 5 ]; then
+            echo "⚠️ **WARNING**: jarida/main is $behind commits behind upstream/main" >> $GITHUB_STEP_SUMMARY
+            echo "Consider syncing to prevent merge conflicts." >> $GITHUB_STEP_SUMMARY
+          elif [ "$behind" -eq 0 ]; then
+            echo "✅ **GOOD**: jarida/main is in sync with upstream/main" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **GOOD**: jarida/main is only $behind commits behind upstream" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: List commits ahead
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Commits in jarida ahead of upstream" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          git log --oneline upstream/main..origin/main | head -20 >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: List commits behind
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Latest commits in upstream (not in jarida)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          git log --oneline origin/main..upstream/main | head -20 >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create issue if drift is significant
+        if: steps.drift.outputs.behind > 5
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const behind = parseInt('${{ steps.drift.outputs.behind }}');
+            
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['upstream-sync']
+            });
+            
+            // Don't create duplicate issues
+            if (existingIssues.data.length > 0) {
+              console.log('Upstream sync issue already exists');
+              return;
+            }
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔄 Upstream Sync Needed: ${behind} commits behind block/goose`,
+              body: `## Upstream Drift Alert
+              
+The jarida/main branch is **${behind} commits behind** upstream/main from block/goose.
+
+### Action Required
+Consider syncing with upstream to prevent merge conflicts and stay up-to-date with improvements.
+
+### How to Sync
+\`\`\`bash
+# Fetch upstream changes
+git fetch upstream
+
+# Merge upstream into your branch
+git merge upstream/main
+
+# Push to jarida
+git push origin main
+\`\`\`
+
+### Latest Upstream Changes
+Run the workflow again to see the latest commits.
+
+This issue will be closed once drift is reduced.`,
+              labels: ['maintenance', 'upstream-sync'],
+              assignees: ['Exile10']
+            });
+
+      - name: Close issue if in sync
+        if: steps.drift.outputs.behind <= 5
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['upstream-sync']
+            });
+            
+            for (const issue of issues.data) {
+              if (issue.title.includes('Upstream Sync')) {
+                github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed'
+                });
+                console.log(`Closed issue #${issue.number} - in sync with upstream`);
+              }
+            }
