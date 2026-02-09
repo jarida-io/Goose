@@ -6,14 +6,18 @@ on:
   pull_request:
     branches: [main, develop]
   schedule:
-    # Run daily at 2 AM UTC
     - cron: "0 2 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   compatibility-check:
     runs-on: ubuntu-latest
     name: Test Against Block/Goose Upstream
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Code
@@ -25,11 +29,13 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          components: rustfmt, clippy
 
       - name: Install System Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y libdbus-1-dev gnome-keyring libxcb1-dev
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev gnome-keyring libxcb1-dev
+        timeout-minutes: 10
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -37,73 +43,80 @@ jobs:
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/block/goose.git || true
-          git fetch upstream main
+          git fetch upstream main --quiet
 
-      - name: Check merge compatibility
+      - name: Check upstream compatibility
+        id: compat
         run: |
-          echo "## Upstream Compatibility Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Current Branch**: $(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_STEP_SUMMARY
-          echo "**Upstream Branch**: upstream/main" >> $GITHUB_STEP_SUMMARY
+          AHEAD=$(git rev-list --count upstream/main..HEAD 2>/dev/null || echo "0")
+          BEHIND=$(git rev-list --count HEAD..upstream/main 2>/dev/null || echo "0")
 
-          # Try to merge without committing
-          git fetch upstream main
+          echo "ahead=${AHEAD}" >> "$GITHUB_OUTPUT"
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+
+          echo "## Upstream Compatibility Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Repository: Exile10/Goose" >> "$GITHUB_STEP_SUMMARY"
+          echo "Upstream: block/goose" >> "$GITHUB_STEP_SUMMARY"
+          echo "Current Branch: $(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Git Status" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commits ahead: $AHEAD" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commits behind: $BEHIND" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
           if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "**Status**: ✅ Up to date with upstream" >> $GITHUB_STEP_SUMMARY
+            echo "Status: Compatible with upstream" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "**Status**: ⚠️ Behind upstream" >> $GITHUB_STEP_SUMMARY
+            echo "Status: Behind upstream" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Commits ahead**: $(git rev-list --count upstream/main..HEAD)" >> $GITHUB_STEP_SUMMARY
-          echo "**Commits behind**: $(git rev-list --count HEAD..upstream/main)" >> $GITHUB_STEP_SUMMARY
-
-      - name: Build test
+      - name: Build with Cargo
+        id: build
         run: |
           cd crates
-          cargo build --all-targets 2>&1 | tee build.log
-          if [ ${PIPESTATUS[0]} -eq 0 ]; then
-            echo "✅ Build succeeded" >> $GITHUB_STEP_SUMMARY
+          if cargo build --all-targets --quiet; then
+            echo "Build: Success" >> "$GITHUB_STEP_SUMMARY"
+            echo "build_status=success" >> "$GITHUB_OUTPUT"
           else
-            echo "❌ Build failed" >> $GITHUB_STEP_SUMMARY
-            cat build.log
+            echo "Build: Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "build_status=failed" >> "$GITHUB_OUTPUT"
             exit 1
           fi
         env:
-          RUST_BACKTRACE: 1
+          RUST_BACKTRACE: full
+          CARGO_TERM_COLOR: always
 
       - name: Run tests
+        id: test
         run: |
           cd crates
-          cargo test --lib -- --skip scenario_tests 2>&1 | tee test.log
-          if [ ${PIPESTATUS[0]} -eq 0 ]; then
-            echo "✅ Tests passed" >> $GITHUB_STEP_SUMMARY
+          if cargo test --lib --quiet -- --skip scenario_tests; then
+            echo "Tests: Passed" >> "$GITHUB_STEP_SUMMARY"
+            echo "test_status=success" >> "$GITHUB_OUTPUT"
           else
-            echo "❌ Tests failed" >> $GITHUB_STEP_SUMMARY
-            cat test.log
+            echo "Tests: Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "test_status=failed" >> "$GITHUB_OUTPUT"
             exit 1
           fi
         env:
-          RUST_BACKTRACE: 1
+          RUST_BACKTRACE: full
           RUST_MIN_STACK: 8388608
 
-      - name: Generate compatibility summary
+      - name: Run clippy
+        if: always()
+        continue-on-error: true
+        run: |
+          cd crates
+          cargo clippy --all-targets --all-features 2>&1 | tail -20 >> "$GITHUB_STEP_SUMMARY" || true
+          echo "Clippy: Complete" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          CARGO_TERM_COLOR: always
+
+      - name: Summary
         if: always()
         run: |
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Summary" >> $GITHUB_STEP_SUMMARY
-          echo "This PR has been tested for compatibility with upstream/main" >> $GITHUB_STEP_SUMMARY
-          echo "Check the detailed logs above for any issues." >> $GITHUB_STEP_SUMMARY
-
-      - name: Comment on PR with compatibility status
-        if: github.event_name == 'pull_request' && always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const status = context.payload.pull_request ? 'Compatibility check completed' : '';
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: '## 🔄 Upstream Compatibility Check\n\nThis PR has been tested against upstream/main from block/goose.\n\nSee workflow run for detailed results.'
-            });
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "Build: ${{ steps.build.outputs.build_status || 'unknown' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tests: ${{ steps.test.outputs.test_status || 'unknown' }}" >> "$GITHUB_STEP_SUMMARY"

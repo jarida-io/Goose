@@ -13,6 +13,7 @@ jobs:
   drift-detection:
     runs-on: ubuntu-latest
     name: Detect Upstream Divergence
+    timeout-minutes: 10
 
     steps:
       - name: Checkout Code
@@ -28,8 +29,8 @@ jobs:
       - name: Add upstream remote and fetch
         run: |
           git remote add upstream https://github.com/block/goose.git || true
-          git fetch upstream main --quiet
-          git fetch origin main --quiet
+          git fetch upstream main --quiet 2>/dev/null || true
+          git fetch origin main --quiet 2>/dev/null || true
 
       - name: Calculate drift metrics
         id: drift
@@ -40,86 +41,79 @@ jobs:
           echo "ahead=${AHEAD}" >> "$GITHUB_OUTPUT"
           echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
 
-          {
-            echo "## Upstream Drift Detection Report"
-            echo ""
-            echo "**Repository**: Exile10/Goose"
-            echo "**Upstream**: block/goose"
-            echo ""
-            echo "### Drift Metrics"
-            echo "- Commits ahead: $AHEAD"
-            echo "- Commits behind: $BEHIND"
-            echo ""
-            
-            if [ "$BEHIND" -gt 5 ]; then
-              echo "### Status: BEHIND UPSTREAM"
-              echo "Your fork is $BEHIND commits behind. Consider syncing."
-            elif [ "$BEHIND" -eq 0 ]; then
-              echo "### Status: IN SYNC"
-              echo "Your fork is synchronized with upstream."
-            else
-              echo "### Status: MINOR DRIFT"
-              echo "Your fork is only $BEHIND commits behind."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "## Upstream Drift Detection Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Repository: Exile10/Goose" >> "$GITHUB_STEP_SUMMARY"
+          echo "Upstream: block/goose/main" >> "$GITHUB_STEP_SUMMARY"
+          echo "Scan Date: $(date -u +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Drift Metrics" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commits ahead: $AHEAD" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commits behind: $BEHIND" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Log commits ahead
+          if [ "$BEHIND" -gt 10 ]; then
+            echo "Status: SIGNIFICANTLY BEHIND" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$BEHIND" -gt 5 ]; then
+            echo "Status: MODERATELY BEHIND" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$BEHIND" -eq 0 ]; then
+            echo "Status: IN SYNC" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Status: MINIMAL DRIFT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: List commits ahead
         if: always()
         run: |
-          {
-            echo ""
-            echo "### Commits ahead of upstream"
-            echo ""
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          AHEAD=$(git rev-list --count upstream/main..HEAD 2>/dev/null || echo "0")
+          if [ "$AHEAD" -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Commits ahead of upstream" >> "$GITHUB_STEP_SUMMARY"
+            git log --oneline upstream/main..HEAD --max-count=20 >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "Unable to list" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-          git log --oneline upstream/main..HEAD --max-count=20 >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(none)" >> "$GITHUB_STEP_SUMMARY"
-
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Log commits behind
+      - name: List commits behind
         if: always()
         run: |
-          {
-            echo ""
-            echo "### Latest upstream commits (not in your fork)"
-            echo ""
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          BEHIND=$(git rev-list --count HEAD..upstream/main 2>/dev/null || echo "0")
+          if [ "$BEHIND" -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Latest upstream commits (not in your fork)" >> "$GITHUB_STEP_SUMMARY"
+            git log --oneline HEAD..upstream/main --max-count=20 >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "Unable to list" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-          git log --oneline HEAD..upstream/main --max-count=20 >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(none)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Add sync instructions
+        if: always()
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### How to Sync with Upstream" >> "$GITHUB_STEP_SUMMARY"
+          echo "git fetch upstream main" >> "$GITHUB_STEP_SUMMARY"
+          echo "git merge upstream/main" >> "$GITHUB_STEP_SUMMARY"
+          echo "git push origin main" >> "$GITHUB_STEP_SUMMARY"
 
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Create issue if significantly behind
+      - name: Create issue if behind
         if: steps.drift.outputs.behind > 5
         uses: actions/github-script@v7
         with:
           script: |
-            const behind = parseInt('${{ steps.drift.outputs.behind }}', 10);
-            const ahead = parseInt('${{ steps.drift.outputs.ahead }}', 10);
-
+            const behind = parseInt('${{ steps.drift.outputs.behind }}');
             const { data: issues } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
               state: 'open',
               labels: ['upstream-sync']
             });
-
             if (issues.length === 0) {
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                title: `Upstream Sync Needed: ${behind} commits behind`,
-                body: `Your fork is ${behind} commits behind block/goose/main.\n\nSync with upstream to prevent merge conflicts.\n\nGit commands:\n\`\`\`bash\ngit fetch upstream main\ngit merge upstream/main\ngit push origin main\n\`\`\``,
-                labels: ['maintenance', 'upstream-sync']
+                title: 'Upstream Sync Needed',
+                body: 'Your fork is behind upstream. Run: git fetch upstream main && git merge upstream/main && git push origin main',
+                labels: ['upstream-sync']
               });
-              console.log('Created upstream sync issue');
-            } else {
-              console.log('Upstream sync issue already exists');
             }
 
-      - name: Close sync issue if in sync
+      - name: Close issue if synced
         if: steps.drift.outputs.behind <= 5
         uses: actions/github-script@v7
         with:
@@ -130,7 +124,6 @@ jobs:
               state: 'open',
               labels: ['upstream-sync']
             });
-
             for (const issue of issues) {
               await github.rest.issues.update({
                 owner: context.repo.owner,
@@ -138,6 +131,11 @@ jobs:
                 issue_number: issue.number,
                 state: 'closed'
               });
-              console.log(`Closed issue #${issue.number}`);
             }
 
+      - name: Summary
+        if: always()
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Workflow Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "Drift: ${{ steps.drift.outputs.behind }} behind, ${{ steps.drift.outputs.ahead }} ahead" >> "$GITHUB_STEP_SUMMARY"

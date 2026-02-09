@@ -6,14 +6,18 @@ on:
   pull_request:
     branches: [main, develop]
   schedule:
-    # Run weekly on Thursday at 10 AM UTC
     - cron: "0 10 * * 4"
   workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   security-audit:
     runs-on: ubuntu-latest
     name: Audit Dependencies for Vulnerabilities
+    timeout-minutes: 20
 
     steps:
       - name: Checkout Code
@@ -28,45 +32,57 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        run: cargo install cargo-audit --quiet
+        timeout-minutes: 10
 
-      - name: Run cargo audit
+      - name: Run security audit
         id: audit
+        continue-on-error: true
         run: |
-          echo "## Security Audit Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Security Audit Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Repository: Exile10/Goose" >> "$GITHUB_STEP_SUMMARY"
+          echo "Scan Date: $(date -u +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Vulnerability Scan" >> "$GITHUB_STEP_SUMMARY"
 
-          cargo audit --json > audit-report.json 2>&1 || true
-
-          if cargo audit --deny warnings; then
-            echo "✅ No known security vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+          if cargo audit --json > audit-report.json 2>&1; then
+            echo "Status: No vulnerabilities detected" >> "$GITHUB_STEP_SUMMARY"
+            echo "audit_status=clean" >> "$GITHUB_OUTPUT"
           else
-            echo "⚠️ Security issues detected (see details below)" >> $GITHUB_STEP_SUMMARY
-            cargo audit --deny warnings || true
+            echo "Status: Vulnerabilities found" >> "$GITHUB_STEP_SUMMARY"
+            cargo audit >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+            echo "audit_status=found" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Check for outdated dependencies
+      - name: Check outdated dependencies
+        continue-on-error: true
         run: |
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Outdated Dependencies" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Outdated Dependencies" >> "$GITHUB_STEP_SUMMARY"
+          cargo install cargo-outdated --quiet 2>/dev/null || true
+          cargo outdated --exit-code 0 | head -20 >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "Check complete" >> "$GITHUB_STEP_SUMMARY"
 
-          cargo install cargo-outdated || true
-
-          if command -v cargo-outdated &> /dev/null; then
-            echo "Checking for outdated dependencies..." >> $GITHUB_STEP_SUMMARY
-            cargo outdated --exit-code 0 | head -20 >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Summary
+      - name: Generate recommendations
+        if: always()
         run: |
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Recommendations" >> $GITHUB_STEP_SUMMARY
-          echo "- Review any reported vulnerabilities" >> $GITHUB_STEP_SUMMARY
-          echo "- Update dependencies with \`cargo update\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Run \`cargo audit fix\` for automatic fixes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Recommendations" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Update dependencies regularly with: cargo update" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Run security audits before release: cargo audit" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Review dependency changes in PRs" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail on vulnerabilities in production
-        if: github.event_name == 'pull_request'
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-report
+          path: audit-report.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Fail if vulnerabilities in PR
+        if: github.event_name == 'pull_request' && steps.audit.outputs.audit_status == 'found'
         run: |
-          cargo audit
+          echo "Security vulnerabilities detected"
+          exit 1
