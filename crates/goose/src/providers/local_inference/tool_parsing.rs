@@ -78,8 +78,10 @@ pub(super) fn split_content_and_tool_calls(text: &str) -> (String, Option<String
 pub(super) fn safe_stream_end(text: &str) -> usize {
     // Hold back from the start of any incomplete <tool_call> tag.
     // If we find an unmatched opening, nothing from that point should be streamed.
-    let xml_hold = text.find("<tool_call>").unwrap_or(text.len());
+    let xml_hold    = text.find("<tool_call>").unwrap_or(text.len());
     let llama3_hold = text.find("<|tool_call|>").unwrap_or(text.len());
+    // Gemma 4 GGUF uses <|tool_call> (no trailing |) as opening tag — hold it back too.
+    let gemma4_hold = text.find("<|tool_call>").unwrap_or(text.len());
 
     let bytes = text.as_bytes();
     let mut safe_end = bytes.len();
@@ -109,7 +111,8 @@ pub(super) fn safe_stream_end(text: &str) -> usize {
     // Also hold back a partial `<tool_call` prefix at the end of the text.
     let tag1 = b"<tool_call>";
     let tag2 = b"<|tool_call|>";
-    
+    let tag3 = b"<|tool_call>";  // Gemma 4 GGUF opening tag
+
     let mut tail_hold = safe_end;
     let check_len1 = tag1.len().min(bytes.len());
     for start in (safe_end.saturating_sub(check_len1))..safe_end {
@@ -119,7 +122,7 @@ pub(super) fn safe_stream_end(text: &str) -> usize {
             break;
         }
     }
-    
+
     let check_len2 = tag2.len().min(bytes.len());
     for start in (safe_end.saturating_sub(check_len2))..safe_end {
         let tail = &bytes[start..safe_end];
@@ -129,7 +132,16 @@ pub(super) fn safe_stream_end(text: &str) -> usize {
         }
     }
 
-    safe_end.min(xml_hold).min(llama3_hold).min(tail_hold)
+    let check_len3 = tag3.len().min(bytes.len());
+    for start in (safe_end.saturating_sub(check_len3))..safe_end {
+        let tail = &bytes[start..safe_end];
+        if tag3.starts_with(tail) {
+            tail_hold = tail_hold.min(start);
+            break;
+        }
+    }
+
+    safe_end.min(xml_hold).min(llama3_hold).min(gemma4_hold).min(tail_hold)
 }
 
 /// Extract tool call messages from a JSON object containing "tool_calls".
@@ -241,10 +253,19 @@ pub(super) fn split_content_and_xml_tool_calls(
 /// Parse Llama 3.2 style tool calls:
 /// Format: `<|tool_call|>call:giap__get_current_weather{"location":"London"}<tool_call|>`
 /// or `<|tool_call|>{"name": "...", "arguments": {...}}`
+///
+/// Also handles Gemma 4 GGUF format which uses `<|tool_call>` (no trailing `|`) as the
+/// opening tag and `<tool_call|>` as the closing tag.
 pub(super) fn split_content_and_llama3_tool_calls(
     text: &str,
 ) -> Option<(String, Vec<(String, serde_json::Map<String, Value>)>)> {
-    let tag_open = "<|tool_call|>";
+    // Prefer Llama 3 format (<|tool_call|>); fall back to Gemma 4 format (<|tool_call>).
+    // Note: the two tags are distinct — "<|tool_call>" is NOT a substring of "<|tool_call|>".
+    let tag_open = if text.contains("<|tool_call|>") {
+        "<|tool_call|>"
+    } else {
+        "<|tool_call>"
+    };
     let (content, first_block_and_rest) = text.split_once(tag_open)?;
     let content = content.trim_end().to_string();
     let mut tool_calls = Vec::new();
@@ -630,6 +651,51 @@ mod tests {
         assert!(result.is_some());
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&result.unwrap()).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn test_parse_gemma4_tool_call_no_args() {
+        // Gemma 4 GGUF emits <|tool_call> (no trailing |) as opening tag
+        let text = "<|tool_call>call:giap__get_current_weather{}<tool_call|><eos><eos>";
+        let result = split_content_and_llama3_tool_calls(text);
+        assert!(result.is_some());
+        let (content, calls) = result.unwrap();
+        assert!(content.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "giap__get_current_weather");
+        assert!(calls[0].1.is_empty());
+    }
+
+    #[test]
+    fn test_parse_gemma4_tool_call_with_args() {
+        let text = "Sure!\n<|tool_call>call:giap__get_weather{\"location\":\"Nairobi\"}<tool_call|>";
+        let result = split_content_and_llama3_tool_calls(text);
+        assert!(result.is_some());
+        let (content, calls) = result.unwrap();
+        assert_eq!(content, "Sure!");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "giap__get_weather");
+        assert_eq!(calls[0].1.get("location").unwrap(), "Nairobi");
+    }
+
+    #[test]
+    fn test_llama3_format_still_works() {
+        // Ensure existing Llama 3 format is unaffected
+        let text = "<|tool_call|>call:giap__get_current_weather{\"location\":\"London\"}<tool_call|>";
+        let result = split_content_and_llama3_tool_calls(text);
+        assert!(result.is_some());
+        let (content, calls) = result.unwrap();
+        assert!(content.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "giap__get_current_weather");
+        assert_eq!(calls[0].1.get("location").unwrap(), "London");
+    }
+
+    #[test]
+    fn test_safe_stream_end_holds_back_gemma4_tag() {
+        let text = "Some text <|tool_call>call:foo{}";
+        let safe = safe_stream_end(text);
+        assert!(safe <= text.find("<|tool_call>").unwrap());
     }
 
     #[test]
