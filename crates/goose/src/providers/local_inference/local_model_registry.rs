@@ -56,11 +56,16 @@ pub struct ModelSettings {
     pub use_mlock: bool,
     pub flash_attention: Option<bool>,
     pub n_threads: Option<i32>,
-    #[serde(default)]
+    #[serde(default = "default_native_tool_calling")]
     pub native_tool_calling: bool,
     #[serde(default)]
     pub use_jinja: bool,
 }
+
+fn default_native_tool_calling() -> bool {
+    true
+}
+
 
 fn default_repeat_penalty() -> f32 {
     1.0
@@ -85,8 +90,8 @@ impl Default for ModelSettings {
             use_mlock: false,
             flash_attention: None,
             n_threads: None,
-            native_tool_calling: false,
-            use_jinja: false,
+            native_tool_calling: true,
+            use_jinja: true,
         }
     }
 }

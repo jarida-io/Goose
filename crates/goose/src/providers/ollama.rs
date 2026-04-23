@@ -316,7 +316,7 @@ impl Provider for OllamaProvider {
 
 /// Per-chunk timeout for Ollama streaming responses.
 /// If no new raw SSE data arrives within this duration, the connection is considered dead.
-const OLLAMA_CHUNK_TIMEOUT_SECS: u64 = 30;
+const OLLAMA_CHUNK_TIMEOUT_SECS: u64 = 120;
 
 /// Wraps a line stream with a per-item timeout at the raw SSE level.
 /// This detects dead connections without false-positive stalls during long

@@ -139,11 +139,10 @@ impl GooseClient {
 
     async fn set_session_id(&self, session_id: &str) {
         let mut slot = self.session_id.lock().await;
-        assert!(
-            slot.as_deref().is_none_or(|s| s == session_id),
-            "McpClient received requests from different sessions"
-        );
-        *slot = Some(session_id.to_string());
+        if slot.as_deref() != Some(session_id) {
+            tracing::debug!("McpClient session_id updated to {}", session_id);
+            *slot = Some(session_id.to_string());
+        }
     }
 
     async fn current_session_id(&self) -> Option<String> {

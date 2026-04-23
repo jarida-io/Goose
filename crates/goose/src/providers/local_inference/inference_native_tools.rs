@@ -11,6 +11,7 @@ use super::inference_engine::{
 use super::tool_parsing::{
     extract_tool_call_messages, extract_xml_tool_call_messages, safe_stream_end,
     split_content_and_tool_calls, split_content_and_xml_tool_calls,
+    split_content_and_llama3_tool_calls,
 };
 
 pub(super) fn generate_with_native_tools(
@@ -116,10 +117,15 @@ pub(super) fn generate_with_native_tools(
         |piece| {
             generated_text.push_str(piece);
 
+            let has_llama3_tc = split_content_and_llama3_tool_calls(&generated_text).is_some();
             let has_xml_tc = split_content_and_xml_tool_calls(&generated_text).is_some();
             let (content, tc) = split_content_and_tool_calls(&generated_text);
             let stream_up_to = if tc.is_some() {
                 content.len()
+            } else if has_llama3_tc {
+                split_content_and_llama3_tool_calls(&generated_text)
+                    .map(|(c, _)| c.len())
+                    .unwrap_or(0)
             } else if has_xml_tc {
                 split_content_and_xml_tool_calls(&generated_text)
                     .map(|(c, _)| c.len())
@@ -153,7 +159,10 @@ pub(super) fn generate_with_native_tools(
     )?;
 
     let (content, tool_call_msgs) =
-        if let Some((xml_content, xml_calls)) = split_content_and_xml_tool_calls(&generated_text) {
+        if let Some((llama3_content, llama3_calls)) = split_content_and_llama3_tool_calls(&generated_text) {
+            let msgs = extract_xml_tool_call_messages(llama3_calls, message_id);
+            (llama3_content, msgs)
+        } else if let Some((xml_content, xml_calls)) = split_content_and_xml_tool_calls(&generated_text) {
             let msgs = extract_xml_tool_call_messages(xml_calls, message_id);
             (xml_content, msgs)
         } else {

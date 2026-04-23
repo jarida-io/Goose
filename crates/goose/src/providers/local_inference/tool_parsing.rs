@@ -79,6 +79,7 @@ pub(super) fn safe_stream_end(text: &str) -> usize {
     // Hold back from the start of any incomplete <tool_call> tag.
     // If we find an unmatched opening, nothing from that point should be streamed.
     let xml_hold = text.find("<tool_call>").unwrap_or(text.len());
+    let llama3_hold = text.find("<|tool_call|>").unwrap_or(text.len());
 
     let bytes = text.as_bytes();
     let mut safe_end = bytes.len();
@@ -106,22 +107,29 @@ pub(super) fn safe_stream_end(text: &str) -> usize {
     }
 
     // Also hold back a partial `<tool_call` prefix at the end of the text.
-    // The tag is 11 chars; if the last N chars are a prefix of `<tool_call>`, hold them.
-    let tag = b"<tool_call>";
-    let tail_hold = {
-        let mut hold = safe_end;
-        let check_len = tag.len().min(bytes.len());
-        for start in (safe_end.saturating_sub(check_len))..safe_end {
-            let tail = &bytes[start..safe_end];
-            if tag.starts_with(tail) {
-                hold = start;
-                break;
-            }
+    let tag1 = b"<tool_call>";
+    let tag2 = b"<|tool_call|>";
+    
+    let mut tail_hold = safe_end;
+    let check_len1 = tag1.len().min(bytes.len());
+    for start in (safe_end.saturating_sub(check_len1))..safe_end {
+        let tail = &bytes[start..safe_end];
+        if tag1.starts_with(tail) {
+            tail_hold = tail_hold.min(start);
+            break;
         }
-        hold
-    };
+    }
+    
+    let check_len2 = tag2.len().min(bytes.len());
+    for start in (safe_end.saturating_sub(check_len2))..safe_end {
+        let tail = &bytes[start..safe_end];
+        if tag2.starts_with(tail) {
+            tail_hold = tail_hold.min(start);
+            break;
+        }
+    }
 
-    safe_end.min(xml_hold).min(tail_hold)
+    safe_end.min(xml_hold).min(llama3_hold).min(tail_hold)
 }
 
 /// Extract tool call messages from a JSON object containing "tool_calls".
@@ -219,6 +227,59 @@ pub(super) fn split_content_and_xml_tool_calls(
         // Try to find the next <tool_call> in what remains
         match after_close.split_once("<tool_call>") {
             Some((_between, next_remaining)) => remaining = next_remaining,
+            None => break,
+        }
+    }
+
+    if tool_calls.is_empty() {
+        None
+    } else {
+        Some((content, tool_calls))
+    }
+}
+
+/// Parse Llama 3.2 style tool calls:
+/// Format: `<|tool_call|>call:giap__get_current_weather{"location":"London"}<tool_call|>`
+/// or `<|tool_call|>{"name": "...", "arguments": {...}}`
+pub(super) fn split_content_and_llama3_tool_calls(
+    text: &str,
+) -> Option<(String, Vec<(String, serde_json::Map<String, Value>)>)> {
+    let tag_open = "<|tool_call|>";
+    let (content, first_block_and_rest) = text.split_once(tag_open)?;
+    let content = content.trim_end().to_string();
+    let mut tool_calls = Vec::new();
+
+    let mut remaining = first_block_and_rest;
+    loop {
+        // Models might use `<tool_call|>` or `</tool_call>` or `<|eot_id|>` as the closing tag
+        let close_tag = if remaining.contains("<tool_call|>") {
+            "<tool_call|>"
+        } else if remaining.contains("</tool_call>") {
+            "</tool_call>"
+        } else {
+            "<|eot_id|>"
+        };
+        let (block, after_close) = remaining.split_once(close_tag).unwrap_or((remaining, ""));
+        
+        let block = block.trim();
+        if let Some(after_call) = block.strip_prefix("call:") {
+            if let Some(brace_idx) = after_call.find('{') {
+                let func_name = after_call[..brace_idx].trim().to_string();
+                let json_str = &after_call[brace_idx..];
+                let args = serde_json::from_str(json_str).unwrap_or_default();
+                tool_calls.push((func_name, args));
+            }
+        } else {
+            // Also try plain JSON format if `call:` prefix is missing
+            if let Ok(Value::Object(map)) = serde_json::from_str(block) {
+                if let (Some(Value::String(name)), Some(Value::Object(args))) = (map.get("name"), map.get("arguments")) {
+                    tool_calls.push((name.to_string(), args.clone()));
+                }
+            }
+        }
+
+        match after_close.split_once(tag_open) {
+            Some((_, next_remaining)) => remaining = next_remaining,
             None => break,
         }
     }
