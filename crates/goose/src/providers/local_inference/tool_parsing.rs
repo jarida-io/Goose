@@ -78,7 +78,7 @@ pub(super) fn split_content_and_tool_calls(text: &str) -> (String, Option<String
 pub(super) fn safe_stream_end(text: &str) -> usize {
     // Hold back from the start of any incomplete <tool_call> tag.
     // If we find an unmatched opening, nothing from that point should be streamed.
-    let xml_hold    = text.find("<tool_call>").unwrap_or(text.len());
+    let xml_hold = text.find("<tool_call>").unwrap_or(text.len());
     let llama3_hold = text.find("<|tool_call|>").unwrap_or(text.len());
     // Gemma 4 GGUF uses <|tool_call> (no trailing |) as opening tag — hold it back too.
     let gemma4_hold = text.find("<|tool_call>").unwrap_or(text.len());
@@ -111,7 +111,7 @@ pub(super) fn safe_stream_end(text: &str) -> usize {
     // Also hold back a partial `<tool_call` prefix at the end of the text.
     let tag1 = b"<tool_call>";
     let tag2 = b"<|tool_call|>";
-    let tag3 = b"<|tool_call>";  // Gemma 4 GGUF opening tag
+    let tag3 = b"<|tool_call>"; // Gemma 4 GGUF opening tag
 
     let mut tail_hold = safe_end;
     let check_len1 = tag1.len().min(bytes.len());
@@ -141,7 +141,11 @@ pub(super) fn safe_stream_end(text: &str) -> usize {
         }
     }
 
-    safe_end.min(xml_hold).min(llama3_hold).min(gemma4_hold).min(tail_hold)
+    safe_end
+        .min(xml_hold)
+        .min(llama3_hold)
+        .min(gemma4_hold)
+        .min(tail_hold)
 }
 
 /// Extract tool call messages from a JSON object containing "tool_calls".
@@ -281,19 +285,30 @@ pub(super) fn split_content_and_llama3_tool_calls(
             "<|eot_id|>"
         };
         let (block, after_close) = remaining.split_once(close_tag).unwrap_or((remaining, ""));
-        
+
         let block = block.trim();
         if let Some(after_call) = block.strip_prefix("call:") {
             if let Some(brace_idx) = after_call.find('{') {
                 let func_name = after_call[..brace_idx].trim().to_string();
-                let json_str = &after_call[brace_idx..];
-                let args = serde_json::from_str(json_str).unwrap_or_default();
+                let raw_args = &after_call[brace_idx..];
+                // Gemma 4 uses <|"|> as string delimiters, not JSON quotes.
+                // FunctionGemma uses <escape>. Both need custom parsing.
+                let args: serde_json::Map<String, Value> =
+                    if raw_args.contains("<|\"") || raw_args.contains("<escape>") {
+                        parse_gemma_tool_args(raw_args)
+                    } else {
+                        serde_json::from_str(raw_args).unwrap_or_else(|_| {
+                            parse_gemma_tool_args(raw_args)
+                        })
+                    };
                 tool_calls.push((func_name, args));
             }
         } else {
             // Also try plain JSON format if `call:` prefix is missing
             if let Ok(Value::Object(map)) = serde_json::from_str(block) {
-                if let (Some(Value::String(name)), Some(Value::Object(args))) = (map.get("name"), map.get("arguments")) {
+                if let (Some(Value::String(name)), Some(Value::Object(args))) =
+                    (map.get("name"), map.get("arguments"))
+                {
                     tool_calls.push((name.to_string(), args.clone()));
                 }
             }
@@ -310,6 +325,97 @@ pub(super) fn split_content_and_llama3_tool_calls(
     } else {
         Some((content, tool_calls))
     }
+}
+
+/// Parse Gemma-family tool call arguments from their native format.
+///
+/// Gemma 4 uses `<|"|>` as string delimiters: `{location:<|"|>Tokyo<|"|>}`
+/// FunctionGemma uses `<escape>`: `{location:<escape>Tokyo<escape>}`
+/// Neither is valid JSON. This converts to a `serde_json::Map`.
+fn parse_gemma_tool_args(raw: &str) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    // Strip outer braces
+    let inner = raw.trim().trim_start_matches('{').trim_end_matches('}');
+    if inner.is_empty() {
+        return map;
+    }
+
+    let mut remaining = inner;
+    while !remaining.is_empty() {
+        remaining = remaining.trim_start_matches([',', ' ']);
+        if remaining.is_empty() {
+            break;
+        }
+
+        // Find key (before ':')
+        let colon = match remaining.find(':') {
+            Some(p) => p,
+            None => break,
+        };
+        let key = remaining[..colon].trim().to_string();
+        remaining = &remaining[colon + 1..];
+
+        // Gemma 4: <|"|>value<|"|>
+        let value = if remaining.starts_with("<|\"") {
+            let delim = "<|\"";
+            // Skip opening delimiter (find the closing one)
+            if let Some(start) = remaining.find("|>") {
+                remaining = &remaining[start + 2..];
+                if let Some(end) = remaining.find("<|\"") {
+                    let val = remaining[..end].to_string();
+                    // Skip past closing <|"|>
+                    if let Some(close_end) = remaining[end..].find("|>") {
+                        remaining = &remaining[end + close_end + 2..];
+                    } else {
+                        remaining = &remaining[end + delim.len()..];
+                    }
+                    Value::String(val)
+                } else {
+                    let val = remaining.to_string();
+                    remaining = "";
+                    Value::String(val)
+                }
+            } else {
+                break;
+            }
+        }
+        // FunctionGemma: <escape>value<escape>
+        else if remaining.starts_with("<escape>") {
+            remaining = &remaining["<escape>".len()..];
+            match remaining.find("<escape>") {
+                Some(end) => {
+                    let val = remaining[..end].to_string();
+                    remaining = &remaining[end + "<escape>".len()..];
+                    Value::String(val)
+                }
+                None => {
+                    let val = remaining.to_string();
+                    remaining = "";
+                    Value::String(val)
+                }
+            }
+        }
+        // Bare value: integer, boolean, or undelimited string
+        else {
+            let end = remaining.find(',').unwrap_or(remaining.len());
+            let raw_val = remaining[..end].trim();
+            remaining = &remaining[end..];
+            if let Ok(n) = raw_val.parse::<i64>() {
+                Value::Number(n.into())
+            } else if raw_val.eq_ignore_ascii_case("true") {
+                Value::Bool(true)
+            } else if raw_val.eq_ignore_ascii_case("false") {
+                Value::Bool(false)
+            } else {
+                Value::String(raw_val.to_string())
+            }
+        };
+
+        if !key.is_empty() {
+            map.insert(key, value);
+        }
+    }
+    map
 }
 
 fn parse_single_xml_tool_call(block: &str) -> Option<(String, serde_json::Map<String, Value>)> {
@@ -668,7 +774,8 @@ mod tests {
 
     #[test]
     fn test_parse_gemma4_tool_call_with_args() {
-        let text = "Sure!\n<|tool_call>call:giap__get_weather{\"location\":\"Nairobi\"}<tool_call|>";
+        let text =
+            "Sure!\n<|tool_call>call:giap__get_weather{\"location\":\"Nairobi\"}<tool_call|>";
         let result = split_content_and_llama3_tool_calls(text);
         assert!(result.is_some());
         let (content, calls) = result.unwrap();
@@ -681,7 +788,8 @@ mod tests {
     #[test]
     fn test_llama3_format_still_works() {
         // Ensure existing Llama 3 format is unaffected
-        let text = "<|tool_call|>call:giap__get_current_weather{\"location\":\"London\"}<tool_call|>";
+        let text =
+            "<|tool_call|>call:giap__get_current_weather{\"location\":\"London\"}<tool_call|>";
         let result = split_content_and_llama3_tool_calls(text);
         assert!(result.is_some());
         let (content, calls) = result.unwrap();
@@ -719,5 +827,69 @@ mod tests {
     fn test_safe_stream_end_no_braces() {
         let text = "plain text here";
         assert_eq!(safe_stream_end(text), text.len());
+    }
+
+    // ── Gemma 4 tool call format tests ──
+
+    #[test]
+    fn test_gemma4_tool_call_with_pipe_quote_delimiters() {
+        let text = r#"<|tool_call>call:get_wikipedia_article{topic:<|"|>John Cena<|"|>}<tool_call|>"#;
+        let result = split_content_and_llama3_tool_calls(text);
+        assert!(result.is_some(), "should parse Gemma 4 tool call");
+        let (content, calls) = result.unwrap();
+        assert!(content.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "get_wikipedia_article");
+        assert_eq!(calls[0].1.get("topic").unwrap().as_str().unwrap(), "John Cena");
+    }
+
+    #[test]
+    fn test_gemma4_tool_call_multiple_args() {
+        let text = r#"<|tool_call>call:get_weather{location:<|"|>Tokyo, JP<|"|>,unit:<|"|>celsius<|"|>}<tool_call|>"#;
+        let result = split_content_and_llama3_tool_calls(text);
+        assert!(result.is_some());
+        let (_, calls) = result.unwrap();
+        assert_eq!(calls[0].1.get("location").unwrap().as_str().unwrap(), "Tokyo, JP");
+        assert_eq!(calls[0].1.get("unit").unwrap().as_str().unwrap(), "celsius");
+    }
+
+    #[test]
+    fn test_gemma4_tool_call_with_content_before() {
+        let text = r#"Let me check that for you.<|tool_call>call:get_weather{location:<|"|>Nairobi<|"|>}<tool_call|>"#;
+        let result = split_content_and_llama3_tool_calls(text);
+        assert!(result.is_some());
+        let (content, calls) = result.unwrap();
+        assert_eq!(content, "Let me check that for you.");
+        assert_eq!(calls[0].1.get("location").unwrap().as_str().unwrap(), "Nairobi");
+    }
+
+    #[test]
+    fn test_gemma4_tool_call_bare_integer_arg() {
+        let text = r#"<|tool_call>call:set_temp{temperature:22,enabled:true}<tool_call|>"#;
+        let result = split_content_and_llama3_tool_calls(text);
+        assert!(result.is_some());
+        let (_, calls) = result.unwrap();
+        assert_eq!(calls[0].1.get("temperature").unwrap().as_i64().unwrap(), 22);
+        assert_eq!(calls[0].1.get("enabled").unwrap().as_bool().unwrap(), true);
+    }
+
+    #[test]
+    fn test_parse_gemma_args_pipe_quote() {
+        let args = parse_gemma_tool_args(r#"{topic:<|"|>black holes<|"|>}"#);
+        assert_eq!(args.get("topic").unwrap().as_str().unwrap(), "black holes");
+    }
+
+    #[test]
+    fn test_parse_gemma_args_escape() {
+        let args = parse_gemma_tool_args("{topic:<escape>Kenya<escape>}");
+        assert_eq!(args.get("topic").unwrap().as_str().unwrap(), "Kenya");
+    }
+
+    #[test]
+    fn test_parse_gemma_args_mixed() {
+        let args = parse_gemma_tool_args(r#"{name:<|"|>test<|"|>,count:42,active:true}"#);
+        assert_eq!(args.get("name").unwrap().as_str().unwrap(), "test");
+        assert_eq!(args.get("count").unwrap().as_i64().unwrap(), 42);
+        assert_eq!(args.get("active").unwrap().as_bool().unwrap(), true);
     }
 }

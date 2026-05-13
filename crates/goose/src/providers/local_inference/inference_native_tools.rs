@@ -10,8 +10,8 @@ use super::inference_engine::{
 };
 use super::tool_parsing::{
     extract_tool_call_messages, extract_xml_tool_call_messages, safe_stream_end,
-    split_content_and_tool_calls, split_content_and_xml_tool_calls,
-    split_content_and_llama3_tool_calls,
+    split_content_and_llama3_tool_calls, split_content_and_tool_calls,
+    split_content_and_xml_tool_calls,
 };
 
 pub(super) fn generate_with_native_tools(
@@ -158,20 +158,22 @@ pub(super) fn generate_with_native_tools(
         },
     )?;
 
-    let (content, tool_call_msgs) =
-        if let Some((llama3_content, llama3_calls)) = split_content_and_llama3_tool_calls(&generated_text) {
-            let msgs = extract_xml_tool_call_messages(llama3_calls, message_id);
-            (llama3_content, msgs)
-        } else if let Some((xml_content, xml_calls)) = split_content_and_xml_tool_calls(&generated_text) {
-            let msgs = extract_xml_tool_call_messages(xml_calls, message_id);
-            (xml_content, msgs)
-        } else {
-            let (json_content, tool_calls_json) = split_content_and_tool_calls(&generated_text);
-            let msgs = tool_calls_json
-                .map(|tc| extract_tool_call_messages(&tc, message_id))
-                .unwrap_or_default();
-            (json_content, msgs)
-        };
+    let (content, tool_call_msgs) = if let Some((llama3_content, llama3_calls)) =
+        split_content_and_llama3_tool_calls(&generated_text)
+    {
+        let msgs = extract_xml_tool_call_messages(llama3_calls, message_id);
+        (llama3_content, msgs)
+    } else if let Some((xml_content, xml_calls)) = split_content_and_xml_tool_calls(&generated_text)
+    {
+        let msgs = extract_xml_tool_call_messages(xml_calls, message_id);
+        (xml_content, msgs)
+    } else {
+        let (json_content, tool_calls_json) = split_content_and_tool_calls(&generated_text);
+        let msgs = tool_calls_json
+            .map(|tc| extract_tool_call_messages(&tc, message_id))
+            .unwrap_or_default();
+        (json_content, msgs)
+    };
 
     if content.len() > streamed_len {
         #[allow(clippy::string_slice)]

@@ -66,7 +66,6 @@ fn default_native_tool_calling() -> bool {
     true
 }
 
-
 fn default_repeat_penalty() -> f32 {
     1.0
 }
@@ -91,7 +90,7 @@ impl Default for ModelSettings {
             flash_attention: None,
             n_threads: None,
             native_tool_calling: true,
-            use_jinja: true,
+            use_jinja: false,
         }
     }
 }

@@ -86,26 +86,43 @@ pub(super) fn context_cap(
     n_ctx_train: usize,
     memory_max_ctx: Option<usize>,
 ) -> usize {
+    // 1. Explicit context_size in model settings (highest priority)
     if let Some(ctx_size) = settings.context_size {
         return ctx_size as usize;
     }
 
-    let limit = if context_limit > 0 {
-        context_limit
-    } else {
-        n_ctx_train
-    };
+    // 2. context_limit from registry or caller
+    if context_limit > 0 {
+        return context_limit.min(n_ctx_train);
+    }
 
+    // 3. GOOSE_CONTEXT_LIMIT env var — read directly as a host override.
+    //    When the host application (e.g. GIAP) sets this, it knows the
+    //    platform's memory budget and accepts the KV cache cost.
+    if let Ok(env_limit) = std::env::var("GOOSE_CONTEXT_LIMIT") {
+        if let Ok(limit) = env_limit.parse::<usize>() {
+            if limit > 0 {
+                let capped = limit.min(n_ctx_train);
+                tracing::info!(
+                    "Using GOOSE_CONTEXT_LIMIT={} (host override, memory estimate skipped)",
+                    capped,
+                );
+                return capped;
+            }
+        }
+    }
+
+    // 3. Fall back to memory-based estimation
     match memory_max_ctx {
-        Some(mem_max) if mem_max < limit => {
+        Some(mem_max) if mem_max < n_ctx_train => {
             tracing::info!(
                 "Capping context from {} to {} based on available memory",
-                limit,
+                n_ctx_train,
                 mem_max,
             );
             mem_max
         }
-        _ => limit,
+        _ => n_ctx_train,
     }
 }
 
