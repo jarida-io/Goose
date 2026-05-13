@@ -1,6 +1,9 @@
 use crate::config::paths::Paths;
 use crate::providers::api_client::{ApiClient, AuthMethod};
-use crate::providers::openai_compatible::{handle_status_openai_compat, stream_openai_compat};
+use crate::providers::oauth_device_flow::{run_device_flow, DeviceFlowConfig, RequestEncoding};
+use crate::providers::openai_compatible::{
+    handle_status, stream_openai_compat, stream_responses_compat,
+};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use axum::http;
@@ -13,57 +16,105 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::base::{Provider, ProviderDef, ProviderMetadata, ProviderUsage, Usage};
+// Task-local so complete() and stream() can't race on the same provider instance.
+tokio::task_local! {
+    static IS_AGENT_CALL: bool;
+}
+
+use super::base::{
+    collect_stream, Provider, ProviderDef, ProviderMetadata, ProviderUsage, Usage,
+    DEFAULT_PROVIDER_TIMEOUT_SECS,
+};
 use super::errors::ProviderError;
 use super::formats::openai::{create_request, get_usage, response_to_message};
+use super::formats::openai_responses::create_responses_request;
 use super::openai_compatible::handle_response_openai_compat;
 use super::retry::ProviderRetry;
-use super::utils::{get_model, ImageFormat, RequestLog};
+use super::utils::{get_model, is_openai_responses_model, ImageFormat, RequestLog};
 
 use crate::config::{Config, ConfigError};
-use crate::conversation::message::Message;
+use crate::conversation::message::{Message, MessageContent};
 
 use crate::model::ModelConfig;
 use crate::providers::base::{ConfigKey, MessageStream};
 use futures::future::BoxFuture;
-use rmcp::model::Tool;
+use rmcp::model::{RawContent, Tool};
+use std::ops::Deref;
 
 const GITHUB_COPILOT_PROVIDER_NAME: &str = "github_copilot";
 pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-4.1";
 pub const GITHUB_COPILOT_KNOWN_MODELS: &[&str] = &[
-    "gpt-4.1",
-    "gpt-5-mini",
-    "gpt-5",
-    "gpt-4o",
-    "grok-code-fast-1",
-    "gpt-5-codex",
+    "claude-haiku-4.5",
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+    "claude-opus-4.7",
     "claude-sonnet-4",
     "claude-sonnet-4.5",
-    "claude-haiku-4.5",
+    "claude-sonnet-4.6",
     "gemini-2.5-pro",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+    "gpt-4.1",
+    "gpt-4o",
+    "grok-code-fast-1",
+    "gpt-5-mini",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.5",
 ];
 
+// Models that support streaming on the /chat/completions path.
+// Models routed to /responses always stream and don't need to be listed here.
 pub const GITHUB_COPILOT_STREAM_MODELS: &[&str] = &[
     "gpt-4.1",
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-5-codex",
-    "gemini-2.5-pro",
+    "gpt-4o",
     "grok-code-fast-1",
+    "gemini-2.5-pro",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
 ];
 
 const GITHUB_COPILOT_DOC_URL: &str =
     "https://docs.github.com/en/copilot/using-github-copilot/ai-models";
-const GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
-const GITHUB_COPILOT_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
-const GITHUB_COPILOT_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
-const GITHUB_COPILOT_API_KEY_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+const DEFAULT_GITHUB_HOST: &str = "github.com";
+const DEFAULT_GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
-#[derive(Debug, Deserialize)]
-struct DeviceCodeInfo {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
+fn normalize_host(host: &str) -> String {
+    let host = host.trim_end_matches('/');
+    let host = host.strip_prefix("https://").unwrap_or(host);
+    host.to_string()
+}
+
+#[derive(Debug, Clone)]
+struct GithubCopilotUrls {
+    device_code_url: String,
+    access_token_url: String,
+    copilot_token_url: String,
+}
+
+impl GithubCopilotUrls {
+    fn new(host: &str, copilot_token_url: Option<&str>) -> Self {
+        if host == "github.com" {
+            Self {
+                device_code_url: "https://github.com/login/device/code".to_string(),
+                access_token_url: "https://github.com/login/oauth/access_token".to_string(),
+                copilot_token_url: "https://api.github.com/copilot_internal/v2/token".to_string(),
+            }
+        } else {
+            let base = format!("https://{}", host);
+            let copilot_token_url = copilot_token_url
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| format!("https://api.{}/copilot_internal/v2/token", host));
+            Self {
+                device_code_url: format!("{}/login/device/code", base),
+                access_token_url: format!("{}/login/oauth/access_token", base),
+                copilot_token_url,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -96,8 +147,13 @@ struct DiskCache {
 }
 
 impl DiskCache {
-    fn new() -> Self {
-        let cache_path = Paths::in_config_dir("githubcopilot/info.json");
+    fn new(host: &str) -> Self {
+        let cache_path = if host == DEFAULT_GITHUB_HOST {
+            Paths::in_config_dir("githubcopilot/info.json")
+        } else {
+            let safe_host = host.replace(['/', ':', '.'], "_");
+            Paths::in_config_dir(&format!("githubcopilot/{}/info.json", safe_host))
+        };
         Self { cache_path }
     }
 
@@ -138,48 +194,62 @@ pub struct GithubCopilotProvider {
     mu: tokio::sync::Mutex<RefCell<Option<CopilotState>>>,
     model: ModelConfig,
     #[serde(skip)]
+    urls: GithubCopilotUrls,
+    #[serde(skip)]
+    client_id: String,
+    #[serde(skip)]
     name: String,
 }
 
 impl GithubCopilotProvider {
     pub async fn cleanup() -> Result<()> {
-        DiskCache::new().clear().await
+        let config = Config::global();
+        let host = normalize_host(
+            &config
+                .get_param::<String>("GITHUB_COPILOT_HOST")
+                .unwrap_or_else(|_| DEFAULT_GITHUB_HOST.to_string()),
+        );
+        DiskCache::new(&host).clear().await
     }
 
-    fn payload_contains_image(payload: &Value) -> bool {
-        payload
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .is_some_and(|messages| {
-                messages.iter().any(|msg| {
-                    msg.get("content").is_some_and(|content| {
-                        content
-                            .as_array()
-                            .map(|arr| arr.iter().collect::<Vec<_>>())
-                            .unwrap_or_else(|| vec![content])
-                            .iter()
-                            .any(|item| {
-                                matches!(
-                                    item.get("type").and_then(|v| v.as_str()),
-                                    Some("image_url") | Some("image")
-                                )
-                            })
-                    })
-                })
+    fn messages_contain_image(messages: &[Message]) -> bool {
+        messages.iter().any(|m| {
+            m.content.iter().any(|c| match c {
+                MessageContent::Image(_) => true,
+                MessageContent::ToolResponse(resp) => resp.tool_result.as_ref().is_ok_and(|r| {
+                    r.content
+                        .iter()
+                        .any(|item| matches!(item.deref(), RawContent::Image(_)))
+                }),
+                _ => false,
             })
+        })
     }
 
     pub async fn from_env(model: ModelConfig) -> Result<Self> {
+        let config = Config::global();
+        let host = normalize_host(
+            &config
+                .get_param::<String>("GITHUB_COPILOT_HOST")
+                .unwrap_or_else(|_| DEFAULT_GITHUB_HOST.to_string()),
+        );
+        let client_id: String = config
+            .get_param("GITHUB_COPILOT_CLIENT_ID")
+            .unwrap_or_else(|_| DEFAULT_GITHUB_COPILOT_CLIENT_ID.to_string());
+        let copilot_token_url: Option<String> = config.get_param("GITHUB_COPILOT_TOKEN_URL").ok();
+        let urls = GithubCopilotUrls::new(&host, copilot_token_url.as_deref());
         let client = Client::builder()
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(DEFAULT_PROVIDER_TIMEOUT_SECS))
             .build()?;
-        let cache = DiskCache::new();
+        let cache = DiskCache::new(&host);
         let mu = tokio::sync::Mutex::new(RefCell::new(None));
         Ok(Self {
             client,
             cache,
             mu,
             model,
+            urls,
+            client_id,
             name: GITHUB_COPILOT_PROVIDER_NAME.to_string(),
         })
     }
@@ -187,18 +257,23 @@ impl GithubCopilotProvider {
     async fn post(
         &self,
         session_id: Option<&str>,
+        path: &str,
+        is_user_initiated: bool,
         payload: &mut Value,
+        has_images: bool,
     ) -> Result<Response, ProviderError> {
         let (endpoint, token) = self.get_api_info().await?;
         let auth = AuthMethod::BearerToken(token);
         let mut headers = self.get_github_headers();
-        if Self::payload_contains_image(payload) {
+        if has_images {
             headers.insert("Copilot-Vision-Request", "true".parse().unwrap());
         }
+        let initiator = if is_user_initiated { "user" } else { "agent" };
+        headers.insert("X-Initiator", initiator.parse().unwrap());
         let api_client = ApiClient::new(endpoint.clone(), auth)?.with_headers(headers)?;
 
         api_client
-            .response_post(session_id, "chat/completions", payload)
+            .response_post(session_id, path, payload)
             .await
             .map_err(|e| e.into())
     }
@@ -258,7 +333,7 @@ impl GithubCopilotProvider {
         };
         let resp = self
             .client
-            .get(GITHUB_COPILOT_API_KEY_URL)
+            .get(&self.urls.copilot_token_url)
             .headers(self.get_github_headers())
             .header(http::header::AUTHORIZATION, format!("bearer {}", &token))
             .send()
@@ -283,105 +358,16 @@ impl GithubCopilotProvider {
     }
 
     async fn login(&self) -> Result<String> {
-        let device_code_info = self.get_device_code().await?;
-
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            if let Err(e) = clipboard.set_text(&device_code_info.user_code) {
-                tracing::warn!("Failed to copy verification code to clipboard: {}", e);
-            }
-        }
-
-        if let Err(e) = webbrowser::open(&device_code_info.verification_uri) {
-            tracing::warn!("Failed to open browser: {}", e);
-        }
-
-        println!(
-            "Please visit {} and enter code {}",
-            device_code_info.verification_uri, device_code_info.user_code
-        );
-
-        self.poll_for_access_token(&device_code_info.device_code)
-            .await
-    }
-
-    async fn get_device_code(&self) -> Result<DeviceCodeInfo> {
-        #[derive(Serialize)]
-        struct DeviceCodeRequest {
-            client_id: String,
-            scope: String,
-        }
-        self.client
-            .post(GITHUB_COPILOT_DEVICE_CODE_URL)
-            .headers(self.get_github_headers())
-            .json(&DeviceCodeRequest {
-                client_id: GITHUB_COPILOT_CLIENT_ID.to_string(),
-                scope: "read:user".to_string(),
-            })
-            .send()
-            .await
-            .context("failed to send request to get device code")?
-            .error_for_status()
-            .context("failed to get device code")?
-            .json::<DeviceCodeInfo>()
-            .await
-            .context("failed to parse device code response")
-    }
-
-    async fn poll_for_access_token(&self, device_code: &str) -> Result<String> {
-        #[derive(Serialize)]
-        struct AccessTokenRequest {
-            client_id: String,
-            device_code: String,
-            grant_type: String,
-        }
-        #[derive(Debug, Deserialize)]
-        struct AccessTokenResponse {
-            access_token: Option<String>,
-            error: Option<String>,
-            #[serde(flatten)]
-            _extra: HashMap<String, Value>,
-        }
-
-        const MAX_ATTEMPTS: i32 = 36;
-        for attempt in 0..MAX_ATTEMPTS {
-            let resp = self
-                .client
-                .post(GITHUB_COPILOT_ACCESS_TOKEN_URL)
-                .headers(self.get_github_headers())
-                .json(&AccessTokenRequest {
-                    client_id: GITHUB_COPILOT_CLIENT_ID.to_string(),
-                    device_code: device_code.to_string(),
-                    grant_type: "urn:ietf:params:oauth:grant-type:device_code".to_string(),
-                })
-                .send()
-                .await
-                .context("failed to make request while polling for access token")?
-                .error_for_status()
-                .context("error polling for access token")?
-                .json::<AccessTokenResponse>()
-                .await
-                .context("failed to parse response while polling for access token")?;
-            if resp.access_token.is_some() {
-                tracing::trace!("successful authorization: {:#?}", resp,);
-            }
-            if let Some(access_token) = resp.access_token {
-                return Ok(access_token);
-            } else if resp
-                .error
-                .as_ref()
-                .is_some_and(|err| err == "authorization_pending")
-            {
-                tracing::debug!(
-                    "authorization pending (attempt {}/{})",
-                    attempt + 1,
-                    MAX_ATTEMPTS
-                );
-            } else {
-                tracing::debug!("unexpected response: {:#?}", resp);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        }
-        Err(anyhow!("failed to get access token"))
+        let cfg = DeviceFlowConfig {
+            device_auth_url: Some(&self.urls.device_code_url),
+            token_url: &self.urls.access_token_url,
+            client_id: &self.client_id,
+            scopes: Some("read:user"),
+            extra_headers: self.get_github_headers(),
+            encoding: RequestEncoding::Json,
+        };
+        let tokens = run_device_flow(&self.client, &cfg).await?;
+        Ok(tokens.access_token)
     }
 
     fn get_github_headers(&self) -> http::HeaderMap {
@@ -399,6 +385,139 @@ impl GithubCopilotProvider {
         headers.insert("editor-plugin-version", "copilot/1.155.0".parse().unwrap());
         headers
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_responses(
+        &self,
+        model_config: &ModelConfig,
+        session_id: &str,
+        is_user_initiated: bool,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+        has_images: bool,
+    ) -> Result<MessageStream, ProviderError> {
+        let mut payload = create_responses_request(model_config, system, messages, tools)
+            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
+        payload["stream"] = serde_json::Value::Bool(true);
+
+        let mut log = RequestLog::start(model_config, &payload)?;
+
+        let response = self
+            .with_retry(|| async {
+                let mut payload_clone = payload.clone();
+                let resp = self
+                    .post(
+                        Some(session_id),
+                        "responses",
+                        is_user_initiated,
+                        &mut payload_clone,
+                        has_images,
+                    )
+                    .await?;
+                handle_status(resp).await
+            })
+            .await
+            .inspect_err(|e| {
+                let _ = log.error(e);
+            })?;
+
+        stream_responses_compat(response, log)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_chat_completions(
+        &self,
+        model_config: &ModelConfig,
+        session_id: &str,
+        is_user_initiated: bool,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+        has_images: bool,
+    ) -> Result<MessageStream, ProviderError> {
+        let supports_streaming = GITHUB_COPILOT_STREAM_MODELS
+            .iter()
+            .any(|prefix| model_config.model_name.starts_with(prefix));
+
+        if supports_streaming {
+            let payload = create_request(
+                model_config,
+                system,
+                messages,
+                tools,
+                &ImageFormat::OpenAi,
+                true,
+            )?;
+            let mut log = RequestLog::start(model_config, &payload)?;
+
+            let response = self
+                .with_retry(|| async {
+                    let mut payload_clone = payload.clone();
+                    let resp = self
+                        .post(
+                            Some(session_id),
+                            "chat/completions",
+                            is_user_initiated,
+                            &mut payload_clone,
+                            has_images,
+                        )
+                        .await?;
+                    handle_status(resp).await
+                })
+                .await
+                .inspect_err(|e| {
+                    let _ = log.error(e);
+                })?;
+
+            stream_openai_compat(response, log)
+        } else {
+            let session_id_opt = if session_id.is_empty() {
+                None
+            } else {
+                Some(session_id)
+            };
+            let payload = create_request(
+                model_config,
+                system,
+                messages,
+                tools,
+                &ImageFormat::OpenAi,
+                false,
+            )?;
+            let mut log = RequestLog::start(model_config, &payload)?;
+
+            let response = self
+                .with_retry(|| async {
+                    let mut payload_clone = payload.clone();
+                    self.post(
+                        session_id_opt,
+                        "chat/completions",
+                        is_user_initiated,
+                        &mut payload_clone,
+                        has_images,
+                    )
+                    .await
+                })
+                .await?;
+            let response = handle_response_openai_compat(response).await?;
+
+            let response = promote_tool_choice(response);
+
+            let message = response_to_message(&response)?;
+            let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
+                tracing::debug!("Failed to get usage data");
+                Usage::default()
+            });
+            let response_model = get_model(&response);
+            log.write(&response, Some(&usage))?;
+
+            Ok(super::base::stream_from_single_message(
+                message,
+                ProviderUsage::new(response_model, usage),
+            ))
+        }
+    }
 }
 
 impl ProviderDef for GithubCopilotProvider {
@@ -412,13 +531,12 @@ impl ProviderDef for GithubCopilotProvider {
             GITHUB_COPILOT_DEFAULT_MODEL,
             GITHUB_COPILOT_KNOWN_MODELS.to_vec(),
             GITHUB_COPILOT_DOC_URL,
-            vec![ConfigKey::new_oauth_device_code(
-                "GITHUB_COPILOT_TOKEN",
-                true,
-                true,
-                None,
-                false,
-            )],
+            vec![
+                ConfigKey::new_oauth_device_code("GITHUB_COPILOT_TOKEN", true, true, None, false),
+                ConfigKey::new("GITHUB_COPILOT_HOST", false, false, None, false),
+                ConfigKey::new("GITHUB_COPILOT_CLIENT_ID", false, false, None, false),
+                ConfigKey::new("GITHUB_COPILOT_TOKEN_URL", false, false, None, false),
+            ],
         )
     }
 
@@ -440,6 +558,29 @@ impl Provider for GithubCopilotProvider {
         self.model.clone()
     }
 
+    #[tracing::instrument(
+        skip(self, model_config, session_id, system, messages, tools),
+        fields(session.id = %session_id, gen_ai.request.model = %model_config.model_name)
+    )]
+    async fn complete(
+        &self,
+        model_config: &ModelConfig,
+        session_id: &str,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<(Message, ProviderUsage), ProviderError> {
+        IS_AGENT_CALL
+            .scope(true, async {
+                collect_stream(
+                    self.stream(model_config, session_id, system, messages, tools)
+                        .await?,
+                )
+                .await
+            })
+            .await
+    }
+
     async fn stream(
         &self,
         model_config: &ModelConfig,
@@ -448,76 +589,37 @@ impl Provider for GithubCopilotProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        // Check if this model supports streaming
-        let supports_streaming = GITHUB_COPILOT_STREAM_MODELS
-            .iter()
-            .any(|prefix| model_config.model_name.starts_with(prefix));
+        let is_agent_call = IS_AGENT_CALL.try_with(|&v| v).unwrap_or(false);
+        let last_is_tool_response = messages.last().is_some_and(|m| {
+            m.content
+                .iter()
+                .any(|c| matches!(c, MessageContent::ToolResponse(_)))
+        });
+        let is_user_initiated = !is_agent_call && !last_is_tool_response;
+        let has_images = Self::messages_contain_image(messages);
 
-        if supports_streaming {
-            // Use streaming API
-            let payload = create_request(
+        if is_openai_responses_model(&model_config.model_name) {
+            self.stream_responses(
                 model_config,
+                session_id,
+                is_user_initiated,
                 system,
                 messages,
                 tools,
-                &ImageFormat::OpenAi,
-                true,
-            )?;
-            let mut log = RequestLog::start(model_config, &payload)?;
-
-            let response = self
-                .with_retry(|| async {
-                    let mut payload_clone = payload.clone();
-                    let resp = self.post(Some(session_id), &mut payload_clone).await?;
-                    handle_status_openai_compat(resp).await
-                })
-                .await
-                .inspect_err(|e| {
-                    let _ = log.error(e);
-                })?;
-
-            stream_openai_compat(response, log)
+                has_images,
+            )
+            .await
         } else {
-            // Use non-streaming API and wrap result
-            let session_id_opt = if session_id.is_empty() {
-                None
-            } else {
-                Some(session_id)
-            };
-            let payload = create_request(
+            self.stream_chat_completions(
                 model_config,
+                session_id,
+                is_user_initiated,
                 system,
                 messages,
                 tools,
-                &ImageFormat::OpenAi,
-                false,
-            )?;
-            let mut log = RequestLog::start(model_config, &payload)?;
-
-            // Make request with retry
-            let response = self
-                .with_retry(|| async {
-                    let mut payload_clone = payload.clone();
-                    self.post(session_id_opt, &mut payload_clone).await
-                })
-                .await?;
-            let response = handle_response_openai_compat(response).await?;
-
-            let response = promote_tool_choice(response);
-
-            // Parse response
-            let message = response_to_message(&response)?;
-            let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
-                tracing::debug!("Failed to get usage data");
-                Usage::default()
-            });
-            let response_model = get_model(&response);
-            log.write(&response, Some(&usage))?;
-
-            Ok(super::base::stream_from_single_message(
-                message,
-                ProviderUsage::new(response_model, usage),
-            ))
+                has_images,
+            )
+            .await
         }
     }
 
@@ -565,25 +667,20 @@ impl Provider for GithubCopilotProvider {
     async fn configure_oauth(&self) -> Result<(), ProviderError> {
         let config = Config::global();
 
-        // Check if token already exists and is valid
         if config.get_secret::<String>("GITHUB_COPILOT_TOKEN").is_ok() {
-            // Try to refresh API info to validate the token
             match self.refresh_api_info().await {
-                Ok(_) => return Ok(()), // Token is valid
+                Ok(_) => return Ok(()),
                 Err(_) => {
-                    // Token is invalid, continue with OAuth flow
                     tracing::debug!("Existing token is invalid, starting OAuth flow");
                 }
             }
         }
 
-        // Start OAuth device code flow
         let token = self
             .get_access_token()
             .await
             .map_err(|e| ProviderError::Authentication(format!("OAuth flow failed: {}", e)))?;
 
-        // Save the token
         config
             .set_secret("GITHUB_COPILOT_TOKEN", &token)
             .map_err(|e| ProviderError::ExecutionError(format!("Failed to save token: {}", e)))?;
@@ -594,10 +691,6 @@ impl Provider for GithubCopilotProvider {
 
 // Copilot sometimes returns multiple choices in a completion response for
 // Claude models and places the `tool_calls` payload in a non-zero index choice.
-// Example:
-// - Choice 0: {"finish_reason":"stop","message":{"content":"I'll check the Desktop directory…"}}
-// - Choice 1: {"finish_reason":"tool_calls","message":{"tool_calls":[{"function":{"arguments":"{\"command\":
-//   \"ls -1 ~/Desktop | wc -l\"}","name":"developer__shell"},…}]}}
 // This function ensures the first choice contains tool metadata so the shared formatter emits a
 // `ToolRequest` instead of returning only the plain-text choice.
 fn promote_tool_choice(response: Value) -> Value {
@@ -633,8 +726,65 @@ fn promote_tool_choice(response: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::promote_tool_choice;
+    use super::{normalize_host, promote_tool_choice, GithubCopilotProvider, GithubCopilotUrls};
+    use crate::providers::utils::is_openai_responses_model;
     use serde_json::json;
+
+    #[test]
+    fn responses_models_routed_correctly() {
+        assert!(is_openai_responses_model("gpt-5.5"));
+        assert!(is_openai_responses_model("gpt-5.4"));
+        assert!(is_openai_responses_model("gpt-5"));
+        assert!(is_openai_responses_model("gpt-5-mini"));
+        assert!(is_openai_responses_model("gpt-5-codex"));
+        assert!(is_openai_responses_model("o3"));
+        assert!(is_openai_responses_model("o3-mini"));
+
+        assert!(!is_openai_responses_model("gpt-4.1"));
+        assert!(!is_openai_responses_model("gpt-4o"));
+        assert!(!is_openai_responses_model("claude-sonnet-4"));
+        assert!(!is_openai_responses_model("claude-haiku-4.5"));
+        assert!(!is_openai_responses_model("gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn detects_images_in_messages() {
+        use crate::conversation::message::Message;
+
+        let messages_with_image = vec![Message::user()
+            .with_text("describe this")
+            .with_image("base64data", "image/png")];
+        assert!(GithubCopilotProvider::messages_contain_image(
+            &messages_with_image
+        ));
+
+        let messages_without_image = vec![Message::user().with_text("plain text")];
+        assert!(!GithubCopilotProvider::messages_contain_image(
+            &messages_without_image
+        ));
+    }
+
+    #[test]
+    fn detects_images_in_tool_responses() {
+        use crate::conversation::message::{Message, MessageContent};
+        use rmcp::model::{CallToolResult, Content};
+
+        let image_content = Content::image("aW1hZ2VkYXRh".to_string(), "image/png".to_string());
+        let tool_result = Ok(CallToolResult::success(vec![image_content]));
+
+        let messages =
+            vec![Message::user()
+                .with_content(MessageContent::tool_response("call_123", tool_result))];
+        assert!(GithubCopilotProvider::messages_contain_image(&messages));
+
+        let text_result = Ok(CallToolResult::success(vec![Content::text("no images")]));
+        let messages_text_only =
+            vec![Message::user()
+                .with_content(MessageContent::tool_response("call_456", text_result))];
+        assert!(!GithubCopilotProvider::messages_contain_image(
+            &messages_text_only
+        ));
+    }
 
     #[test]
     fn promotes_choice_with_tool_call() {
@@ -676,5 +826,60 @@ mod tests {
 
         let promoted = promote_tool_choice(response.clone());
         assert_eq!(promoted, response);
+    }
+
+    #[test]
+    fn normalize_host_strips_prefix_and_slash() {
+        assert_eq!(normalize_host("github.com"), "github.com");
+        assert_eq!(normalize_host("https://github.com"), "github.com");
+        assert_eq!(normalize_host("github.com/"), "github.com");
+        assert_eq!(normalize_host("https://github.com/"), "github.com");
+        assert_eq!(
+            normalize_host("https://my-enterprise.ghe.com/"),
+            "my-enterprise.ghe.com"
+        );
+    }
+
+    #[test]
+    fn urls_default_github_com() {
+        let urls = GithubCopilotUrls::new("github.com", None);
+        assert_eq!(urls.device_code_url, "https://github.com/login/device/code");
+        assert_eq!(
+            urls.access_token_url,
+            "https://github.com/login/oauth/access_token"
+        );
+        assert_eq!(
+            urls.copilot_token_url,
+            "https://api.github.com/copilot_internal/v2/token"
+        );
+    }
+
+    #[test]
+    fn urls_enterprise_host() {
+        let urls = GithubCopilotUrls::new("my-enterprise.ghe.com", None);
+        assert_eq!(
+            urls.device_code_url,
+            "https://my-enterprise.ghe.com/login/device/code"
+        );
+        assert_eq!(
+            urls.access_token_url,
+            "https://my-enterprise.ghe.com/login/oauth/access_token"
+        );
+        assert_eq!(
+            urls.copilot_token_url,
+            "https://api.my-enterprise.ghe.com/copilot_internal/v2/token"
+        );
+    }
+
+    #[test]
+    fn urls_enterprise_with_token_url_override() {
+        let urls = GithubCopilotUrls::new(
+            "my-enterprise.ghe.com",
+            Some("https://my-enterprise.ghe.com/api/v3/copilot_internal/v2/token"),
+        );
+        assert_eq!(
+            urls.copilot_token_url,
+            "https://my-enterprise.ghe.com/api/v3/copilot_internal/v2/token"
+        );
     }
 }

@@ -61,9 +61,9 @@ function validPayload(overrides = {}) {
     iat: now - 10,
     exp: now + 300,
     jti: `test-jti-${++jtiCounter}`,
-    repository: "block/goose",
+    repository: "aaif-goose/goose",
     ref: "refs/heads/main",
-    sub: "repo:block/goose:ref:refs/heads/main",
+    sub: "repo:aaif-goose/goose:ref:refs/heads/main",
     ...overrides,
   };
 }
@@ -141,7 +141,7 @@ function testEnv(overrides = {}) {
     UPSTREAM_URL: "https://api.anthropic.com",
     UPSTREAM_AUTH_HEADER: "x-api-key",
     UPSTREAM_API_KEY: "sk-ant-real-key",
-    ALLOWED_REPOS: "block/goose",
+    ALLOWED_REPOS: "aaif-goose/goose",
     MAX_TOKEN_AGE_SECONDS: "1200",
     MAX_REQUESTS_PER_TOKEN: "200",
     RATE_LIMIT_PER_SECOND: "2",
@@ -206,6 +206,62 @@ describe("rejects invalid requests", () => {
     expect(response.status).toBe(401);
     expect((await response.json()).error).toBe("Token too old");
   });
+
+  it("age cap fires independently of exp (iat past cap, exp still valid)", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await createSignedJwt(
+      validPayload({ iat: now - 1500, exp: now + 300 }),
+    );
+    const request = new Request("https://proxy.example.com/v1/messages", {
+      headers: { "x-api-key": token },
+    });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request, testEnv(), ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(401);
+    expect((await response.json()).error).toBe("Token too old");
+  });
+
+  it("rejects expired token even when MAX_TOKEN_AGE_SECONDS is set", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await createSignedJwt(
+      validPayload({ iat: now - 600, exp: now - 300 }),
+    );
+    const request = new Request("https://proxy.example.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": token, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request, testEnv(), ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(401);
+    expect((await response.json()).error).toBe("Token expired");
+  });
+
+  it("rejects expired token when MAX_TOKEN_AGE_SECONDS is unset", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await createSignedJwt(
+      validPayload({ iat: now - 600, exp: now - 300 }),
+    );
+    const request = new Request("https://proxy.example.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": token, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      request,
+      testEnv({ MAX_TOKEN_AGE_SECONDS: undefined }),
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(401);
+    expect((await response.json()).error).toBe("Token expired");
+  });
 });
 
 describe("proxies valid requests", () => {
@@ -229,7 +285,7 @@ describe("proxies valid requests", () => {
     expect((await response.json()).id).toBe("msg_123");
   });
 
-  it("accepts recently-expired token within MAX_TOKEN_AGE_SECONDS", async () => {
+  it("rejects expired token even when within MAX_TOKEN_AGE_SECONDS", async () => {
     const now = Math.floor(Date.now() / 1000);
     const token = await createSignedJwt(
       validPayload({ iat: now - 600, exp: now - 300 }),
@@ -245,7 +301,8 @@ describe("proxies valid requests", () => {
     const response = await worker.fetch(request, testEnv(), ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(401);
+    expect((await response.json()).error).toBe("Token expired");
   });
 });
 

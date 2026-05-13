@@ -101,6 +101,7 @@ export interface CreateChatWindowOptions {
 // Define the API types in a single place
 type ElectronAPI = {
   platform: string;
+  arch: string;
   reactReady: () => void;
   getConfig: () => Record<string, unknown>;
   hideWindow: () => void;
@@ -114,6 +115,17 @@ type ElectronAPI = {
   fetchMetadata: (url: string) => Promise<string>;
   reloadApp: () => void;
   checkForOllama: () => Promise<boolean>;
+  checkMesh: () => Promise<{
+    running: boolean;
+    installed: boolean;
+    models: string[];
+    token?: string;
+    peerCount?: number;
+    nodeStatus?: string;
+    binaryPath?: string;
+  }>;
+  startMesh: (args: string[]) => Promise<{ started: boolean; error?: string; pid?: number }>;
+  stopMesh: () => Promise<{ stopped: boolean }>;
   selectFileOrDirectory: (defaultPath?: string) => Promise<string | null>;
   getBinaryPath: (binaryName: string) => Promise<string>;
   readFile: (directory: string) => Promise<FileResponse>;
@@ -135,6 +147,7 @@ type ElectronAPI = {
   setSpellcheck: (enable: boolean) => Promise<boolean>;
   getSpellcheckState: () => Promise<boolean>;
   openNotificationsSettings: () => Promise<boolean>;
+  isAnyWindowFocused: () => Promise<boolean>;
   onMouseBackButtonClicked: (callback: () => void) => void;
   offMouseBackButtonClicked: (callback: () => void) => void;
   on: (
@@ -171,6 +184,8 @@ type ElectronAPI = {
   refreshApp: (app: GooseApp) => Promise<void>;
   closeApp: (appName: string) => Promise<void>;
   addRecentDir: (dir: string) => Promise<boolean>;
+  listRecentDirs: () => Promise<string[]>;
+  listGitWorktreeDirs: (dir: string) => Promise<string[]>;
 };
 
 type AppConfigAPI = {
@@ -180,6 +195,7 @@ type AppConfigAPI = {
 
 const electronAPI: ElectronAPI = {
   platform: process.platform,
+  arch: process.arch,
   reactReady: () => ipcRenderer.send('react-ready'),
   getConfig: () => {
     if (!config || Object.keys(config).length === 0) {
@@ -201,6 +217,10 @@ const electronAPI: ElectronAPI = {
   fetchMetadata: (url: string) => ipcRenderer.invoke('fetch-metadata', url),
   reloadApp: () => ipcRenderer.send('reload-app'),
   checkForOllama: () => ipcRenderer.invoke('check-ollama'),
+  checkMesh: () => ipcRenderer.invoke('check-mesh'),
+  startMesh: (args: string[]) => ipcRenderer.invoke('start-mesh', args),
+  stopMesh: () => ipcRenderer.invoke('stop-mesh'),
+
   selectFileOrDirectory: (defaultPath?: string) =>
     ipcRenderer.invoke('select-file-or-directory', defaultPath),
   getBinaryPath: (binaryName: string) => ipcRenderer.invoke('get-binary-path', binaryName),
@@ -250,6 +270,7 @@ const electronAPI: ElectronAPI = {
   setSpellcheck: (enable: boolean) => ipcRenderer.invoke('set-spellcheck', enable),
   getSpellcheckState: () => ipcRenderer.invoke('get-spellcheck-state'),
   openNotificationsSettings: () => ipcRenderer.invoke('open-notifications-settings'),
+  isAnyWindowFocused: () => ipcRenderer.invoke('is-any-window-focused'),
   onMouseBackButtonClicked: (callback: () => void) => {
     // Wrapper that ignores the event parameter.
     const wrappedCallback = (_event: Electron.IpcRendererEvent) => callback();
@@ -319,6 +340,8 @@ const electronAPI: ElectronAPI = {
   refreshApp: (app: GooseApp) => ipcRenderer.invoke('refresh-app', app),
   closeApp: (appName: string) => ipcRenderer.invoke('close-app', appName),
   addRecentDir: (dir: string) => ipcRenderer.invoke('add-recent-dir', dir),
+  listRecentDirs: () => ipcRenderer.invoke('list-recent-dirs'),
+  listGitWorktreeDirs: (dir: string) => ipcRenderer.invoke('list-git-worktree-dirs', dir),
 };
 
 const appConfigAPI: AppConfigAPI = {

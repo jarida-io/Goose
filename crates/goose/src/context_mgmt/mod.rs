@@ -188,6 +188,10 @@ pub async fn check_if_compaction_needed(
     threshold_override: Option<f64>,
     session: &crate::session::Session,
 ) -> Result<bool> {
+    if provider.manages_own_context() {
+        return Ok(false);
+    }
+
     let messages = conversation.messages();
     let config = Config::global();
     let threshold = threshold_override.unwrap_or_else(|| {
@@ -529,13 +533,17 @@ pub fn maybe_summarize_tool_pairs(
     conversation: Conversation,
     cutoff: usize,
     protect_last_n: usize,
-) -> JoinHandle<Vec<(Message, String)>> {
-    tokio::spawn(async move {
-        if !tool_pair_summarization_enabled() || provider.manages_own_context() {
-            return Vec::new();
-        }
+) -> Option<JoinHandle<Vec<(Message, String)>>> {
+    if !tool_pair_summarization_enabled() || provider.manages_own_context() {
+        return None;
+    }
 
-        let tool_ids = tool_ids_to_summarize(&conversation, cutoff, protect_last_n);
+    let tool_ids = tool_ids_to_summarize(&conversation, cutoff, protect_last_n);
+    if tool_ids.is_empty() {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
         let mut results = Vec::new();
         for tool_id in tool_ids {
             match summarize_tool_call(provider.as_ref(), &session_id, &conversation, &tool_id).await
@@ -547,7 +555,7 @@ pub fn maybe_summarize_tool_pairs(
             }
         }
         results
-    })
+    }))
 }
 
 #[cfg(test)]

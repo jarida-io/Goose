@@ -6,7 +6,7 @@
 import React from 'react';
 import { screen, render, waitFor } from '@testing-library/react';
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { AppInner } from './App';
+import { AppInner, resolveSessionInitialMessage } from './App';
 import { IntlTestWrapper } from './i18n/test-utils';
 
 // Set up globals for jsdom
@@ -60,6 +60,7 @@ vi.mock('./sessions', () => ({
     .fn()
     .mockResolvedValue({ sessionId: 'test', messages: [], metadata: { description: '' } }),
   generateSessionId: vi.fn(),
+  createSession: vi.fn(),
 }));
 
 // Mock the ConfigContext module
@@ -86,6 +87,8 @@ vi.mock('./components/ModelAndProviderContext', () => ({
     provider: null,
     model: null,
     getCurrentModelAndProvider: vi.fn(),
+    getFallbackModelAndProvider: vi.fn().mockResolvedValue({ provider: '', model: '' }),
+    refreshCurrentModelAndProvider: vi.fn().mockResolvedValue(undefined),
     setCurrentModelAndProvider: vi.fn(),
   }),
 }));
@@ -161,7 +164,7 @@ const mockElectron = {
 
 // Mock appConfig
 const mockAppConfig = {
-  get: vi.fn((key: string) => {
+  get: vi.fn((key: string): string | null => {
     if (key === 'GOOSE_WORKING_DIR') return '/test/dir';
     return null;
   }),
@@ -191,6 +194,10 @@ describe('App Component - Brand New State', () => {
     vi.clearAllMocks();
     mockNavigate.mockClear();
     mockSetSearchParams.mockClear();
+    mockAppConfig.get.mockImplementation((key: string): string | null => {
+      if (key === 'GOOSE_WORKING_DIR') return '/test/dir';
+      return null;
+    });
 
     // Reset search params
     mockSearchParams.forEach((_, key) => {
@@ -200,8 +207,6 @@ describe('App Component - Brand New State', () => {
     window.location.hash = '';
     window.location.search = '';
     window.location.pathname = '/';
-    window.sessionStorage.clear();
-    window.localStorage.clear();
   });
 
   afterEach(() => {
@@ -246,10 +251,10 @@ describe('App Component - Brand New State', () => {
       expect(mockElectron.reactReady).toHaveBeenCalled();
     });
 
-    expect(screen.getByText(/^Select an AI model provider/)).toBeInTheDocument();
+    expect(screen.getByText(/^Welcome to goose/)).toBeInTheDocument();
   });
 
-  it('should not redirect to /welcome when provider is configured', async () => {
+  it('should not redirect when provider is configured', async () => {
     // Mock provider configured
     mockElectron.getConfig.mockReturnValue({
       GOOSE_DEFAULT_PROVIDER: 'openai',
@@ -268,26 +273,19 @@ describe('App Component - Brand New State', () => {
     expect(mockNavigate).not.toHaveBeenCalled();
   });
 
-  it('should handle config recovery gracefully', async () => {
-    // Mock config error that triggers recovery
-    const { readAllConfig, recoverConfig } = await import('./api');
-    console.log(recoverConfig);
-    vi.mocked(readAllConfig).mockRejectedValueOnce(new Error('Config read error'));
-
-    mockElectron.getConfig.mockReturnValue({
-      GOOSE_DEFAULT_PROVIDER: null,
-      GOOSE_DEFAULT_MODEL: null,
-      GOOSE_ALLOWLIST_WARNING: false,
+  it('should seed recipe sessions with the recipe prompt when no initial message is provided', () => {
+    expect(
+      resolveSessionInitialMessage(
+        {
+          recipe: {
+            prompt: 'Write a release note for the latest change',
+          },
+        },
+        undefined
+      )
+    ).toEqual({
+      msg: 'Write a release note for the latest change',
+      images: [],
     });
-
-    render(<AppInner />, { wrapper: IntlTestWrapper });
-
-    // Wait for initialization and recovery
-    await waitFor(() => {
-      expect(mockElectron.reactReady).toHaveBeenCalled();
-    });
-
-    // App should still initialize without any navigation calls
-    expect(mockNavigate).not.toHaveBeenCalled();
   });
 });

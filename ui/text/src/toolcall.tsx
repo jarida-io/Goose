@@ -40,207 +40,122 @@ const STATUS_INDICATORS: Record<string, { icon: string; color: string }> = {
   failed: { icon: "✗", color: CRANBERRY },
 };
 
-function formatJsonCompact(value: unknown, maxWidth: number): string[] {
-  if (value === undefined || value === null) return [];
-  let raw: string;
+function truncateLine(line: string, maxWidth: number): string {
+  const safeMaxWidth = Math.max(maxWidth, 1);
+  if (line.length <= safeMaxWidth) return line;
+  return safeMaxWidth > 1
+    ? line.slice(0, safeMaxWidth - 1) + "…"
+    : line.slice(0, safeMaxWidth);
+}
+
+export function formatJson(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") {
+    // If it looks like JSON, try to parse and re-format; otherwise return as-is.
+    const trimmed = value.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        return JSON.stringify(JSON.parse(trimmed), null, 2);
+      } catch {
+        return value;
+      }
+    }
+    return value;
+  }
   try {
-    raw = JSON.stringify(value, null, 2);
+    return JSON.stringify(value, null, 2);
   } catch {
-    raw = String(value);
+    return String(value);
   }
-  const lines = raw.split("\n");
-  const result: string[] = [];
-  for (const line of lines) {
-    if (line.length <= maxWidth) {
-      result.push(line);
-    } else {
-      let remaining = line;
-      while (remaining.length > maxWidth) {
-        result.push(remaining.slice(0, maxWidth));
-        remaining = remaining.slice(maxWidth);
-      }
-      if (remaining) result.push(remaining);
-    }
-  }
-  return result;
 }
 
-function extractTextFromContent(content: ToolCallContent[]): string[] {
-  const lines: string[] = [];
-  for (const item of content) {
-    if (item.type === "content" && item.content) {
-      const block = item.content as any;
-      if (block.type === "text" && block.text) {
-        lines.push(...block.text.split("\n"));
-      }
-    } else if (item.type === "diff") {
-      const diff = item as any;
-      lines.push(`diff: ${diff.path || "unknown"}`);
-    } else if (item.type === "terminal") {
-      const term = item as any;
-      lines.push(`terminal: ${term.terminalId || "unknown"}`);
-    }
-  }
-  return lines;
-}
-
-function summarizeContent(info: ToolCallInfo): string {
-  const parts: string[] = [];
-
-  if (info.locations && info.locations.length > 0) {
-    for (const loc of info.locations) {
-      parts.push(loc.path + (loc.line ? `:${loc.line}` : ""));
-    }
-  }
-
-  if (info.content && info.content.length > 0) {
-    const textLines = extractTextFromContent(info.content);
-    if (textLines.length > 0) {
-      const first = textLines[0]!.trim();
-      if (first.length > 60) {
-        parts.push(first.slice(0, 57) + "…");
-      } else if (first) {
-        parts.push(first);
-      }
-    }
-  }
-
-  if (parts.length === 0 && info.rawOutput !== undefined && info.rawOutput !== null) {
-    const raw = String(
-      typeof info.rawOutput === "string" ? info.rawOutput : JSON.stringify(info.rawOutput),
-    );
-    const firstLine = raw.split("\n")[0] ?? "";
-    if (firstLine.length > 60) {
-      parts.push(firstLine.slice(0, 57) + "…");
-    } else if (firstLine) {
-      parts.push(firstLine);
-    }
-  }
-
-  return parts.join(" · ");
-}
-
-export function findFeaturedToolCallId(
-  toolCallOrder: string[],
-  toolCalls: Map<string, ToolCallInfo>,
-): string | undefined {
-  for (let i = toolCallOrder.length - 1; i >= 0; i--) {
-    const tc = toolCalls.get(toolCallOrder[i]!);
-    if (tc && (tc.status === "pending" || tc.status === "in_progress")) {
-      return toolCallOrder[i]!;
-    }
-  }
-  return toolCallOrder[toolCallOrder.length - 1];
-}
-
-interface ToolCallProps {
-  info: ToolCallInfo;
-  width: number;
-  expanded: boolean;
-  showTabHint: boolean;
-  keyPrefix: string;
-}
-
-export function ToolCallCard({
-  info,
-  width,
-  expanded,
-  showTabHint,
-  keyPrefix,
-}: ToolCallProps): React.ReactNode[] {
+/**
+ * Render a tool call as a single-line boxed summary.
+ *
+ * The box always has the same content and height as before; when `selected`
+ * is true we swap the border color and show a hint that space will expand it.
+ */
+export function renderToolCallLines(
+  info: ToolCallInfo,
+  width: number,
+  selected: boolean,
+): React.ReactElement[] {
   const kindIcon = KIND_ICONS[info.kind ?? "other"] ?? "⚙";
-  const statusInfo = STATUS_INDICATORS[info.status] ?? STATUS_INDICATORS.pending!;
-  const borderColor = info.status === "failed" ? CRANBERRY : CEDAR;
-  const dimBorder = info.status !== "failed";
+  const statusInfo =
+    STATUS_INDICATORS[info.status] ?? STATUS_INDICATORS.pending!;
 
-  const hasInput = info.rawInput !== undefined && info.rawInput !== null;
-  const hasOutput = info.rawOutput !== undefined && info.rawOutput !== null;
-  const hasContent = info.content && info.content.length > 0;
-  const hasLocations = info.locations && info.locations.length > 0;
+  const borderColor = selected
+    ? GOLD
+    : info.status === "failed"
+      ? CRANBERRY
+      : CEDAR;
+  const dimBorder = !selected && info.status !== "failed";
 
-  const contentWidth = width - 4;
+  const safeWidth = Math.max(width, 10);
+  const innerWidth = Math.max(safeWidth - 4, 6);
 
-  const lines: React.ReactNode[] = [];
-  const content: React.ReactNode[] = [];
+  const k = info.toolCallId;
+  const lines: React.ReactElement[] = [];
 
-  // Header
-  const runningText = info.status === "in_progress" ? " running…" : "";
-  content.push(
-    <Box key="header" flexDirection="row">
-      <Text color={statusInfo.color}>{statusInfo.icon}</Text>
-      <Text> </Text>
-      <Text>{kindIcon}</Text>
-      <Text> </Text>
-      <Text color={TEXT_SECONDARY} bold>{info.title}</Text>
-      {runningText && <Text color={TEXT_DIM} italic>{runningText}</Text>}
-      <Box flexGrow={1} />
-      {showTabHint && !expanded && <Text color={TEXT_DIM} italic>tab ↔</Text>}
-    </Box>
+  const hRule = "─".repeat(Math.max(safeWidth - 2, 0));
+  lines.push(
+    <Box key={`${k}-t`} width={safeWidth} height={1}>
+      <Text color={borderColor} dimColor={dimBorder}>
+        ╭{hRule}╮
+      </Text>
+    </Box>,
   );
 
-  // Compact view - show summary
-  if (!expanded) {
-    const summary = summarizeContent(info);
-    if (summary) {
-      content.push(
-        <Box key="summary">
-          <Text color={TEXT_DIM}>{summary}</Text>
-        </Box>
-      );
-    }
-  } else {
-    // Expanded view - show all details
-    const inputLines = hasInput ? formatJsonCompact(info.rawInput, contentWidth - 6) : [];
-    const outputLines = hasOutput ? formatJsonCompact(info.rawOutput, contentWidth - 6) : [];
-    const contentLines = hasContent ? extractTextFromContent(info.content!) : [];
-
-    if (hasLocations) {
-      for (let i = 0; i < info.locations!.length; i++) {
-        const loc = info.locations![i]!;
-        content.push(
-          <Box key={`loc-${i}`}>
-            <Text color={TEXT_DIM}>📁 {loc.path}{loc.line ? `:${loc.line}` : ""}</Text>
-          </Box>
-        );
-      }
-    }
-
-    const addSection = (label: string, sectionLines: string[]) => {
-      if (sectionLines.length === 0) return;
-      
-      content.push(
-        <Box key={`${label}-header`}>
-          <Text color={TEXT_DIM}>▸ {label}:</Text>
-        </Box>
-      );
-
-      for (let i = 0; i < sectionLines.length; i++) {
-        content.push(
-          <Box key={`${label}-${i}`} paddingLeft={2}>
-            <Text color={TEXT_DIM}>{sectionLines[i]}</Text>
-          </Box>
-        );
-      }
-    };
-
-    addSection("input", inputLines);
-    addSection("output", outputLines);
-    addSection("content", contentLines);
-  }
+  const statusIcon = statusInfo.icon;
+  const runningText = info.status === "in_progress" ? " running…" : "";
+  const hintText = selected ? "space to expand" : "";
+  const fixedLen = 4 + runningText.length + hintText.length;
+  const titleMax = Math.max(innerWidth - fixedLen, 4);
+  const title = truncateLine(info.title, titleMax);
 
   lines.push(
-    <Box
-      key={keyPrefix}
-      width={width}
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={borderColor}
-      borderDimColor={dimBorder}
-      paddingX={1}
-    >
-      {content}
-    </Box>
+    <Box key={`${k}-h`} width={safeWidth} height={1}>
+      <Text color={borderColor} dimColor={dimBorder}>
+        │{" "}
+      </Text>
+      <Box width={innerWidth} height={1}>
+        <Text color={statusInfo.color}>{statusIcon}</Text>
+        <Text> {kindIcon} </Text>
+        <Text wrap="truncate-end" color={TEXT_SECONDARY} bold>
+          {title}
+        </Text>
+        {runningText ? (
+          <Text color={TEXT_DIM} italic>
+            {runningText}
+          </Text>
+        ) : null}
+        <Box flexGrow={1} />
+        {hintText ? (
+          <Text color={GOLD} italic>
+            {hintText}
+          </Text>
+        ) : null}
+      </Box>
+      <Text color={borderColor} dimColor={dimBorder}>
+        {" "}
+        │
+      </Text>
+    </Box>,
+  );
+
+  lines.push(
+    <Box key={`${k}-b`} width={safeWidth} height={1}>
+      <Text color={borderColor} dimColor={dimBorder}>
+        ╰{hRule}╯
+      </Text>
+    </Box>,
   );
 
   return lines;
 }
+
+/**
+ * Height in lines of the rendered single-line tool-call box.
+ * Kept in sync with `renderToolCallLines`.
+ */
+export const TOOL_CALL_BOX_HEIGHT = 3;

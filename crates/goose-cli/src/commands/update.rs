@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
-use sigstore_verify::trust_root::TrustedRoot;
+use sigstore_verify::trust_root::{TrustedRoot, SIGSTORE_PRODUCTION_TRUSTED_ROOT};
 use sigstore_verify::types::{Bundle, Sha256Hash};
 use sigstore_verify::VerificationPolicy;
 use std::env;
@@ -26,7 +26,11 @@ fn asset_name() -> &'static str {
     {
         "goose-aarch64-unknown-linux-gnu.tar.bz2"
     }
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "cuda"))]
+    {
+        "goose-x86_64-pc-windows-msvc-cuda.zip"
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", not(feature = "cuda")))]
     {
         "goose-x86_64-pc-windows-msvc.zip"
     }
@@ -69,7 +73,7 @@ const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com
 
 async fn fetch_attestations(digest: &str, token: Option<&str>) -> Result<Vec<serde_json::Value>> {
     let url = format!(
-        "https://api.github.com/repos/block/goose/attestations/sha256:{digest}\
+        "https://api.github.com/repos/aaif-goose/goose/attestations/sha256:{digest}\
          ?per_page=30&predicate_type=https://slsa.dev/provenance/v1"
     );
 
@@ -165,7 +169,8 @@ async fn verify_provenance(archive_data: &[u8], tag: &str) -> Result<bool> {
         }
     };
 
-    let trusted_root = TrustedRoot::production().context("Failed to load Sigstore trusted root")?;
+    let trusted_root = TrustedRoot::from_json(SIGSTORE_PRODUCTION_TRUSTED_ROOT)
+        .context("Failed to load Sigstore trusted root")?;
     let policy = VerificationPolicy::with_issuer(GITHUB_ACTIONS_ISSUER);
     let artifact_digest =
         Sha256Hash::from_hex(&digest).context("Failed to parse artifact digest")?;
@@ -209,7 +214,7 @@ pub async fn update(canary: bool, reconfigure: bool) -> Result<()> {
     {
         let tag = if canary { "canary" } else { "stable" };
         let asset = asset_name();
-        let url = format!("https://github.com/block/goose/releases/download/{tag}/{asset}");
+        let url = format!("https://github.com/aaif-goose/goose/releases/download/{tag}/{asset}");
 
         println!("Downloading {asset} from {tag} release...");
 
@@ -462,9 +467,25 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        // On Unix, copy the new binary over the existing one
-        fs::copy(new_binary, current_exe)
-            .with_context(|| format!("Failed to copy new binary to {}", current_exe.display()))?;
+        let old_exe = current_exe.with_extension("old");
+
+        // Rename current binary to avoid ETXTBSY on Linux
+        if current_exe.exists() {
+            fs::rename(current_exe, &old_exe).with_context(|| {
+                format!("Failed to rename {} before update", current_exe.display())
+            })?;
+        }
+
+        if let Err(e) = fs::copy(new_binary, current_exe) {
+            // Restore old binary if copy fails
+            let _ = fs::rename(&old_exe, current_exe);
+            return Err(e).with_context(|| {
+                format!("Failed to copy new binary to {}", current_exe.display())
+            });
+        }
+
+        // Delete the old backup binary
+        let _ = fs::remove_file(&old_exe);
 
         // Ensure the binary is executable
         #[cfg(unix)]

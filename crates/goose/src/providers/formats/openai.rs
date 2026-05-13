@@ -1,11 +1,12 @@
 use crate::conversation::message::{Message, MessageContent, ProviderMetadata};
 use crate::mcp_utils::extract_text_from_resource;
 use crate::model::ModelConfig;
-use crate::providers::base::{ProviderUsage, Usage};
+use crate::providers::base::{split_think_blocks, ProviderUsage, ThinkFilter, Usage};
 use crate::providers::errors::ProviderError;
 use crate::providers::utils::{
-    convert_image, detect_image_path, extract_reasoning_effort, is_valid_function_name,
-    load_image_file, safely_parse_json, sanitize_function_name, ImageFormat,
+    convert_image, detect_image_path, extract_reasoning_effort, is_openai_responses_model,
+    is_valid_function_name, load_image_file, safely_parse_json, sanitize_function_name,
+    ImageFormat,
 };
 use anyhow::{anyhow, Error};
 use async_stream::try_stream;
@@ -31,10 +32,17 @@ type ToolCallData = HashMap<
     ),
 >;
 
+fn deserialize_null_default_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct DeltaToolCallFunction {
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default_string")]
     arguments: String,
 }
 
@@ -64,19 +72,31 @@ struct ContentPart {
     thought_signature: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct Delta {
     #[serde(default)]
     content: Option<DeltaContent>,
     role: Option<String>,
     tool_calls: Option<Vec<DeltaToolCall>>,
     reasoning_details: Option<Vec<Value>>,
-    #[serde(alias = "reasoning")]
+    reasoning: Option<String>,
     reasoning_content: Option<String>,
+}
+
+impl Delta {
+    /// Prefer `reasoning_content` (DeepSeek/OpenRouter) over `reasoning`
+    /// (vLLM); some servers (gpt-oss via vLLM) emit both. Skip empty values.
+    fn reasoning_text(&self) -> Option<&str> {
+        self.reasoning_content
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.reasoning.as_deref().filter(|s| !s.is_empty()))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct StreamingChoice {
+    #[serde(default)]
     delta: Delta,
     index: Option<i32>,
     finish_reason: Option<String>,
@@ -340,7 +360,115 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
         messages_spec.extend(output);
     }
 
+    merge_split_tool_call_messages(&mut messages_spec);
     messages_spec
+}
+
+/// The agent splits a single assistant response with N tool_calls into N
+/// interleaved `asst(TC)/tool` pairs, cloning `reasoning_content` onto each.
+/// This function merges them back into one assistant message with all tool_calls,
+/// followed by the tool results — the standard OpenAI format.
+///
+/// Only merges when `reasoning_content` is present and matches, since that is
+/// the only signal that messages were split from the same turn.
+fn merge_split_tool_call_messages(messages: &mut Vec<Value>) {
+    let mut i = 0;
+    while i < messages.len() {
+        let is_assistant_tool_call = messages[i].get("role") == Some(&json!("assistant"))
+            && messages[i]
+                .get("tool_calls")
+                .and_then(|tc| tc.as_array())
+                .is_some_and(|a| !a.is_empty());
+        let base_reasoning = messages[i].get("reasoning_content");
+
+        if !is_assistant_tool_call || base_reasoning.is_none() {
+            i += 1;
+            continue;
+        }
+        let base_reasoning = base_reasoning.unwrap().clone();
+
+        let mut extra_tool_calls: Vec<Value> = Vec::new();
+        let mut collected: Vec<Value> = Vec::new();
+        let mut scan = i + 1;
+
+        loop {
+            if scan >= messages.len() || messages[scan].get("role") != Some(&json!("tool")) {
+                break;
+            }
+
+            // Skip past tool result and any image-only user messages that
+            // format_messages inserts after tool results containing images.
+            let mut peek = scan + 1;
+            while peek < messages.len() && is_image_only_user_message(&messages[peek]) {
+                peek += 1;
+            }
+
+            if peek >= messages.len() {
+                break;
+            }
+            let next = &messages[peek];
+            let has_no_content = next.get("content").is_none_or(|c| {
+                c.is_null()
+                    || c.as_str().is_some_and(|s| s.is_empty())
+                    || c.as_array().is_some_and(|a| a.is_empty())
+            });
+            let is_split = next.get("role") == Some(&json!("assistant"))
+                && next
+                    .get("tool_calls")
+                    .and_then(|tc| tc.as_array())
+                    .is_some_and(|a| !a.is_empty())
+                && has_no_content
+                && next.get("reasoning_content") == Some(&base_reasoning);
+
+            if !is_split {
+                break;
+            }
+
+            collected.extend(messages[scan..peek].iter().cloned());
+            if let Some(tc) = messages[peek]
+                .get("tool_calls")
+                .and_then(|tc| tc.as_array())
+            {
+                extra_tool_calls.extend(tc.iter().cloned());
+            }
+            scan = peek + 1;
+        }
+
+        if extra_tool_calls.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        if let Some(base_tc) = messages[i]
+            .get_mut("tool_calls")
+            .and_then(|tc| tc.as_array_mut())
+        {
+            base_tc.extend(extra_tool_calls);
+        }
+
+        let insert_at = i + 1;
+        messages.drain(insert_at..scan);
+        let num_collected = collected.len();
+        for (j, msg) in collected.into_iter().enumerate() {
+            messages.insert(insert_at + j, msg);
+        }
+
+        i = insert_at + num_collected;
+    }
+}
+
+/// True if `msg` is a synthetic image-only user message (content is exclusively image_url items).
+fn is_image_only_user_message(msg: &Value) -> bool {
+    msg.get("role") == Some(&json!("user"))
+        && msg
+            .get("content")
+            .and_then(|c| c.as_array())
+            .is_some_and(|arr| {
+                !arr.is_empty()
+                    && arr
+                        .iter()
+                        .all(|item| item.get("type") == Some(&json!("image_url")))
+            })
 }
 
 pub fn format_tools(tools: &[Tool]) -> anyhow::Result<Vec<Value>> {
@@ -390,9 +518,11 @@ pub fn response_to_message(response: &Value) -> anyhow::Result<Message> {
     let reasoning_value = original
         .get("reasoning_content")
         .or_else(|| original.get("reasoning"));
+    let mut has_structured_thinking = false;
     if let Some(reasoning_content) = reasoning_value {
         if let Some(reasoning_str) = reasoning_content.as_str() {
             if !reasoning_str.is_empty() {
+                has_structured_thinking = true;
                 content.push(MessageContent::thinking(reasoning_str, ""));
             }
         }
@@ -400,7 +530,15 @@ pub fn response_to_message(response: &Value) -> anyhow::Result<Message> {
 
     if let Some(text) = original.get("content") {
         if let Some(text_str) = text.as_str() {
-            content.push(MessageContent::text(text_str));
+            let (cleaned, inline_thinking) = split_think_blocks(text_str);
+
+            if !has_structured_thinking && !inline_thinking.is_empty() {
+                content.push(MessageContent::thinking(inline_thinking, ""));
+            }
+
+            if !cleaned.is_empty() {
+                content.push(MessageContent::text(cleaned));
+            }
         }
     }
 
@@ -495,14 +633,21 @@ pub fn get_usage(usage: &Value) -> Usage {
         .filter(|nested| nested.is_object())
         .unwrap_or(usage);
 
+    // Try standard OpenAI fields first, then fall back to Ollama-native fields
+    // (prompt_eval_count / eval_count) for compatibility with older Ollama builds
+    // that don't translate to OpenAI field names.
+    // Parse the value before falling back so that present-but-null keys
+    // (e.g. "completion_tokens": null) don't block the fallback.
     let input_tokens = usage
         .get("prompt_tokens")
         .and_then(|v| v.as_i64())
+        .or_else(|| usage.get("prompt_eval_count").and_then(|v| v.as_i64()))
         .map(|v| v as i32);
 
     let output_tokens = usage
         .get("completion_tokens")
         .and_then(|v| v.as_i64())
+        .or_else(|| usage.get("eval_count").and_then(|v| v.as_i64()))
         .map(|v| v as i32);
 
     let cache_read_input_tokens = usage
@@ -575,6 +720,7 @@ fn ensure_valid_json_schema(schema: &mut Value) {
             if let Some(properties) = params_obj.get_mut("properties") {
                 if let Some(properties_obj) = properties.as_object_mut() {
                     for (_key, prop) in properties_obj.iter_mut() {
+                        normalize_nullable(prop);
                         if prop.is_object()
                             && prop.get("type").and_then(|t| t.as_str()) == Some("object")
                         {
@@ -584,6 +730,61 @@ fn ensure_valid_json_schema(schema: &mut Value) {
                 }
             }
         }
+    }
+}
+
+/// Normalizes nullable type representations that some providers (e.g. Vertex Gemini via Bifrost)
+/// don't support:
+/// - `"type": ["integer", "null"]` → `"type": "integer"` (drops the null variant)
+/// - `"anyOf": [T, {"type": "null"}]` → T (unwraps to the non-null schema)
+///
+/// Optional-ness is already conveyed by the field being absent from `required`.
+fn normalize_nullable(schema: &mut Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    // Handle type: ["T", "null"] array form (schemars 1.x style for nullable primitives)
+    if let Some(type_val) = obj.get("type").cloned() {
+        if let Some(types) = type_val.as_array() {
+            let non_null: Vec<&Value> = types
+                .iter()
+                .filter(|t| t.as_str() != Some("null"))
+                .collect();
+            if non_null.len() == 1 {
+                let scalar = non_null[0].clone();
+                obj.insert("type".to_string(), scalar);
+                return;
+            }
+        }
+    }
+
+    // Handle anyOf: [T, {type: "null"}] form — merge the non-null variant's fields
+    // into the current object (preserving sibling keys like "description" or "default")
+    // rather than replacing the whole schema.
+    if let Some(any_of) = obj.remove("anyOf") {
+        if let Some(variants) = any_of.as_array() {
+            if variants.len() == 2 {
+                let is_null = |v: &Value| v.get("type").and_then(|t| t.as_str()) == Some("null");
+                let non_null = if is_null(&variants[0]) {
+                    Some(&variants[1])
+                } else if is_null(&variants[1]) {
+                    Some(&variants[0])
+                } else {
+                    None
+                };
+                if let Some(replacement) = non_null {
+                    if let Some(replacement_obj) = replacement.as_object() {
+                        for (k, v) in replacement_obj {
+                            obj.entry(k.clone()).or_insert(v.clone());
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        // Put it back if we couldn't simplify
+        obj.insert("anyOf".to_string(), any_of);
     }
 }
 
@@ -631,7 +832,13 @@ where
 
         let mut accumulated_reasoning: Vec<Value> = Vec::new();
         let mut accumulated_reasoning_content = String::new();
+        let mut think_filter = ThinkFilter::new();
+        let mut saw_structured_reasoning = false;
         let mut last_signature: Option<String> = None;
+        // Buffer inline <think>...</think> content until we know whether structured
+        // reasoning will arrive. Emitting it immediately and then receiving
+        // reasoning_content in a later chunk would produce duplicated reasoning.
+        let mut pending_inline_thinking = String::new();
 
         'outer: while let Some(response) = stream.next().await {
             let response_str = response?;
@@ -653,8 +860,12 @@ where
                 if let Some(details) = &chunk.choices[0].delta.reasoning_details {
                     accumulated_reasoning.extend(details.iter().cloned());
                 }
-                if let Some(rc) = &chunk.choices[0].delta.reasoning_content {
+                if let Some(rc) = chunk.choices[0].delta.reasoning_text() {
                     accumulated_reasoning_content.push_str(rc);
+                    if !rc.is_empty() {
+                        saw_structured_reasoning = true;
+                        pending_inline_thinking.clear();
+                    }
                 }
             }
 
@@ -695,8 +906,12 @@ where
                                     if let Some(details) = &tool_chunk.choices[0].delta.reasoning_details {
                                         accumulated_reasoning.extend(details.iter().cloned());
                                     }
-                                    if let Some(rc) = &tool_chunk.choices[0].delta.reasoning_content {
+                                    if let Some(rc) = tool_chunk.choices[0].delta.reasoning_text() {
                                         accumulated_reasoning_content.push_str(rc);
+                                        if !rc.is_empty() {
+                                            saw_structured_reasoning = true;
+                                            pending_inline_thinking.clear();
+                                        }
                                     }
                                     if let Some(delta_tool_calls) = &tool_chunk.choices[0].delta.tool_calls {
                                         for delta_call in delta_tool_calls {
@@ -737,6 +952,37 @@ where
                     None
                 };
 
+                let filtered = think_filter.push("");
+                let mut flush_thinking = String::new();
+                if !saw_structured_reasoning {
+                    flush_thinking.push_str(&pending_inline_thinking);
+                    flush_thinking.push_str(&filtered.thinking);
+                }
+                pending_inline_thinking.clear();
+                if !filtered.content.is_empty() || !flush_thinking.is_empty() {
+                    let mut filtered_contents = Vec::new();
+                    if !filtered.content.is_empty() {
+                        filtered_contents.push(MessageContent::text(filtered.content));
+                    }
+                    if !flush_thinking.is_empty() {
+                        filtered_contents.push(MessageContent::thinking(flush_thinking, ""));
+                    }
+
+                    if !filtered_contents.is_empty() {
+                        let mut msg = Message::new(
+                            Role::Assistant,
+                            chrono::Utc::now().timestamp(),
+                            filtered_contents,
+                        );
+
+                        if let Some(id) = chunk.id.clone() {
+                            msg = msg.with_id(id);
+                        }
+
+                        yield (Some(msg), None);
+                    }
+                }
+
                 let mut contents = Vec::new();
                 if !accumulated_reasoning_content.is_empty() {
                     contents.push(MessageContent::thinking(&accumulated_reasoning_content, ""));
@@ -750,7 +996,7 @@ where
                         let parsed = if arguments.is_empty() {
                             Ok(json!({}))
                         } else {
-                            serde_json::from_str::<Value>(arguments)
+                            safely_parse_json(arguments)
                         };
 
                         let metadata = if let Some(sig) = &last_signature {
@@ -803,14 +1049,12 @@ where
                     Some(msg),
                     usage,
                 )
-            } else if chunk.choices[0].delta.content.is_some() || chunk.choices[0].delta.reasoning_content.is_some() {
+            } else if chunk.choices[0].delta.content.is_some() || chunk.choices[0].delta.reasoning_text().is_some() {
                 let mut content = Vec::new();
 
-                if let Some(reasoning) = &chunk.choices[0].delta.reasoning_content {
-                    if !reasoning.is_empty() {
-                        let signature = last_signature.as_deref().unwrap_or("");
-                        content.push(MessageContent::thinking(reasoning, signature));
-                    }
+                if let Some(reasoning) = chunk.choices[0].delta.reasoning_text() {
+                    let signature = last_signature.as_deref().unwrap_or("");
+                    content.push(MessageContent::thinking(reasoning, signature));
                 }
 
                 let (text_content, thought_signature) = extract_content_and_signature(chunk.choices[0].delta.content.as_ref());
@@ -820,8 +1064,14 @@ where
                 }
 
                 if let Some(text) = text_content {
-                    if !text.is_empty() {
-                        content.push(MessageContent::text(&text));
+                    let filtered = think_filter.push(&text);
+
+                    if !saw_structured_reasoning && !filtered.thinking.is_empty() {
+                        pending_inline_thinking.push_str(&filtered.thinking);
+                    }
+
+                    if !filtered.content.is_empty() {
+                        content.push(MessageContent::text(filtered.content));
                     }
                 }
 
@@ -851,6 +1101,35 @@ where
                 yield (None, usage)
             }
         }
+
+        let filtered = think_filter.finish();
+        let mut trailing_thinking = String::new();
+        if !saw_structured_reasoning {
+            trailing_thinking.push_str(&pending_inline_thinking);
+            trailing_thinking.push_str(&filtered.thinking);
+        }
+        pending_inline_thinking.clear();
+
+        if !filtered.content.is_empty() || !trailing_thinking.is_empty() {
+            let mut content = Vec::new();
+
+            if !filtered.content.is_empty() {
+                content.push(MessageContent::text(filtered.content));
+            }
+
+            if !trailing_thinking.is_empty() {
+                content.push(MessageContent::thinking(trailing_thinking, ""));
+            }
+
+            yield (
+                Some(Message::new(
+                    Role::Assistant,
+                    chrono::Utc::now().timestamp(),
+                    content,
+                )),
+                None,
+            )
+        }
     }
 }
 
@@ -869,7 +1148,7 @@ pub fn create_request(
     }
 
     let (model_name, reasoning_effort) = extract_reasoning_effort(&model_config.model_name);
-    let is_reasoning_model = reasoning_effort.is_some();
+    let is_reasoning_model = is_openai_responses_model(&model_name);
 
     let system_message = json!({
         "role": if is_reasoning_model { "developer" } else { "system" },
@@ -903,15 +1182,22 @@ pub fn create_request(
         }
     }
 
-    let key = if is_reasoning_model {
-        "max_completion_tokens"
-    } else {
-        "max_tokens"
-    };
-    payload
-        .as_object_mut()
-        .unwrap()
-        .insert(key.to_string(), json!(model_config.max_output_tokens()));
+    // Only emit max_tokens / max_completion_tokens when the user (via
+    // GOOSE_MAX_TOKENS) or a canonical model record has supplied a value.
+    // For unknown models on OpenAI-compatible endpoints (e.g. llama_swap,
+    // lmstudio) sending the historic 4096 default truncates non-trivial
+    // responses; omitting the field lets the server use its own max.
+    if let Some(max_tokens) = model_config.max_tokens {
+        let key = if is_reasoning_model {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert(key.to_string(), json!(max_tokens));
+    }
 
     if for_streaming {
         payload["stream"] = json!(true);
@@ -1006,6 +1292,85 @@ mod tests {
         let mut tools = vec![original_schema.clone()];
         validate_tool_schemas(&mut tools);
         assert_eq!(tools[0], original_schema);
+
+        // Test case 4: anyOf nullable is unwrapped, preserving sibling metadata
+        let mut tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "run shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" },
+                        "timeout_secs": {
+                            "description": "timeout in seconds",
+                            "anyOf": [
+                                { "type": "integer", "format": "uint64", "minimum": 0 },
+                                { "type": "null" }
+                            ]
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        })];
+        validate_tool_schemas(&mut tools);
+        let timeout_schema = &tools[0]["function"]["parameters"]["properties"]["timeout_secs"];
+        assert_eq!(timeout_schema["type"], "integer");
+        assert_eq!(timeout_schema["format"], "uint64");
+        assert_eq!(timeout_schema["description"], "timeout in seconds");
+        assert!(timeout_schema.get("anyOf").is_none());
+
+        // Test case 4b: type array form (schemars 1.x style for nullable primitives)
+        let mut tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "run shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" },
+                        "timeout_secs": {
+                            "type": ["integer", "null"],
+                            "format": "uint64",
+                            "minimum": 0
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        })];
+        validate_tool_schemas(&mut tools);
+        let timeout_schema = &tools[0]["function"]["parameters"]["properties"]["timeout_secs"];
+        assert_eq!(timeout_schema["type"], "integer");
+        assert!(!timeout_schema["type"].is_array());
+
+        // Test case 5: Verify the actual ShellParams schema is compatible (no anyOf for timeout_secs)
+        use crate::agents::platform_extensions::developer::shell::ShellParams;
+        use schemars::schema_for;
+        let schema_value = serde_json::to_value(schema_for!(ShellParams)).unwrap();
+        let schema_obj = schema_value.as_object().unwrap().clone();
+        let tool = rmcp::model::Tool::new("shell", "run shell", schema_obj);
+        let mut tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            }
+        })];
+        validate_tool_schemas(&mut tools);
+        let timeout = &tools[0]["function"]["parameters"]["properties"]["timeout_secs"];
+        assert!(
+            timeout.get("anyOf").is_none(),
+            "timeout_secs should not have anyOf after validation, got: {timeout}"
+        );
+        assert_eq!(
+            timeout["type"], "integer",
+            "timeout_secs should have type=integer"
+        );
     }
 
     const OPENAI_TOOL_USE_RESPONSE: &str = r#"{
@@ -1600,8 +1965,46 @@ mod tests {
     }
 
     #[test]
+    fn test_create_request_omits_max_tokens_when_unset() -> anyhow::Result<()> {
+        // Unknown models on OpenAI-compatible local providers (llama_swap,
+        // lmstudio) have no canonical record and no GOOSE_MAX_TOKENS, so the
+        // request must not pin the legacy 4096 default — the server should
+        // pick its own ceiling. See issue #9007.
+        let model_config = ModelConfig {
+            model_name: "some-unknown-local-model".to_string(),
+            context_limit: None,
+            temperature: None,
+            max_tokens: None,
+            toolshim: false,
+            toolshim_model: None,
+            fast_model_config: None,
+            request_params: None,
+            reasoning: None,
+        };
+        let request = create_request(
+            &model_config,
+            "system",
+            &[],
+            &[],
+            &ImageFormat::OpenAi,
+            false,
+        )?;
+        let obj = request.as_object().unwrap();
+        assert!(
+            !obj.contains_key("max_tokens"),
+            "max_tokens should be omitted when model_config.max_tokens is None"
+        );
+        assert!(
+            !obj.contains_key("max_completion_tokens"),
+            "max_completion_tokens should be omitted when model_config.max_tokens is None"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_create_request_o1_default() -> anyhow::Result<()> {
-        // Test default medium reasoning effort for O1 model
+        // Without an explicit effort suffix the API picks its own default;
+        // we should omit reasoning_effort entirely but still use "developer" role.
         let model_config = ModelConfig {
             model_name: "o1".to_string(),
             context_limit: Some(4096),
@@ -1630,13 +2033,16 @@ mod tests {
                     "content": "system"
                 }
             ],
-            "reasoning_effort": "medium",
             "max_completion_tokens": 1024
         });
 
         for (key, value) in expected.as_object().unwrap() {
             assert_eq!(obj.get(key).unwrap(), value);
         }
+        assert!(
+            obj.get("reasoning_effort").is_none(),
+            "reasoning_effort should be omitted when no explicit suffix is provided"
+        );
 
         Ok(())
     }
@@ -1883,6 +2289,23 @@ data: [DONE]
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_azure_annotation_chunk_without_delta_does_not_fail() -> anyhow::Result<()> {
+        let response_lines = r#"
+data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1234567890,"model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}],"usage":null}
+data: {"choices":[{"content_filter_offsets":{"check_offset":5,"start_offset":5,"end_offset":5},"content_filter_results":{"hate":{"filtered":false,"severity":"safe"},"self_harm":{"filtered":false,"severity":"safe"},"sexual":{"filtered":false,"severity":"safe"},"violence":{"filtered":false,"severity":"safe"}},"finish_reason":null,"index":0}],"created":0,"id":"","model":"","object":""}
+data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1234567891,"model":"gpt-5.4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}
+data: [DONE]
+"#;
+
+        let result = run_streaming_test(response_lines).await?;
+
+        assert!(result.has_text_content, "Expected text content in response");
+        assert_usage_yielded_once(&result, 10, 1, 11);
+
+        Ok(())
+    }
+
     #[test]
     fn test_response_to_message_with_nested_extra_content() -> anyhow::Result<()> {
         let response = json!({
@@ -1996,6 +2419,85 @@ data: [DONE]"#;
         panic!("Expected tool call message with nested extra_content metadata");
     }
 
+    #[tokio::test]
+    async fn test_streaming_response_extracts_inline_think_blocks() -> anyhow::Result<()> {
+        let response_lines = concat!(
+            "data: {\"id\":\"chunk-1\",\"choices\":[{\"delta\":{\"content\":\"<thi\"},\"index\":0,\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"chunk-1\",\"choices\":[{\"delta\":{\"content\":\"nk>x</thi\"},\"index\":0,\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"chunk-1\",\"choices\":[{\"delta\":{\"content\":\"nk>y\"},\"index\":0,\"finish_reason\":\"stop\"}]}\n",
+            "data: [DONE]\n"
+        );
+
+        let response_stream =
+            tokio_stream::iter(response_lines.lines().map(|line| Ok(line.to_string())));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+
+        let mut text = String::new();
+        let mut thinking = String::new();
+
+        while let Some(result) = messages.next().await {
+            let (message, _) = result?;
+            if let Some(message) = message {
+                for item in message.content {
+                    match item {
+                        MessageContent::Text(text_content) => text.push_str(&text_content.text),
+                        MessageContent::Thinking(thinking_content) => {
+                            thinking.push_str(&thinking_content.thinking)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert_eq!(text, "y");
+        assert_eq!(thinking, "x");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_suppresses_inline_think_when_structured_reasoning_follows(
+    ) -> anyhow::Result<()> {
+        // Inline <think>...</think> arrives in an early content chunk, then
+        // reasoning_content arrives in a later chunk. The inline thinking
+        // should be discarded in favor of the structured reasoning so users
+        // do not get duplicated reasoning output.
+        let response_lines = concat!(
+            "data: {\"id\":\"chunk-1\",\"choices\":[{\"delta\":{\"content\":\"<think>inline reasoning</think>Hi\"},\"index\":0,\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"chunk-2\",\"choices\":[{\"delta\":{\"reasoning_content\":\"structured reasoning\"},\"index\":0,\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"chunk-3\",\"choices\":[{\"delta\":{\"content\":\" there\"},\"index\":0,\"finish_reason\":\"stop\"}]}\n",
+            "data: [DONE]\n"
+        );
+
+        let response_stream =
+            tokio_stream::iter(response_lines.lines().map(|line| Ok(line.to_string())));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+
+        let mut text = String::new();
+        let mut thinking = String::new();
+
+        while let Some(result) = messages.next().await {
+            let (message, _) = result?;
+            if let Some(message) = message {
+                for item in message.content {
+                    match item {
+                        MessageContent::Text(text_content) => text.push_str(&text_content.text),
+                        MessageContent::Thinking(thinking_content) => {
+                            thinking.push_str(&thinking_content.thinking)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert_eq!(text, "Hi there");
+        assert_eq!(thinking, "structured reasoning");
+
+        Ok(())
+    }
+
     #[test]
     fn test_response_to_message_with_reasoning_content() -> anyhow::Result<()> {
         // Test capturing reasoning_content from DeepSeek reasoning models
@@ -2027,6 +2529,66 @@ data: [DONE]"#;
         // Second should be text content
         if let MessageContent::Text(text) = &message.content[1] {
             assert_eq!(text.text, "The answer is 9.11 is greater than 9.8");
+        } else {
+            panic!("Expected Text content");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_response_to_message_extracts_inline_think_blocks() -> anyhow::Result<()> {
+        let response = json!({
+            "choices": [{
+                "role": "assistant",
+                "message": {
+                    "content": "<think>internal reasoning</think>Visible answer"
+                }
+            }]
+        });
+
+        let message = response_to_message(&response)?;
+        assert_eq!(message.content.len(), 2);
+
+        if let MessageContent::Thinking(thinking) = &message.content[0] {
+            assert_eq!(thinking.thinking, "internal reasoning");
+        } else {
+            panic!("Expected Thinking content, got {:?}", message.content[0]);
+        }
+
+        if let MessageContent::Text(text) = &message.content[1] {
+            assert_eq!(text.text, "Visible answer");
+        } else {
+            panic!("Expected Text content");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_response_to_message_prefers_structured_reasoning_over_inline_think(
+    ) -> anyhow::Result<()> {
+        let response = json!({
+            "choices": [{
+                "role": "assistant",
+                "message": {
+                    "reasoning_content": "structured reasoning",
+                    "content": "<think>inline reasoning</think>Visible answer"
+                }
+            }]
+        });
+
+        let message = response_to_message(&response)?;
+        assert_eq!(message.content.len(), 2);
+
+        if let MessageContent::Thinking(thinking) = &message.content[0] {
+            assert_eq!(thinking.thinking, "structured reasoning");
+        } else {
+            panic!("Expected Thinking content");
+        }
+
+        if let MessageContent::Text(text) = &message.content[1] {
+            assert_eq!(text.text, "Visible answer");
         } else {
             panic!("Expected Text content");
         }
@@ -2109,5 +2671,200 @@ data: [DONE]"#;
             found_error,
             "expected an error but stream completed successfully"
         );
+    }
+
+    #[test]
+    fn test_merge_split_tool_calls_with_reasoning() {
+        let mut messages = vec![
+            json!({"role": "assistant", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "read", "arguments": "{}"}}], "reasoning_content": "thinking..."}),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "result1"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "tc2", "type": "function", "function": {"name": "write", "arguments": "{}"}}], "reasoning_content": "thinking..."}),
+            json!({"role": "tool", "tool_call_id": "tc2", "content": "result2"}),
+        ];
+        merge_split_tool_call_messages(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[2]["role"], "tool");
+    }
+
+    #[test]
+    fn test_no_merge_without_reasoning() {
+        let mut messages = vec![
+            json!({"role": "assistant", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "result1"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "tc2", "type": "function", "function": {"name": "write", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "tc2", "content": "result2"}),
+        ];
+        merge_split_tool_call_messages(&mut messages);
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[2]["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_merge_split_tool_calls_with_image_gap() {
+        let mut messages = vec![
+            json!({"role": "assistant", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "screenshot", "arguments": "{}"}}], "reasoning_content": "thinking..."}),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "This tool result included an image that is uploaded in the next message."}),
+            json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]}),
+            json!({"role": "assistant", "tool_calls": [{"id": "tc2", "type": "function", "function": {"name": "click", "arguments": "{}"}}], "reasoning_content": "thinking..."}),
+            json!({"role": "tool", "tool_call_id": "tc2", "content": "clicked"}),
+        ];
+        merge_split_tool_call_messages(&mut messages);
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "tc1");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "tc2");
+    }
+
+    #[test]
+    fn test_merge_does_not_skip_real_user_message() {
+        let mut messages = vec![
+            json!({"role": "assistant", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "read", "arguments": "{}"}}], "reasoning_content": "thinking..."}),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "result1"}),
+            json!({"role": "user", "content": "what happened?"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "tc2", "type": "function", "function": {"name": "write", "arguments": "{}"}}], "reasoning_content": "thinking..."}),
+            json!({"role": "tool", "tool_call_id": "tc2", "content": "result2"}),
+        ];
+        merge_split_tool_call_messages(&mut messages);
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "what happened?");
+        assert_eq!(messages[3]["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_get_usage_with_ollama_native_fields() {
+        // Ollama-native fields should be picked up as fallback
+        let usage = json!({
+            "prompt_eval_count": 42,
+            "eval_count": 128
+        });
+        let result = get_usage(&usage);
+        assert_eq!(result.input_tokens, Some(42));
+        assert_eq!(result.output_tokens, Some(128));
+        assert_eq!(result.total_tokens, Some(170));
+    }
+
+    #[test]
+    fn test_get_usage_prefers_openai_fields_over_ollama() {
+        // Standard OpenAI fields should take precedence
+        let usage = json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "prompt_eval_count": 42,
+            "eval_count": 128
+        });
+        let result = get_usage(&usage);
+        assert_eq!(result.input_tokens, Some(10));
+        assert_eq!(result.output_tokens, Some(20));
+        assert_eq!(result.total_tokens, Some(30));
+    }
+
+    #[test]
+    fn test_get_usage_falls_back_when_openai_fields_are_null() {
+        // When OpenAI fields exist but are null, should fall back to Ollama-native
+        let usage = json!({
+            "prompt_tokens": null,
+            "completion_tokens": null,
+            "prompt_eval_count": 42,
+            "eval_count": 128
+        });
+        let result = get_usage(&usage);
+        assert_eq!(result.input_tokens, Some(42));
+        assert_eq!(result.output_tokens, Some(128));
+        assert_eq!(result.total_tokens, Some(170));
+    }
+
+    // vLLM serving gpt-oss emits both `reasoning` and `reasoning_content`
+    // in the same payload; the non-streaming path handles it fine today.
+    #[test]
+    fn test_response_to_message_with_both_reasoning_fields() -> anyhow::Result<()> {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning": "thinking...",
+                    "reasoning_content": "thinking..."
+                }
+            }]
+        });
+
+        let message = response_to_message(&response)?;
+        assert_eq!(message.content.len(), 2);
+        if let MessageContent::Thinking(t) = &message.content[0] {
+            assert_eq!(t.thinking, "thinking...");
+        } else {
+            panic!("Expected Thinking content, got {:?}", message.content[0]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_with_only_reasoning_content() -> anyhow::Result<()> {
+        let response_lines = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"hi\"},\"finish_reason\":null}]}\ndata: [DONE]";
+        let lines: Vec<String> = response_lines.lines().map(|s| s.to_string()).collect();
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+        while let Some(result) = messages.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
+    // Streaming counterpart: both fields in one delta must parse and yield
+    // thinking content, not fail with "duplicate field `reasoning_content`".
+    #[tokio::test]
+    async fn test_streaming_chunk_with_both_reasoning_fields() -> anyhow::Result<()> {
+        let response_lines = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"thinking...\",\"reasoning_content\":\"thinking...\"},\"finish_reason\":null}]}\ndata: [DONE]";
+        let lines: Vec<String> = response_lines.lines().map(|s| s.to_string()).collect();
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+
+        let mut saw_thinking = false;
+        while let Some(result) = messages.next().await {
+            let (message, _usage) = result?;
+            if let Some(msg) = message {
+                for c in &msg.content {
+                    if let MessageContent::Thinking(t) = c {
+                        assert_eq!(t.thinking, "thinking...");
+                        saw_thinking = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_thinking,
+            "expected thinking content from merged reasoning fields"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_delta_tool_call_function_accepts_null_arguments() {
+        let raw = r#"{"arguments":null}"#;
+        let parsed: DeltaToolCallFunction =
+            serde_json::from_str(raw).expect("null arguments must deserialize");
+        assert_eq!(parsed.arguments, "");
+
+        let raw = r#"{}"#;
+        let parsed: DeltaToolCallFunction =
+            serde_json::from_str(raw).expect("missing arguments must deserialize");
+        assert_eq!(parsed.arguments, "");
+
+        let raw = r#"{"arguments":"{\"k\":1}"}"#;
+        let parsed: DeltaToolCallFunction = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.arguments, "{\"k\":1}");
     }
 }

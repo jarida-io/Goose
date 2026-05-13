@@ -21,45 +21,114 @@ import { NavigationProvider, useNavigationContextSafe } from '../../Layout/Navig
 
 const i18n = defineMessages({
   appearanceTitle: { id: 'settings.appearance.title', defaultMessage: 'Appearance' },
-  appearanceDesc: { id: 'settings.appearance.description', defaultMessage: 'Configure how goose appears on your system' },
+  appearanceDesc: {
+    id: 'settings.appearance.description',
+    defaultMessage: 'Configure how goose appears on your system',
+  },
   notifications: { id: 'settings.notifications.title', defaultMessage: 'Notifications' },
-  notificationsDesc: { id: 'settings.notifications.description', defaultMessage: 'Notifications are managed by your OS - {link}' },
+  notificationsDesc: {
+    id: 'settings.notifications.description',
+    defaultMessage: 'Notifications are managed by your OS - {link}',
+  },
   configGuide: { id: 'settings.notifications.configGuide', defaultMessage: 'Configuration guide' },
   openSettings: { id: 'settings.notifications.openSettings', defaultMessage: 'Open Settings' },
+  taskNotifications: {
+    id: 'settings.notifications.task.title',
+    defaultMessage: 'Task completion notifications',
+  },
+  taskNotificationsDesc: {
+    id: 'settings.notifications.task.description',
+    defaultMessage: 'Notify when Goose finishes a task while the window is in the background',
+  },
   menuBarIcon: { id: 'settings.menuBarIcon.title', defaultMessage: 'Menu bar icon' },
-  menuBarIconDesc: { id: 'settings.menuBarIcon.description', defaultMessage: 'Show goose in the menu bar' },
+  menuBarIconDesc: {
+    id: 'settings.menuBarIcon.description',
+    defaultMessage: 'Show goose in the menu bar',
+  },
   dockIcon: { id: 'settings.dockIcon.title', defaultMessage: 'Dock icon' },
   dockIconDesc: { id: 'settings.dockIcon.description', defaultMessage: 'Show goose in the dock' },
   preventSleep: { id: 'settings.preventSleep.title', defaultMessage: 'Prevent Sleep' },
-  preventSleepDesc: { id: 'settings.preventSleep.description', defaultMessage: 'Keep your computer awake while goose is running a task (screen can still lock)' },
+  preventSleepDesc: {
+    id: 'settings.preventSleep.description',
+    defaultMessage:
+      'Keep your computer awake while goose is running a task (screen can still lock)',
+  },
   costTracking: { id: 'settings.costTracking.title', defaultMessage: 'Cost Tracking' },
-  costTrackingDesc: { id: 'settings.costTracking.description', defaultMessage: 'Show model pricing and usage costs' },
+  costTrackingDesc: {
+    id: 'settings.costTracking.description',
+    defaultMessage: 'Show model pricing and usage costs',
+  },
   themeTitle: { id: 'settings.theme.title', defaultMessage: 'Theme' },
-  themeDesc: { id: 'settings.theme.description', defaultMessage: 'Customize the look and feel of goose' },
+  themeDesc: {
+    id: 'settings.theme.description',
+    defaultMessage: 'Customize the look and feel of goose',
+  },
   navigationTitle: { id: 'settings.navigation.title', defaultMessage: 'Navigation' },
-  navigationDesc: { id: 'settings.navigation.description', defaultMessage: 'Customize navigation layout and behavior' },
+  navigationDesc: {
+    id: 'settings.navigation.description',
+    defaultMessage: 'Customize navigation layout and behavior',
+  },
   navMode: { id: 'settings.navigation.mode', defaultMessage: 'Mode' },
   navStyle: { id: 'settings.navigation.style', defaultMessage: 'Style' },
   navPosition: { id: 'settings.navigation.position', defaultMessage: 'Position' },
   navCustomize: { id: 'settings.navigation.customize', defaultMessage: 'Customize Items' },
   helpTitle: { id: 'settings.help.title', defaultMessage: 'Help & feedback' },
-  helpDesc: { id: 'settings.help.description', defaultMessage: 'Help us improve goose by reporting issues or requesting new features' },
+  helpDesc: {
+    id: 'settings.help.description',
+    defaultMessage: 'Help us improve goose by reporting issues or requesting new features',
+  },
   reportBug: { id: 'settings.help.reportBug', defaultMessage: 'Report a Bug' },
   requestFeature: { id: 'settings.help.requestFeature', defaultMessage: 'Request a Feature' },
   versionTitle: { id: 'settings.version.title', defaultMessage: 'Version' },
   updatesTitle: { id: 'settings.updates.title', defaultMessage: 'Updates' },
-  updatesDesc: { id: 'settings.updates.description', defaultMessage: 'Check for and install updates to keep goose running at its best' },
-  notificationsModalTitle: { id: 'settings.notifications.modal.title', defaultMessage: 'How to Enable Notifications' },
-  notificationsMacInstructions: { id: 'settings.notifications.modal.macInstructions', defaultMessage: 'To enable notifications on macOS:' },
-  notificationsMacStep1: { id: 'settings.notifications.modal.macStep1', defaultMessage: 'Open System Preferences' },
-  notificationsMacStep2: { id: 'settings.notifications.modal.macStep2', defaultMessage: 'Click on Notifications' },
-  notificationsMacStep3: { id: 'settings.notifications.modal.macStep3', defaultMessage: 'Find and select goose in the application list' },
-  notificationsMacStep4: { id: 'settings.notifications.modal.macStep4', defaultMessage: 'Enable notifications and adjust settings as desired' },
-  notificationsWinInstructions: { id: 'settings.notifications.modal.winInstructions', defaultMessage: 'To enable notifications on Windows:' },
-  notificationsWinStep1: { id: 'settings.notifications.modal.winStep1', defaultMessage: 'Open Settings' },
-  notificationsWinStep2: { id: 'settings.notifications.modal.winStep2', defaultMessage: 'Go to System > Notifications' },
-  notificationsWinStep3: { id: 'settings.notifications.modal.winStep3', defaultMessage: 'Find and select goose in the application list' },
-  notificationsWinStep4: { id: 'settings.notifications.modal.winStep4', defaultMessage: 'Toggle notifications on and adjust settings as desired' },
+  updatesDesc: {
+    id: 'settings.updates.description',
+    defaultMessage: 'Check for and install updates to keep goose running at its best',
+  },
+  notificationsModalTitle: {
+    id: 'settings.notifications.modal.title',
+    defaultMessage: 'How to Enable Notifications',
+  },
+  notificationsMacInstructions: {
+    id: 'settings.notifications.modal.macInstructions',
+    defaultMessage: 'To enable notifications on macOS:',
+  },
+  notificationsMacStep1: {
+    id: 'settings.notifications.modal.macStep1',
+    defaultMessage: 'Open System Preferences',
+  },
+  notificationsMacStep2: {
+    id: 'settings.notifications.modal.macStep2',
+    defaultMessage: 'Click on Notifications',
+  },
+  notificationsMacStep3: {
+    id: 'settings.notifications.modal.macStep3',
+    defaultMessage: 'Find and select goose in the application list',
+  },
+  notificationsMacStep4: {
+    id: 'settings.notifications.modal.macStep4',
+    defaultMessage: 'Enable notifications and adjust settings as desired',
+  },
+  notificationsWinInstructions: {
+    id: 'settings.notifications.modal.winInstructions',
+    defaultMessage: 'To enable notifications on Windows:',
+  },
+  notificationsWinStep1: {
+    id: 'settings.notifications.modal.winStep1',
+    defaultMessage: 'Open Settings',
+  },
+  notificationsWinStep2: {
+    id: 'settings.notifications.modal.winStep2',
+    defaultMessage: 'Go to System > Notifications',
+  },
+  notificationsWinStep3: {
+    id: 'settings.notifications.modal.winStep3',
+    defaultMessage: 'Find and select goose in the application list',
+  },
+  notificationsWinStep4: {
+    id: 'settings.notifications.modal.winStep4',
+    defaultMessage: 'Toggle notifications on and adjust settings as desired',
+  },
   close: { id: 'settings.close', defaultMessage: 'Close' },
 });
 
@@ -94,23 +163,31 @@ const NavigationSettingsContent: React.FC = () => {
       {isExpanded && (
         <CardContent className="pt-4 px-4 space-y-6">
           <div>
-            <h3 className="text-sm font-medium text-text-primary mb-3">{intl.formatMessage(i18n.navMode)}</h3>
+            <h3 className="text-sm font-medium text-text-primary mb-3">
+              {intl.formatMessage(i18n.navMode)}
+            </h3>
             <NavigationModeSelector />
           </div>
           {!isOverlayMode && (
             <div>
-              <h3 className="text-sm font-medium text-text-primary mb-3">{intl.formatMessage(i18n.navStyle)}</h3>
+              <h3 className="text-sm font-medium text-text-primary mb-3">
+                {intl.formatMessage(i18n.navStyle)}
+              </h3>
               <NavigationStyleSelector />
             </div>
           )}
           {!isOverlayMode && (
             <div>
-              <h3 className="text-sm font-medium text-text-primary mb-3">{intl.formatMessage(i18n.navPosition)}</h3>
+              <h3 className="text-sm font-medium text-text-primary mb-3">
+                {intl.formatMessage(i18n.navPosition)}
+              </h3>
               <NavigationPositionSelector />
             </div>
           )}
           <div>
-            <h3 className="text-sm font-medium text-text-primary mb-3">{intl.formatMessage(i18n.navCustomize)}</h3>
+            <h3 className="text-sm font-medium text-text-primary mb-3">
+              {intl.formatMessage(i18n.navCustomize)}
+            </h3>
             <NavigationCustomizationSettings />
           </div>
         </CardContent>
@@ -140,6 +217,7 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
   const [menuBarIconEnabled, setMenuBarIconEnabled] = useState(true);
   const [dockIconEnabled, setDockIconEnabled] = useState(true);
   const [wakelockEnabled, setWakelockEnabled] = useState(true);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [isMacOS, setIsMacOS] = useState(false);
   const [isDockSwitchDisabled, setIsDockSwitchDisabled] = useState(false);
   const [showNotificationModal, setShowNotificationModal] = useState(false);
@@ -187,6 +265,10 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
 
     window.electron.getWakelockState().then((enabled) => {
       setWakelockEnabled(enabled);
+    });
+
+    window.electron.getSetting('enableNotifications').then((enabled) => {
+      setNotificationsEnabled(enabled ?? true);
     });
 
     if (isMacOS) {
@@ -247,6 +329,12 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
     }
   };
 
+  const handleNotificationsToggle = async (checked: boolean) => {
+    setNotificationsEnabled(checked);
+    await window.electron.setSetting('enableNotifications', checked);
+    trackSettingToggled('task_notifications', checked);
+  };
+
   const handleShowPricingToggle = async (checked: boolean) => {
     setShowPricing(checked);
     await window.electron.setSetting('showPricing', checked);
@@ -267,7 +355,9 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
         <CardContent className="pt-4 space-y-4 px-4">
           <div className="flex items-center justify-between">
             <div>
-              <h3 className="text-text-primary text-xs">{intl.formatMessage(i18n.notifications)}</h3>
+              <h3 className="text-text-primary text-xs">
+                {intl.formatMessage(i18n.notifications)}
+              </h3>
               <p className="text-xs text-text-secondary max-w-md mt-[2px]">
                 {intl.formatMessage(i18n.notificationsDesc, {
                   link: (
@@ -297,6 +387,24 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
                 <Settings />
                 {intl.formatMessage(i18n.openSettings)}
               </Button>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-text-primary text-xs">
+                {intl.formatMessage(i18n.taskNotifications)}
+              </h3>
+              <p className="text-xs text-text-secondary max-w-md mt-[2px]">
+                {intl.formatMessage(i18n.taskNotificationsDesc)}
+              </p>
+            </div>
+            <div className="flex items-center">
+              <Switch
+                checked={notificationsEnabled}
+                onCheckedChange={handleNotificationsToggle}
+                variant="mono"
+              />
             </div>
           </div>
 
@@ -386,21 +494,19 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
       {/* Navigation Settings */}
       <NavigationSettingsCard />
 
-      <TelemetrySettings isWelcome={false} />
+      <TelemetrySettings />
 
       <Card className="rounded-lg">
         <CardHeader className="pb-0">
           <CardTitle className="mb-1">{intl.formatMessage(i18n.helpTitle)}</CardTitle>
-          <CardDescription>
-            {intl.formatMessage(i18n.helpDesc)}
-          </CardDescription>
+          <CardDescription>{intl.formatMessage(i18n.helpDesc)}</CardDescription>
         </CardHeader>
         <CardContent className="pt-4 px-4">
           <div className="flex space-x-4">
             <Button
               onClick={() => {
                 window.open(
-                  'https://github.com/block/goose/issues/new?template=bug_report.md',
+                  'https://github.com/aaif-goose/goose/issues/new?template=bug_report.md',
                   '_blank'
                 );
               }}
@@ -412,7 +518,7 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
             <Button
               onClick={() => {
                 window.open(
-                  'https://github.com/block/goose/issues/new?template=feature_request.md',
+                  'https://github.com/aaif-goose/goose/issues/new?template=feature_request.md',
                   '_blank'
                 );
               }}
@@ -435,7 +541,7 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
             <div className="flex items-center gap-3">
               <img
                 src={isDarkMode ? BlockLogoWhite : BlockLogoBlack}
-                alt="Block Logo"
+                alt="Block Logo" // TODO: replace with AAIF logo asset
                 className="h-8 w-auto"
               />
               <span className="text-2xl font-mono text-black dark:text-white">
@@ -452,9 +558,7 @@ export default function AppSettingsSection({ scrollToSection }: AppSettingsSecti
           <Card className="rounded-lg">
             <CardHeader className="pb-0">
               <CardTitle className="mb-1">{intl.formatMessage(i18n.updatesTitle)}</CardTitle>
-              <CardDescription>
-                {intl.formatMessage(i18n.updatesDesc)}
-              </CardDescription>
+              <CardDescription>{intl.formatMessage(i18n.updatesDesc)}</CardDescription>
             </CardHeader>
             <CardContent className="px-4">
               <UpdateSection />

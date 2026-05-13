@@ -4,7 +4,7 @@
     "title": "goose-server",
     "description": "An AI agent",
     "contact": {
-      "name": "Block",
+      "name": "AAIF",
       "email": "ai-oss-tools@block.xyz"
     },
     "license": {
@@ -73,29 +73,6 @@
                 }
               }
             }
-          }
-        }
-      }
-    },
-    "/config/backup": {
-      "post": {
-        "tags": [
-          "super::routes::config_management"
-        ],
-        "operationId": "backup_config",
-        "responses": {
-          "200": {
-            "description": "Config file backed up",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error"
           }
         }
       }

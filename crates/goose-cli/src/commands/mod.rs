@@ -1,6 +1,8 @@
 pub mod configure;
+pub mod doctor;
 pub mod gateway;
 pub mod info;
+pub mod plugin;
 pub mod project;
 pub mod recipe;
 pub mod schedule;

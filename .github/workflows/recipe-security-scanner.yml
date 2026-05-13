@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@e3f713f2d8f53843e71c69a996d56f51aa9adfb9  # v2.14.1
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40  # v2.19.0
         with:
           egress-policy: audit
       
@@ -146,7 +146,7 @@ jobs:
       - name: Scan all recipe files
         if: steps.find_recipes.outputs.has_recipes == 'true' && steps.recipe_changes.outputs.recipe_files_changed == 'true'
         env:
-          SECURITY_SCANNER_ANTHROPIC_API_KEY: ${{ secrets.SECURITY_SCANNER_ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TRAINING_DATA_LOW: ${{ secrets.TRAINING_DATA_LOW }}
           TRAINING_DATA_MEDIUM: ${{ secrets.TRAINING_DATA_MEDIUM }}
           TRAINING_DATA_EXTREME: ${{ secrets.TRAINING_DATA_EXTREME }}
@@ -159,7 +159,7 @@ jobs:
           sudo chmod -R 777 "$OUT" || true
           
           # Verify secrets are available (without logging details)
-          if [ -z "$SECURITY_SCANNER_ANTHROPIC_API_KEY" ] || [ -z "$TRAINING_DATA_LOW" ] || [ -z "$TRAINING_DATA_MEDIUM" ] || [ -z "$TRAINING_DATA_EXTREME" ]; then
+          if [ -z "$OPENAI_API_KEY" ] || [ -z "$TRAINING_DATA_LOW" ] || [ -z "$TRAINING_DATA_MEDIUM" ] || [ -z "$TRAINING_DATA_EXTREME" ]; then
             echo "❌ One or more required secrets are missing or inaccessible"
             exit 1
           fi
@@ -183,7 +183,7 @@ jobs:
               
               # Run scanner on this recipe with training data
               if docker run --rm \
-                -e SECURITY_SCANNER_ANTHROPIC_API_KEY="$SECURITY_SCANNER_ANTHROPIC_API_KEY" \
+                -e OPENAI_API_KEY="$OPENAI_API_KEY" \
                 -e TRAINING_DATA_LOW="$TRAINING_DATA_LOW" \
                 -e TRAINING_DATA_MEDIUM="$TRAINING_DATA_MEDIUM" \
                 -e TRAINING_DATA_EXTREME="$TRAINING_DATA_EXTREME" \
@@ -252,7 +252,7 @@ jobs:
 
       - name: Post scan results to PR
         if: always() && steps.find_recipes.outputs.has_recipes == 'true' && steps.recipe_changes.outputs.recipe_files_changed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
           WORKSPACE: ${{ github.workspace }}
           RUNNER_TEMP: ${{ runner.temp }}
@@ -347,7 +347,7 @@ jobs:
 
       - name: Set GitHub status check
         if: always() && steps.find_recipes.outputs.has_recipes == 'true' && steps.recipe_changes.outputs.recipe_files_changed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         with:

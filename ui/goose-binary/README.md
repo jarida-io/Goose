@@ -19,7 +19,7 @@ From the repository root:
 
 ```bash
 # Build for current platform only
-cd ui/acp
+cd ui/sdk
 npm run build:native
 
 # Build for all platforms (requires cross-compilation toolchains)
@@ -32,6 +32,11 @@ npx tsx scripts/build-native.ts darwin-arm64 linux-x64
 The built binaries are placed into `ui/goose-binary/goose-binary-{platform}/bin/`.
 These directories are git-ignored.
 
+Linux native binaries are built with local inference Vulkan support. Linux build
+hosts need Vulkan headers and `glslc`; Linux runtime hosts need the Vulkan loader
+package, such as `libvulkan1` on Debian/Ubuntu or `vulkan-loader` on RPM-based
+distributions.
+
 ## Publishing
 
 Publishing is handled by GitHub Actions. See `.github/workflows/publish-npm.yml`.
@@ -43,7 +48,7 @@ For manual publishing:
 ./ui/scripts/publish.sh --real
 ```
 
-This will publish all native packages along with `@aaif/goose-acp` and `@aaif/goose`.
+This will publish all native packages along with `@aaif/goose-sdk` and `@aaif/goose`.
 
 ## Usage
 

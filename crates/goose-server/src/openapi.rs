@@ -10,8 +10,8 @@ use goose::permission::permission_confirmation::{Permission, PrincipalType};
 use goose::providers::base::{ConfigKey, ModelInfo, ProviderMetadata, ProviderType};
 use goose::session::{Session, SessionInsights, SessionType, SystemInfo};
 use rmcp::model::{
-    Annotations, Content, EmbeddedResource, Icon, ImageContent, JsonObject, RawAudioContent,
-    RawContent, RawEmbeddedResource, RawImageContent, RawResource, RawTextContent,
+    Annotations, Content, EmbeddedResource, Icon, IconTheme, ImageContent, JsonObject,
+    RawAudioContent, RawContent, RawEmbeddedResource, RawImageContent, RawResource, RawTextContent,
     ResourceContents, Role, TaskSupport, TextContent, Tool, ToolAnnotations, ToolExecution,
 };
 use utoipa::{OpenApi, ToSchema};
@@ -378,6 +378,7 @@ derive_utoipa!(Annotations as AnnotationsSchema);
 derive_utoipa!(ResourceContents as ResourceContentsSchema);
 derive_utoipa!(JsonObject as JsonObjectSchema);
 derive_utoipa!(Icon as IconSchema);
+derive_utoipa!(IconTheme as IconThemeSchema);
 
 #[derive(OpenApi)]
 #[openapi(
@@ -386,10 +387,7 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::status::system_info,
         super::routes::status::diagnostics,
         super::routes::mcp_ui_proxy::mcp_ui_proxy,
-        super::routes::config_management::backup_config,
-        super::routes::config_management::recover_config,
         super::routes::config_management::validate_config,
-        super::routes::config_management::init_config,
         super::routes::config_management::upsert_config,
         super::routes::config_management::remove_config,
         super::routes::config_management::read_config,
@@ -445,6 +443,8 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::session::delete_session,
         super::routes::session::export_session,
         super::routes::session::import_session,
+        super::routes::session::share_session_nostr,
+        super::routes::session::import_session_nostr,
         super::routes::session::update_session_user_recipe_values,
         super::routes::session::fork_session,
         super::routes::session::get_session_extensions,
@@ -514,6 +514,9 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::session_events::SessionReplyResponse,
         super::routes::session_events::CancelRequest,
         super::routes::session::ImportSessionRequest,
+        super::routes::session::ShareSessionNostrRequest,
+        super::routes::session::ShareSessionNostrResponse,
+        super::routes::session::ImportSessionNostrRequest,
         super::routes::session::SessionListResponse,
         super::routes::session::UpdateSessionNameRequest,
         super::routes::session::UpdateSessionUserRecipeValuesRequest,
@@ -577,6 +580,7 @@ derive_utoipa!(Icon as IconSchema);
         SystemInfo,
         Conversation,
         IconSchema,
+        IconThemeSchema,
         goose::session::extension_data::ExtensionData,
         super::routes::schedule::CreateScheduleRequest,
         super::routes::schedule::UpdateScheduleRequest,
@@ -672,6 +676,7 @@ pub struct ApiDoc;
         super::routes::dictation::cancel_download,
         super::routes::dictation::delete_model,
         super::routes::local_inference::list_local_models,
+        super::routes::local_inference::sync_featured_models,
         super::routes::local_inference::search_hf_models,
         super::routes::local_inference::get_repo_files,
         super::routes::local_inference::download_hf_model,

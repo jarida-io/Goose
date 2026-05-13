@@ -5,9 +5,13 @@ use axum::middleware;
 use axum_server::Handle;
 use goose_server::auth::check_token;
 #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
-use goose_server::tls::self_signed_config;
+use goose_server::tls::setup_tls;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
+
+fn boot_marker(message: &str) {
+    eprintln!("GOOSED_BOOT: {message}");
+}
 
 #[cfg(unix)]
 async fn shutdown_signal() {
@@ -35,13 +39,17 @@ pub async fn run() -> Result<()> {
     #[cfg(feature = "rustls-tls")]
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    boot_marker("main entered");
     crate::logging::setup_logging(Some("goosed"))?;
+
+    goose::security::set_security_defaults();
 
     let settings = configuration::Settings::new()?;
 
     let secret_key = std::env::var("GOOSE_SERVER__SECRET_KEY")
         .unwrap_or_else(|_| hex::encode(rand::random::<[u8; 32]>()));
 
+    boot_marker("appstate init start");
     let app_state = state::AppState::new(settings.tls).await?;
 
     // Share the server secret with the tunnel manager so it uses the same
@@ -78,7 +86,12 @@ pub async fn run() -> Result<()> {
     if settings.tls {
         #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
         {
-            let tls_setup = self_signed_config().await?;
+            boot_marker("tls setup start");
+            let tls_setup = setup_tls(
+                settings.tls_cert_path.as_deref(),
+                settings.tls_key_path.as_deref(),
+            )
+            .await?;
 
             let handle = Handle::new();
             let shutdown_handle = handle.clone();
@@ -88,6 +101,7 @@ pub async fn run() -> Result<()> {
             });
 
             info!("listening on https://{}", addr);
+            boot_marker("listening");
 
             #[cfg(feature = "rustls-tls")]
             axum_server::bind_rustls(addr, tls_setup.config)
@@ -110,9 +124,11 @@ pub async fn run() -> Result<()> {
             );
         }
     } else {
+        boot_marker("tcp bind start");
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
         info!("listening on http://{}", addr);
+        boot_marker("listening");
 
         axum::serve(listener, app)
             .with_graceful_shutdown(async { shutdown_signal().await })

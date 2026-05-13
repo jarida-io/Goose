@@ -20,7 +20,7 @@ goose is now available on the App Store! The iOS app connects to your desktop go
 ### Getting Started with Mobile
 
 1. **Install the app** - Download [goose from the App Store](https://apps.apple.com/app/goose-ai/id6752889295)
-2. **Enable remote access** - In the goose desktop app, go to App Settings and turn on "Remote Access"
+2. **Enable remote access** - In the goose desktop app, open `Settings`, click `Session`, and click `Start Tunnel` in the `Mobile App` section
 3. **Scan the QR code** - Use the iOS app to scan the QR code displayed in your desktop app
 4. **Start working** - You're connected! Your mobile app now tunnels to your goose desktop instance
 
@@ -55,12 +55,12 @@ Try them out and let us know what you think in our [Discord](https://discord.gg/
 <head>
   <meta property="og:title" content="goose Mobile Access and Native Terminal Support" />
   <meta property="og:type" content="article" />
-  <meta property="og:url" content="https://block.github.io/goose/blog/2025/12/19/goose-mobile-terminal" />
+  <meta property="og:url" content="https://goose-docs.ai/blog/2025/12/19/goose-mobile-terminal" />
   <meta property="og:description" content="Two new ways to use goose" />
-  <meta property="og:image" content="https://block.github.io/goose/blog/2025/12/19/goose-mobile-terminal/mobile_shots.png" />
+  <meta property="og:image" content="https://goose-docs.ai/blog/2025/12/19/goose-mobile-terminal/mobile_shots.png" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta property="twitter:domain" content="block.github.io/goose" />
+  <meta property="twitter:domain" content="goose-docs.ai" />
   <meta name="twitter:title" content="goose mobile access and native terminal support" />
   <meta name="twitter:description" content="Two new ways to use goose" />
-  <meta name="twitter:image" content="https://block.github.io/goose/blog/2025/12/19/goose-mobile-terminal/mobile_shots.png" />
+  <meta name="twitter:image" content="https://goose-docs.ai/blog/2025/12/19/goose-mobile-terminal/mobile_shots.png" />
 </head>
