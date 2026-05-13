@@ -131,12 +131,13 @@ fn resolve_model_path(model_id: &str) -> Option<ResolvedModelPaths> {
         if let Some(entry) = registry.get_model(model_id) {
             let ctx = entry.settings.context_size.unwrap_or(0) as usize;
             let mut settings = entry.settings.clone();
-            // Capability flags are inherent to the model family, not user-configurable.
-            // Re-derive them so that registry entries persisted before a model was
-            // recognized (or with a different quantization) still get the right behavior.
+            // Capability flags: use featured-model defaults as a floor, but never
+            // downgrade a value that was explicitly set to `true` in the registry
+            // (e.g. by GIAP's `apply_platform_settings()`).
             let defaults = default_settings_for_model(model_id);
-            settings.native_tool_calling = defaults.native_tool_calling;
-            settings.vision_capable = defaults.vision_capable;
+            settings.native_tool_calling =
+                settings.native_tool_calling || defaults.native_tool_calling;
+            settings.vision_capable = settings.vision_capable || defaults.vision_capable;
             settings.mmproj_size_bytes = entry.mmproj_size_bytes;
             let mmproj_path = entry.mmproj_path.as_ref().filter(|p| p.exists()).cloned();
             return Some(ResolvedModelPaths {

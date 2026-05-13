@@ -292,7 +292,9 @@ impl LocalModelEntry {
             }
         }
         let defaults = default_settings_for_model(&self.id);
-        self.settings.native_tool_calling = defaults.native_tool_calling;
+        // Use featured defaults as a floor — never downgrade explicit `true`.
+        self.settings.native_tool_calling =
+            self.settings.native_tool_calling || defaults.native_tool_calling;
     }
 
     pub fn is_downloaded(&self) -> bool {
