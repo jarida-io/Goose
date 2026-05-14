@@ -167,6 +167,20 @@ pub const FEATURED_MODELS: &[FeaturedModel] = &[
         native_tool_calling: false,
         mmproj: None,
     },
+    // ── Gemma 4 family ────────────────────────────────────────────────────
+    FeaturedModel {
+        spec: "unsloth/gemma-4-E1B-it-GGUF:Q4_K_M",
+        native_tool_calling: true,
+        mmproj: None,
+    },
+    FeaturedModel {
+        spec: "unsloth/gemma-4-E2B-it-GGUF:Q4_K_M",
+        native_tool_calling: true,
+        mmproj: Some(MmprojSpec {
+            repo: "unsloth/gemma-4-E2B-it-GGUF",
+            filename: "mmproj-BF16.gguf",
+        }),
+    },
     FeaturedModel {
         spec: "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M",
         native_tool_calling: true,
@@ -176,10 +190,26 @@ pub const FEATURED_MODELS: &[FeaturedModel] = &[
         }),
     },
     FeaturedModel {
+        spec: "unsloth/gemma-4-12B-A4B-it-GGUF:Q4_K_M",
+        native_tool_calling: true,
+        mmproj: Some(MmprojSpec {
+            repo: "unsloth/gemma-4-12B-A4B-it-GGUF",
+            filename: "mmproj-BF16.gguf",
+        }),
+    },
+    FeaturedModel {
         spec: "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
         native_tool_calling: true,
         mmproj: Some(MmprojSpec {
             repo: "unsloth/gemma-4-26B-A4B-it-GGUF",
+            filename: "mmproj-BF16.gguf",
+        }),
+    },
+    FeaturedModel {
+        spec: "unsloth/gemma-4-27B-it-GGUF:Q4_K_M",
+        native_tool_calling: true,
+        mmproj: Some(MmprojSpec {
+            repo: "unsloth/gemma-4-27B-it-GGUF",
             filename: "mmproj-BF16.gguf",
         }),
     },
