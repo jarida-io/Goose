@@ -335,6 +335,7 @@ impl ClientHandler for GooseClient {
             .map(|user_data| CreateElicitationResult {
                 action: ElicitationAction::Accept,
                 content: Some(user_data),
+                meta: None,
             })
             .map_err(|e| {
                 ErrorData::new(
