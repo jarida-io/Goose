@@ -72,6 +72,19 @@ fn resolve_ollama_num_ctx(model_config: &ModelConfig) -> Option<usize> {
     input_limit.or(model_config.context_limit)
 }
 
+/// True when a provider error is Ollama's "this model does not support tools"
+/// rejection (HTTP 400). Model-agnostic: matches on the error text so it works
+/// for any current or future non-tool model.
+fn is_tools_unsupported_error(err: &ProviderError) -> bool {
+    matches!(err, ProviderError::RequestFailed(msg)
+    if {
+        let m = msg.to_lowercase();
+        m.contains("does not support tools")
+            || m.contains("does not support tool")
+            || (m.contains("tool") && m.contains("not support"))
+    })
+}
+
 fn resolve_ollama_stream_usage() -> bool {
     let config = crate::config::Config::global();
     match config.get_param::<bool>("OLLAMA_STREAM_USAGE") {
@@ -232,6 +245,40 @@ impl OllamaProvider {
             skip_canonical_filtering: config.skip_canonical_filtering,
         })
     }
+
+    async fn stream_inner(
+        &self,
+        model_config: &ModelConfig,
+        session_id: &str,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        let mut payload = create_request(
+            model_config,
+            system,
+            messages,
+            tools,
+            &ImageFormat::OpenAi,
+            true,
+        )?;
+        apply_ollama_options(&mut payload, model_config);
+        let mut log = RequestLog::start(model_config, &payload)?;
+
+        let response = self
+            .with_retry(|| async {
+                let resp = self
+                    .api_client
+                    .response_post(Some(session_id), "v1/chat/completions", &payload)
+                    .await?;
+                handle_status(resp).await
+            })
+            .await
+            .inspect_err(|e| {
+                let _ = log.error(e);
+            })?;
+        stream_ollama(response, log)
+    }
 }
 
 impl ProviderDef for OllamaProvider {
@@ -318,30 +365,24 @@ impl Provider for OllamaProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        let mut payload = create_request(
-            model_config,
-            system,
-            messages,
-            tools,
-            &ImageFormat::OpenAi,
-            true,
-        )?;
-        apply_ollama_options(&mut payload, model_config);
-        let mut log = RequestLog::start(model_config, &payload)?;
-
-        let response = self
-            .with_retry(|| async {
-                let resp = self
-                    .api_client
-                    .response_post(Some(session_id), "v1/chat/completions", &payload)
-                    .await?;
-                handle_status(resp).await
-            })
+        // First attempt: with tools (if any).
+        match self
+            .stream_inner(model_config, session_id, system, messages, tools)
             .await
-            .inspect_err(|e| {
-                let _ = log.error(e);
-            })?;
-        stream_ollama(response, log)
+        {
+            Ok(s) => Ok(s),
+            Err(e) if !tools.is_empty() && is_tools_unsupported_error(&e) => {
+                tracing::warn!(
+                    model = %model_config.model_name,
+                    "Model rejected tools (HTTP 400 'does not support tools'); \
+                     retrying this turn WITHOUT tools",
+                );
+                // Retry toolless — the model answers as a plain chat model.
+                self.stream_inner(model_config, session_id, system, messages, &[])
+                    .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
@@ -724,6 +765,35 @@ mod tests {
             resolve_ollama_chunk_timeout(),
             OLLAMA_DEFAULT_CHUNK_TIMEOUT_SECS
         );
+    }
+
+    #[test]
+    fn test_is_tools_unsupported_error_matches_ollama_400() {
+        assert!(is_tools_unsupported_error(&ProviderError::RequestFailed(
+            "Bad request (400): registry.ollama.ai model gemma3:4b does not support tools".into()
+        )));
+        assert!(is_tools_unsupported_error(&ProviderError::RequestFailed(
+            "Bad request (400): model does not support tool use".into()
+        )));
+        assert!(is_tools_unsupported_error(&ProviderError::RequestFailed(
+            "400: this model does not support tools currently".into()
+        )));
+    }
+
+    #[test]
+    fn test_is_tools_unsupported_error_ignores_other_errors() {
+        // Context-length 400 must NOT be treated as a tools rejection.
+        assert!(!is_tools_unsupported_error(
+            &ProviderError::ContextLengthExceeded("too many tokens".into())
+        ));
+        // Unrelated 400 body must NOT match.
+        assert!(!is_tools_unsupported_error(&ProviderError::RequestFailed(
+            "Bad request (400): invalid model name".into()
+        )));
+        // A message that mentions tools but is not a rejection must NOT match.
+        assert!(!is_tools_unsupported_error(&ProviderError::RequestFailed(
+            "Bad request (400): tool call arguments malformed".into()
+        )));
     }
 
     #[test]
