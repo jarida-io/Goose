@@ -25,6 +25,9 @@ pub(super) struct GenerationContext<'a> {
     pub tx: &'a StreamSender,
     pub log: &'a mut Option<Box<dyn RequestLogHandle>>,
     pub images: &'a [ExtractedImage],
+    /// Cold-load time for this request's model, when the load happened in this
+    /// request. None when the model was already resident.
+    pub model_load_ms: Option<u64>,
 }
 
 pub(super) struct LoadedModel {
@@ -45,6 +48,9 @@ pub(super) struct PreparedGeneration<'model> {
     pub llama_ctx: llama_cpp_2::context::LlamaContext<'model>,
     pub prompt_token_count: usize,
     pub effective_ctx: usize,
+    /// Wall-clock time for template application + tokenization + prompt
+    /// prefill decode.
+    pub prefill_ms: u64,
 }
 
 pub(super) struct StopSuffixTrimmer {
@@ -445,6 +451,7 @@ pub(super) fn prepare_generation<'model>(
     full_tools_json: Option<&str>,
     compact_tools_json: Option<&str>,
 ) -> Result<PreparedGeneration<'model>, ProviderError> {
+    let prefill_started = std::time::Instant::now();
     let apply_template = |tools: Option<&str>| {
         let params = OpenAIChatTemplateParams {
             messages_json: oai_messages_json,
@@ -551,6 +558,7 @@ pub(super) fn prepare_generation<'model>(
         llama_ctx,
         prompt_token_count,
         effective_ctx,
+        prefill_ms: prefill_started.elapsed().as_millis() as u64,
     })
 }
 

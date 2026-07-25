@@ -27,7 +27,7 @@ use goose_provider_types::base::{MessageStream, Provider, ProviderDescriptor, Pr
 use goose_provider_types::conversation::message::{
     Message, MessageContent, SystemNotificationType,
 };
-use goose_provider_types::conversation::token_usage::{ProviderUsage, Usage};
+use goose_provider_types::conversation::token_usage::{ProviderStats, ProviderUsage, Usage};
 use goose_provider_types::errors::ProviderError;
 use goose_provider_types::images::ImageFormat;
 use goose_provider_types::model::ModelConfig;
@@ -559,6 +559,7 @@ fn finalize_usage(
     path_label: &str,
     prompt_token_count: usize,
     output_token_count: i32,
+    stats: Option<ProviderStats>,
     extra_log_fields: Option<(&str, &str)>,
 ) -> ProviderUsage {
     let input_tokens = prompt_token_count as i32;
@@ -573,11 +574,22 @@ fn finalize_usage(
         "prompt_tokens": input_tokens,
         "output_tokens": output_token_count,
     });
+    if let Some(stats) = &stats {
+        log_json["time_to_first_token_ms"] = serde_json::json!(stats.time_to_first_token_ms);
+        log_json["prefill_ms"] = serde_json::json!(stats.prefill_ms);
+        log_json["elapsed_ms"] = serde_json::json!(stats.elapsed_ms);
+        log_json["model_load_ms"] = serde_json::json!(stats.model_load_ms);
+        log_json["effective_context_tokens"] = serde_json::json!(stats.effective_context_tokens);
+    }
     if let Some((key, value)) = extra_log_fields {
         log_json[key] = serde_json::json!(value);
     }
     let _ = log.write(&log_json, Some(&usage));
-    ProviderUsage::new(model_name, usage)
+    let usage = ProviderUsage::new(model_name, usage);
+    match stats {
+        Some(stats) => usage.with_stats(stats),
+        None => usage,
+    }
 }
 
 type StreamSender =

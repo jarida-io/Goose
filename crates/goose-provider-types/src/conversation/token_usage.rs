@@ -28,6 +28,13 @@ pub struct ProviderStats {
     pub elapsed_ms: Option<u64>,
     pub output_tokens: Option<usize>,
     pub draft: Option<DraftStats>,
+    /// Time spent before generation: chat-template application, tokenization,
+    /// and prompt prefill decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_ms: Option<u64>,
+    /// Actual context-window size (n_ctx) used for this generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_context_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -222,5 +229,37 @@ mod tests {
         assert_eq!(combined.total_tokens, Some(178));
         assert_eq!(combined.cache_read_input_tokens, Some(14));
         assert_eq!(combined.cache_write_input_tokens, Some(6));
+    }
+
+    #[test]
+    fn test_provider_stats_deserializes_json_without_prefill_fields() {
+        let old_json = r#"{
+            "time_to_first_token_ms": 210,
+            "model_load_ms": null,
+            "elapsed_ms": 4200,
+            "output_tokens": 87,
+            "draft": null
+        }"#;
+        let stats: ProviderStats = serde_json::from_str(old_json).unwrap();
+        assert_eq!(stats.time_to_first_token_ms, Some(210));
+        assert_eq!(stats.elapsed_ms, Some(4200));
+        assert_eq!(stats.prefill_ms, None);
+        assert_eq!(stats.effective_context_tokens, None);
+    }
+
+    #[test]
+    fn test_provider_stats_round_trips_prefill_fields() {
+        let stats = ProviderStats {
+            time_to_first_token_ms: Some(210),
+            elapsed_ms: Some(4200),
+            output_tokens: Some(87),
+            prefill_ms: Some(190),
+            effective_context_tokens: Some(3072),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: ProviderStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.prefill_ms, Some(190));
+        assert_eq!(back.effective_context_tokens, Some(3072));
     }
 }

@@ -17,11 +17,14 @@ pub(super) fn generate_with_native_tools(
     full_tools_json: Option<&str>,
     compact_tools: Option<&str>,
 ) -> Result<(), ProviderError> {
+    let generation_started = std::time::Instant::now();
+    let mut first_piece_at: Option<std::time::Instant> = None;
     let prepared = prepare_generation(ctx, oai_messages_json, full_tools_json, compact_tools)?;
     let template_result = prepared.template_result;
     let mut llama_ctx = prepared.llama_ctx;
     let prompt_token_count = prepared.prompt_token_count;
     let effective_ctx = prepared.effective_ctx;
+    let prefill_ms = prepared.prefill_ms;
 
     let message_id = ctx.message_id;
     let tx = ctx.tx;
@@ -57,6 +60,7 @@ pub(super) fn generate_with_native_tools(
         prompt_token_count,
         effective_ctx,
         |piece| {
+            first_piece_at.get_or_insert_with(std::time::Instant::now);
             generated_text.push_str(piece);
             let mut stop_seen = false;
 
@@ -213,12 +217,23 @@ pub(super) fn generate_with_native_tools(
         let _ = tx.blocking_send(Ok((Some(msg), None)));
     }
 
+    let stats = goose_provider_types::conversation::token_usage::ProviderStats {
+        time_to_first_token_ms: first_piece_at
+            .map(|t| t.duration_since(generation_started).as_millis() as u64),
+        model_load_ms: ctx.model_load_ms,
+        elapsed_ms: Some(generation_started.elapsed().as_millis() as u64),
+        output_tokens: Some(output_token_count.max(0) as usize),
+        draft: None,
+        prefill_ms: Some(prefill_ms),
+        effective_context_tokens: Some(effective_ctx),
+    };
     let provider_usage = finalize_usage(
         ctx.log,
         std::mem::take(&mut ctx.model_name),
         "native",
         prompt_token_count,
         output_token_count,
+        Some(stats),
         Some(("generated_text", &generated_text)),
     );
     let _ = ctx.tx.blocking_send(Ok((None, Some(provider_usage))));
