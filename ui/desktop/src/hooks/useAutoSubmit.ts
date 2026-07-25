@@ -1,10 +1,9 @@
 import { AppEvents } from '../constants/events';
 import { useCallback, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Session } from '../api';
-import { Message } from '../api';
 import { ChatState } from '../types/chatState';
-import { UserInput } from '../types/message';
+import type { Message, UserInput } from '../types/message';
+import type { Session } from '../types/session';
 
 /**
  * Auto-submit scenarios:
@@ -53,6 +52,10 @@ export function useAutoSubmit({
   }, [sessionId]);
 
   const hasUnfilledParameters = useCallback((session: Session) => {
+    if (session.session_type === 'scheduled') {
+      return false;
+    }
+
     const recipe = session.recipe;
     return recipe?.parameters && recipe.parameters.length > 0 && !session.user_recipe_values;
   }, []);

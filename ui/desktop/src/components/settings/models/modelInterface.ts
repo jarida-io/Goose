@@ -1,4 +1,6 @@
-import { ProviderDetails, getProviderModels, listLocalModels } from '../../../api';
+import { listLocalModels } from '../../../acp/local-inference';
+import { acpListProviderDetails, acpListProviderModels } from '../../../acp/providers';
+import type { ProviderDetails, ThinkingEffort } from '../../../types/providers';
 import { errorMessage as getErrorMessage } from '../../../utils/conversionUtils';
 
 export default interface Model {
@@ -9,7 +11,8 @@ export default interface Model {
   alias?: string; // optional model display name
   subtext?: string; // goes below model name if not the provider
   context_limit?: number; // optional context limit override
-  request_params?: Record<string, unknown>; // provider-specific request parameters
+  reasoning?: boolean; // optional reasoning/thinking support metadata
+  request_params?: Record<string, unknown> & { thinking_effort?: ThinkingEffort }; // provider-specific request parameters
 }
 
 export function createModelStruct(
@@ -31,11 +34,8 @@ export function createModelStruct(
   };
 }
 
-export async function getProviderMetadata(
-  providerName: string,
-  getProvidersFunc: (b: boolean) => Promise<ProviderDetails[]>
-) {
-  const providers = await getProvidersFunc(false);
+export async function getProviderMetadata(providerName: string) {
+  const providers = await acpListProviderDetails();
   const matches = providers.find((providerMatch) => providerMatch.name === providerName);
   if (!matches) {
     throw Error(`No match for provider: ${providerName}`);
@@ -45,7 +45,7 @@ export async function getProviderMetadata(
 
 export interface ProviderModelsResult {
   provider: ProviderDetails;
-  models: string[] | null;
+  models: Model[] | null;
   error: string | null;
   warning: string | null;
 }
@@ -57,24 +57,36 @@ export async function fetchModelsForProviders(
     try {
       // For local provider, use listLocalModels and filter to only downloaded models
       if (p.name === 'local') {
-        const response = await listLocalModels();
-        const allModels = response.data || [];
+        const allModels = await listLocalModels();
         const downloadedModels = allModels
           .filter((m) => m.status.state === 'Downloaded')
-          .map((m) => m.id);
+          .map((m) => ({ name: m.id, provider: p.name }) as Model);
         return { provider: p, models: downloadedModels, error: null, warning: null };
       }
 
-      const response = await getProviderModels({
-        path: { name: p.name },
-        throwOnError: true,
-      });
-      const models = response.data || [];
+      const providerModels = await acpListProviderModels(p.name);
+      const models = providerModels.map(
+        (m) =>
+          ({
+            name: m.id,
+            provider: p.name,
+            context_limit: m.contextLimit ?? undefined,
+            reasoning: m.reasoning ?? undefined,
+          }) as Model
+      );
       return { provider: p, models, error: null, warning: null };
     } catch (e: unknown) {
       // For custom providers, fall back to the configured model list
       if (p.provider_type === 'Custom') {
-        const fallbackModels = p.metadata.known_models.map((m) => m.name);
+        const fallbackModels = p.metadata.known_models.map(
+          (m) =>
+            ({
+              name: m.name,
+              provider: p.name,
+              context_limit: m.context_limit,
+              reasoning: m.reasoning ?? undefined,
+            }) as Model
+        );
         if (fallbackModels.length > 0) {
           console.warn(`Failed to fetch models for ${p.name}:`, getErrorMessage(e));
           return {
@@ -98,4 +110,18 @@ export async function fetchModelsForProviders(
   });
 
   return await Promise.all(modelPromises);
+}
+
+export async function fetchModelReasoning(
+  provider: string,
+  model: string,
+  fallback?: boolean
+): Promise<boolean | null> {
+  try {
+    const models = await acpListProviderModels(provider);
+    const match = models.find((m) => m.id === model);
+    return match?.reasoning ?? fallback ?? null;
+  } catch {
+    return fallback ?? null;
+  }
 }

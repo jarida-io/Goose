@@ -59,7 +59,14 @@ Editing in place is useful when:
 
     </TabItem>
     <TabItem value="cli" label="goose CLI">
-        Message editing options are not available in the goose CLI.
+        Use the `--edit` flag with `goose session` to open the session's conversation in your editor as YAML:
+
+        ```bash
+        goose session --resume <session-id> --edit
+        ```
+
+        This opens `$VISUAL` / `$EDITOR` / `vi` with the conversation serialized as YAML. After editing and saving, goose continues the session from the edited conversation. Any later messages you leave in the YAML remain in the session and in goose's context; remove messages from the YAML if you want goose to forget them.
+
     </TabItem>
 </Tabs>
 
@@ -86,7 +93,15 @@ Forking sessions is useful to:
         :::
 </TabItem>
     <TabItem value="cli" label="goose CLI">
-    Message editing is not available in the goose CLI, but you can [duplicate entire sessions](/docs/guides/sessions/session-management#duplicate-sessions) using the `--fork` flag.
+        Use the `--edit` and `--fork` flags together to edit a session's conversation and create a new session from the result:
+
+        ```bash
+        goose session --resume <session-id> --fork --edit
+        ```
+
+        This opens `$VISUAL` / `$EDITOR` / `vi` with the conversation serialized as YAML. After editing and saving, goose creates a new session with the edited conversation and resumes from there. The original session remains unchanged.
+
+        You can also [duplicate entire sessions](/docs/guides/sessions/session-management#duplicate-sessions) using `--fork` without `--edit`.
     </TabItem>
 </Tabs>
 
@@ -333,7 +348,7 @@ You can change some settings during a session and they will take effect immediat
   | **Working Directory** | <FolderDot className="inline" size={16} /> directory switcher | New sessions (after restart) |
   | [**Enabled Extensions**](/docs/getting-started/using-extensions#change-extensions-mid-session) | <Puzzle className="inline" size={16} /> icon | Current session only |
   | [**Model**](/docs/getting-started/providers#configure-provider-and-model) | <Bot className="inline" size={16} /> model switcher | New sessions |
-  | [**goose Mode**](/docs/guides/goose-permissions#configuring-goose-mode) | <Tornado className="inline" size={16} /> mode switcher | New sessions |
+  | [**goose Mode**](/docs/guides/managing-tools/goose-permissions#configuring-goose-mode) | <Tornado className="inline" size={16} /> mode switcher | New sessions |
 
   </TabItem>
   <TabItem value="cli" label="goose CLI">
@@ -343,7 +358,7 @@ You can change some settings during a session and they will take effect immediat
   | Setting | Slash Command | Persistence* |
   |---------|--------------|-------------|
   | [**Enabled Extensions**](/docs/getting-started/using-extensions#change-extensions-mid-session) | `/extension` or `/builtin` | Current session only |
-  | [**goose Mode**](/docs/guides/goose-permissions#configuring-goose-mode) | `/mode [options]` | New sessions |
+  | [**goose Mode**](/docs/guides/managing-tools/goose-permissions#configuring-goose-mode) | `/mode [options]` | New sessions |
 
   :::info
   The CLI supports [additional slash commands](/docs/guides/goose-cli-commands#slash-commands) but doesn't support mid-session changes to the working directory or model.

@@ -1,4 +1,5 @@
 pub mod edit;
+pub mod image;
 pub mod shell;
 pub mod tree;
 
@@ -8,6 +9,7 @@ use crate::agents::ToolCallContext;
 use anyhow::Result;
 use async_trait::async_trait;
 use edit::{EditTools, FileEditParams, FileWriteParams};
+use image::{ImageReadParams, ImageTool};
 use indoc::indoc;
 use rmcp::model::{
     CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult,
@@ -27,6 +29,7 @@ pub struct DeveloperClient {
     shell_tool: Arc<ShellTool>,
     edit_tools: Arc<EditTools>,
     tree_tool: Arc<TreeTool>,
+    image_tool: Arc<ImageTool>,
 }
 
 fn developer_instructions() -> &'static str {
@@ -64,16 +67,17 @@ fn developer_instructions() -> &'static str {
 }
 
 impl DeveloperClient {
-    pub fn new(_context: PlatformExtensionContext) -> Result<Self> {
+    pub fn new(context: PlatformExtensionContext) -> Result<Self> {
         let info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(EXTENSION_NAME, "1.0.0").with_title("Developer"))
             .with_instructions(developer_instructions());
 
         Ok(Self {
             info,
-            shell_tool: Arc::new(ShellTool::new()?),
+            shell_tool: Arc::new(ShellTool::new(context.use_login_shell_path)?),
             edit_tools: Arc::new(EditTools::new()),
             tree_tool: Arc::new(TreeTool::new()),
+            image_tool: Arc::new(ImageTool::new()),
         })
     }
 
@@ -152,6 +156,18 @@ impl DeveloperClient {
                 Some(true),
                 Some(false),
             )),
+            Tool::new(
+                "read_image".to_string(),
+                "Read an image from a local file path or http(s) URL and return it as image content for the model to inspect. Supports png, jpeg, gif, and webp.".to_string(),
+                Self::schema::<ImageReadParams>(),
+            )
+            .annotate(ToolAnnotations::from_raw(
+                Some("Read Image".to_string()),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(true),
+            )),
         ]
     }
 }
@@ -176,12 +192,15 @@ impl McpClientTrait for DeveloperClient {
         ctx: &ToolCallContext,
         name: &str,
         arguments: Option<JsonObject>,
-        _cancel_token: CancellationToken,
+        cancel_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
         let working_dir = ctx.working_dir.as_deref();
         match name {
             "shell" => match Self::parse_args::<ShellParams>(arguments) {
-                Ok(params) => Ok(self.shell_tool.shell_with_cwd(params, working_dir).await),
+                Ok(params) => Ok(self
+                    .shell_tool
+                    .shell_with_cwd(params, working_dir, Some(&ctx.session_id), cancel_token)
+                    .await),
                 Err(error) => Ok(ShellTool::error_result(&format!("Error: {error}"), None)),
             },
             "write" => match Self::parse_args::<FileWriteParams>(arguments) {
@@ -200,6 +219,16 @@ impl McpClientTrait for DeveloperClient {
             },
             "tree" => match Self::parse_args::<TreeParams>(arguments) {
                 Ok(params) => Ok(self.tree_tool.tree_with_cwd(params, working_dir)),
+                Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: {error}"
+                ))
+                .with_priority(0.0)])),
+            },
+            "read_image" => match Self::parse_args::<ImageReadParams>(arguments) {
+                Ok(params) => Ok(self
+                    .image_tool
+                    .image_read_with_cwd(params, working_dir)
+                    .await),
                 Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
                     "Error: {error}"
                 ))
@@ -232,7 +261,19 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
 
-        assert_eq!(names, vec!["write", "edit", "shell", "tree"]);
+        assert_eq!(names, vec!["write", "edit", "shell", "tree", "read_image"]);
+    }
+
+    #[test]
+    fn read_image_annotations_reflect_network_access() {
+        let read_image = DeveloperClient::get_tools()
+            .into_iter()
+            .find(|tool| tool.name == "read_image")
+            .unwrap();
+        let annotations = read_image.annotations.unwrap();
+
+        assert_eq!(annotations.read_only_hint, Some(false));
+        assert_eq!(annotations.open_world_hint, Some(true));
     }
 
     fn test_context(data_dir: std::path::PathBuf) -> PlatformExtensionContext {
@@ -240,6 +281,7 @@ mod tests {
             extension_manager: None,
             session_manager: Arc::new(SessionManager::new(data_dir)),
             session: None,
+            use_login_shell_path: false,
         }
     }
 
@@ -294,6 +336,29 @@ mod tests {
             fs::read_to_string(cwd.join("notes.txt")).unwrap(),
             "updated line"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn developer_client_passes_session_id_to_shell_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = DeveloperClient::new(test_context(temp.path().join("sessions"))).unwrap();
+        let ctx = ToolCallContext::new("session-789".to_owned(), None, None);
+
+        let result = client
+            .call_tool(
+                &ctx,
+                "shell",
+                Some(object!({
+                    "command": "printenv AGENT_SESSION_ID"
+                })),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(first_text(&result), "session-789");
     }
 
     #[cfg(not(windows))]

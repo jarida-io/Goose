@@ -5,7 +5,12 @@ pub mod info;
 pub mod plugin;
 pub mod project;
 pub mod recipe;
+pub mod review;
 pub mod schedule;
 pub mod session;
+pub mod skills;
 pub mod term;
+#[cfg(feature = "tui")]
+pub mod tui;
+#[cfg(feature = "update")]
 pub mod update;

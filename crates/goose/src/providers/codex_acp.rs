@@ -8,19 +8,16 @@ use crate::acp::{
 };
 use crate::config::search_path::SearchPaths;
 use crate::config::{Config, GooseMode};
-use crate::model::ModelConfig;
-use crate::providers::acp_tooling::{acp_adapter_installed, acp_inventory_identity};
-use crate::providers::base::{ProviderDef, ProviderMetadata};
-use crate::providers::inventory::InventoryIdentityInput;
+use crate::providers::base::{
+    current_working_dir, ProviderDef, ProviderDescriptor, ProviderMetadata,
+};
 
-const CODEX_ACP_PROVIDER_NAME: &str = "codex-acp";
+pub(crate) const CODEX_ACP_PROVIDER_NAME: &str = "codex-acp";
 const CODEX_ACP_DOC_URL: &str = "https://github.com/zed-industries/codex-acp";
 
 pub struct CodexAcpProvider;
 
-impl ProviderDef for CodexAcpProvider {
-    type Provider = AcpProvider;
-
+impl goose_providers::base::ProviderDescriptor for CodexAcpProvider {
     fn metadata() -> ProviderMetadata {
         ProviderMetadata::new(
             CODEX_ACP_PROVIDER_NAME,
@@ -34,14 +31,26 @@ impl ProviderDef for CodexAcpProvider {
         .with_setup_steps(vec![
             "Install the ACP adapter: `npm install -g @zed-industries/codex-acp`",
             "Run `codex` once to authenticate with your OpenAI account",
-            "Set in your goose config file (`~/.config/goose/config.yaml` on macOS/Linux):\n  GOOSE_PROVIDER: codex-acp\n  GOOSE_MODEL: current",
+            "Add to your goose config file (`~/.config/goose/config.yaml` on macOS/Linux):\n  GOOSE_PROVIDER: codex-acp\n  GOOSE_MODEL: current\n  codex-acp_configured: true",
             "Restart goose for changes to take effect",
         ])
     }
+}
+
+impl ProviderDef for CodexAcpProvider {
+    type Provider = AcpProvider;
 
     fn from_env(
-        model: ModelConfig,
         extensions: Vec<crate::config::ExtensionConfig>,
+        tls_config: Option<crate::providers::api_client::TlsConfig>,
+    ) -> BoxFuture<'static, Result<AcpProvider>> {
+        Self::from_env_with_working_dir(extensions, current_working_dir(), tls_config)
+    }
+
+    fn from_env_with_working_dir(
+        extensions: Vec<crate::config::ExtensionConfig>,
+        working_dir: PathBuf,
+        _tls_config: Option<crate::providers::api_client::TlsConfig>,
     ) -> BoxFuture<'static, Result<AcpProvider>> {
         Box::pin(async move {
             let config = Config::global();
@@ -49,7 +58,6 @@ impl ProviderDef for CodexAcpProvider {
             let resolved_command = SearchPaths::builder()
                 .with_npm()
                 .resolve(CODEX_ACP_PROVIDER_NAME)?;
-            let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let env = vec![];
             let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
             let mcp_servers = extension_configs_to_mcp_servers(&extensions);
@@ -67,7 +75,7 @@ impl ProviderDef for CodexAcpProvider {
             // servers are configured so codex-acp can connect to them.
             let has_http_mcp = mcp_servers
                 .iter()
-                .any(|s| matches!(s, agent_client_protocol::schema::McpServer::Http(_)));
+                .any(|s| matches!(s, agent_client_protocol::schema::v1::McpServer::Http(_)));
             if has_http_mcp {
                 args.extend([
                     "-c".to_string(),
@@ -75,12 +83,17 @@ impl ProviderDef for CodexAcpProvider {
                 ]);
             }
 
-            // Chat and Approve both map to "read-only".
             let mode_mapping = HashMap::from([
-                (GooseMode::Auto, "full-access".to_string()),
-                (GooseMode::Approve, "read-only".to_string()),
-                (GooseMode::SmartApprove, "auto".to_string()),
-                (GooseMode::Chat, "read-only".to_string()),
+                (
+                    GooseMode::Auto,
+                    vec!["full-access".to_string(), "agent-full-access".to_string()],
+                ),
+                (
+                    GooseMode::SmartApprove,
+                    vec!["auto".to_string(), "agent".to_string()],
+                ),
+                (GooseMode::Approve, vec!["read-only".to_string()]),
+                (GooseMode::Chat, vec!["read-only".to_string()]),
             ]);
 
             let provider_config = AcpProviderConfig {
@@ -88,29 +101,18 @@ impl ProviderDef for CodexAcpProvider {
                 args,
                 env,
                 env_remove: vec![],
-                work_dir,
+                work_dir: working_dir,
                 mcp_servers,
-                // Disabled until https://github.com/zed-industries/codex-acp/issues/179 is fixed.
                 session_mode_id: None,
+                session_config_options: vec![],
+                model_config_option_id: None,
                 mode_mapping,
                 notification_callback: None,
             };
 
             let metadata = Self::metadata();
-            AcpProvider::connect(metadata.name, model, goose_mode, provider_config).await
+            AcpProvider::connect(metadata.name, goose_mode, provider_config).await
         })
-    }
-
-    fn supports_inventory_refresh() -> bool {
-        true
-    }
-
-    fn inventory_identity() -> Result<InventoryIdentityInput> {
-        acp_inventory_identity(CODEX_ACP_PROVIDER_NAME, CODEX_ACP_PROVIDER_NAME)
-    }
-
-    fn inventory_configured() -> bool {
-        acp_adapter_installed(CODEX_ACP_PROVIDER_NAME)
     }
 }
 

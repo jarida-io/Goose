@@ -1,9 +1,9 @@
 use goose::conversation::message::Message;
-use goose::model::ModelConfig;
 use goose::providers::api_client::{ApiClient, AuthMethod};
 use goose::providers::base::Provider;
 use goose::providers::openai::OpenAiProvider;
-use goose::session_context::SESSION_ID_HEADER;
+use goose::session_context::{session_id_request_builder, SESSION_ID_HEADER};
+use goose_providers::model::ModelConfig;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -36,13 +36,14 @@ impl HeaderCapture {
 }
 
 fn create_test_provider(mock_server_url: &str) -> Box<dyn Provider> {
-    let api_client = ApiClient::new(
+    let api_client = ApiClient::new_with_tls(
         mock_server_url.to_string(),
         AuthMethod::BearerToken("test-key".to_string()),
+        None,
     )
-    .unwrap();
-    let model = ModelConfig::new_or_fail("gpt-5-nano");
-    Box::new(OpenAiProvider::new(api_client, model))
+    .unwrap()
+    .with_request_builder(session_id_request_builder());
+    Box::new(OpenAiProvider::new(api_client))
 }
 
 async fn setup_mock_server() -> (MockServer, HeaderCapture, Box<dyn Provider>) {
@@ -143,17 +144,18 @@ async fn setup_mock_server() -> (MockServer, HeaderCapture, Box<dyn Provider>) {
 
 async fn make_request(provider: &dyn Provider, session_id: &str) {
     let message = Message::user().with_text("test message");
-    let model_config = provider.get_model_config();
-    let _ = provider
-        .complete(
+    let model_config = ModelConfig::new("gpt-5-nano");
+    let _ = goose::session_context::with_session_id(
+        Some(session_id.to_string()),
+        provider.complete(
             &model_config,
-            session_id,
             "You are a helpful assistant.",
             &[message],
             &[],
-        )
-        .await
-        .unwrap();
+        ),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -161,7 +163,9 @@ async fn make_request(provider: &dyn Provider, session_id: &str) {
 async fn test_session_id_propagates_to_log_records() {
     use opentelemetry::logs::AnyValue;
     use opentelemetry::Key;
-    use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+    use opentelemetry_appender_tracing::layer::{
+        OpenTelemetryTracingBridge, TracingSpanAttributes,
+    };
     use opentelemetry_sdk::logs::{InMemoryLogExporterBuilder, SdkLoggerProvider};
     use tracing_subscriber::prelude::*;
 
@@ -171,7 +175,7 @@ async fn test_session_id_propagates_to_log_records() {
         .build();
 
     let layer = OpenTelemetryTracingBridge::builder(&provider)
-        .with_span_attribute_allowlist(["session.id"])
+        .with_tracing_span_attributes(TracingSpanAttributes::allowlist(["session.id"]))
         .build();
     let subscriber = tracing_subscriber::registry().with(layer);
     let _guard = tracing::subscriber::set_default(subscriber);

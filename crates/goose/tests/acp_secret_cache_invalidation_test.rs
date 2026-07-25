@@ -6,18 +6,17 @@ use common_tests::fixtures::server::AcpServerConnection;
 use common_tests::fixtures::{run_test, send_custom, Connection, TestConnectionConfig};
 use goose::config::paths::Paths;
 use goose::config::{Config, ConfigError};
-use goose::model::ModelConfig;
 use goose::providers::base::{MessageStream, Provider};
-use goose::providers::errors::ProviderError;
 use goose::providers::inventory::ProviderInventoryService;
 use goose::session::session_manager::SessionStorage;
+use goose_providers::errors::ProviderError;
+use goose_providers::model::ModelConfig;
 use goose_test_support::EnforceSessionId;
 use serial_test::serial;
 use std::sync::Arc;
 
 struct MockProvider {
     name: String,
-    model_config: ModelConfig,
 }
 
 #[async_trait::async_trait]
@@ -29,7 +28,6 @@ impl Provider for MockProvider {
     async fn stream(
         &self,
         _model_config: &ModelConfig,
-        _session_id: &str,
         _system: &str,
         _messages: &[goose::conversation::message::Message],
         _tools: &[rmcp::model::Tool],
@@ -37,21 +35,19 @@ impl Provider for MockProvider {
         unimplemented!()
     }
 
-    fn get_model_config(&self) -> ModelConfig {
-        self.model_config.clone()
-    }
-
-    async fn fetch_recommended_models(&self) -> Result<Vec<String>, ProviderError> {
+    async fn fetch_recommended_models(
+        &self,
+        _toolshim: bool,
+    ) -> Result<Vec<String>, ProviderError> {
         Ok(vec!["claude-3-5-haiku-latest".to_string()])
     }
 }
 
 fn mock_provider_factory() -> goose::acp::server::AcpProviderFactory {
-    Arc::new(|provider_name, model_config, _extensions| {
+    Arc::new(|provider_name, _extensions, _working_dir| {
         Box::pin(async move {
             Ok(Arc::new(MockProvider {
                 name: provider_name,
-                model_config,
             }) as Arc<dyn Provider>)
         })
     })
@@ -113,7 +109,7 @@ fn acp_secret_mutations_and_inventory_refresh_invalidate_global_secret_cache() {
         write_secrets(&config_dir, "GROQ_API_KEY: fresh-key\n");
         send_custom(
             conn.cx(),
-            "_goose/dictation/secret/save",
+            "_goose/unstable/dictation/secret/save",
             serde_json::json!({
                 "provider": "groq",
                 "value": "fresh-key",
@@ -133,7 +129,7 @@ fn acp_secret_mutations_and_inventory_refresh_invalidate_global_secret_cache() {
         write_secrets(&config_dir, "{}\n");
         send_custom(
             conn.cx(),
-            "_goose/dictation/secret/delete",
+            "_goose/unstable/dictation/secret/delete",
             serde_json::json!({
                 "provider": "groq",
             }),
@@ -151,7 +147,7 @@ fn acp_secret_mutations_and_inventory_refresh_invalidate_global_secret_cache() {
 
         let save_provider_config = send_custom(
             conn.cx(),
-            "_goose/providers/config/save",
+            "_goose/unstable/providers/config/save",
             serde_json::json!({
                 "providerId": "xai",
                 "fields": [
@@ -199,7 +195,7 @@ fn acp_secret_mutations_and_inventory_refresh_invalidate_global_secret_cache() {
 
         let read_provider_config = send_custom(
             conn.cx(),
-            "_goose/providers/config/read",
+            "_goose/unstable/providers/config/read",
             serde_json::json!({
                 "providerId": "xai",
             }),
@@ -223,7 +219,7 @@ fn acp_secret_mutations_and_inventory_refresh_invalidate_global_secret_cache() {
 
         let delete_provider_config = send_custom(
             conn.cx(),
-            "_goose/providers/config/delete",
+            "_goose/unstable/providers/config/delete",
             serde_json::json!({
                 "providerId": "xai",
             }),
@@ -255,7 +251,7 @@ fn acp_secret_mutations_and_inventory_refresh_invalidate_global_secret_cache() {
 
         let refresh = send_custom(
             conn.cx(),
-            "_goose/providers/inventory/refresh",
+            "_goose/unstable/providers/inventory/refresh",
             serde_json::json!({
                 "providerIds": ["anthropic"],
             }),

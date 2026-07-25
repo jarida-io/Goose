@@ -1,8 +1,8 @@
 import React, { useState, useEffect, FormEvent, useCallback } from 'react';
+import type { ScheduledJobDto } from '@aaif/goose-sdk';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
-import { ScheduledJob } from '../../schedule';
 import { CronPicker } from './CronPicker';
 import { Recipe, parseDeeplink, parseRecipeFromFile } from '../../recipe';
 import { getStorageDirectory } from '../../recipe/recipe_management';
@@ -47,7 +47,7 @@ interface ScheduleModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSubmit: (payload: NewSchedulePayload | string) => Promise<void>;
-  schedule: ScheduledJob | null;
+  schedule: ScheduledJobDto | null;
   isLoadingExternally: boolean;
   apiErrorExternally: string | null;
   initialDeepLink: string | null;
@@ -212,12 +212,12 @@ export const ScheduleModal: React.FC<ScheduleModalProps> = ({
           className="px-8 py-4 space-y-4 flex-grow overflow-y-auto"
         >
           {apiErrorExternally && (
-            <p className="text-text-danger text-sm mb-3 p-2 bg-background-danger border border-border-danger rounded-md">
+            <p className="text-text-danger text-sm mb-3 p-2 border border-border-danger rounded-md">
               {apiErrorExternally}
             </p>
           )}
           {internalValidationError && (
-            <p className="text-text-danger text-sm mb-3 p-2 bg-background-danger border border-border-danger rounded-md">
+            <p className="text-text-danger text-sm mb-3 p-2 border border-border-danger rounded-md">
               {internalValidationError}
             </p>
           )}
@@ -226,7 +226,7 @@ export const ScheduleModal: React.FC<ScheduleModalProps> = ({
             <>
               <div>
                 <label htmlFor="scheduleId-modal" className={modalLabelClassName}>
-                  {intl.formatMessage(i18n.nameLabel)}
+                  {intl.formatMessage(i18n.nameLabel)} <span className="text-red-500">*</span>
                 </label>
                 <Input
                   type="text"
@@ -239,7 +239,9 @@ export const ScheduleModal: React.FC<ScheduleModalProps> = ({
               </div>
 
               <div>
-                <label className={modalLabelClassName}>{intl.formatMessage(i18n.sourceLabel)}</label>
+                <label className={modalLabelClassName}>
+                    {intl.formatMessage(i18n.sourceLabel)} <span className="text-red-500">*</span>
+                </label>
                 <div className="space-y-2">
                   <div className="flex bg-gray-100 dark:bg-gray-700 rounded-full p-1">
                     <button

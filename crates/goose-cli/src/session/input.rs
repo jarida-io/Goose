@@ -1,4 +1,7 @@
 use super::completion::GooseCompleter;
+use super::paste::{
+    read_paste_aware_input, PasteAwareEnterHandler, PasteCaptureHandler, PasteState,
+};
 use super::{CompletionCache, HintStatus};
 use anyhow::Result;
 use goose::config::{Config, GooseMode};
@@ -20,6 +23,7 @@ pub enum InputResult {
     ListPrompts(Option<String>),
     PromptCommand(PromptCommandOptions),
     GooseMode(String),
+    Model(Option<String>),
     Plan(PlanCommandOptions),
     EndPlan,
     Clear,
@@ -82,12 +86,18 @@ impl rustyline::ConditionalEventHandler for CtrlCHandler {
     }
 }
 
+/// The Ctrl-modified character that inserts a newline instead of submitting the
+/// prompt. Configurable via `GOOSE_CLI_NEWLINE_KEY`, defaulting to `j` (Ctrl+J).
+/// Characters already bound to other actions are rejected: `m` (Ctrl+M is Enter)
+/// and `c` (Ctrl+C interrupts), both of which would otherwise shadow the paste
+/// and interrupt handlers.
 pub fn get_newline_key() -> char {
     Config::global()
         .get_param::<String>("GOOSE_CLI_NEWLINE_KEY")
         .ok()
         .and_then(|s| s.chars().next())
         .map(|c| c.to_ascii_lowercase())
+        .filter(|c| !matches!(c, 'm' | 'c'))
         .unwrap_or('j')
 }
 
@@ -135,10 +145,32 @@ pub fn get_input(
         .map(|h| h.completion_cache.clone())
         .ok_or_else(|| anyhow::anyhow!("Editor helper not set"))?;
 
-    let newline_key = get_newline_key();
+    let paste_state = Arc::new(std::sync::RwLock::new(PasteState::default()));
+
+    editor.bind_sequence(
+        rustyline::Event::Any,
+        rustyline::EventHandler::Conditional(Box::new(PasteCaptureHandler::new(
+            paste_state.clone(),
+        ))),
+    );
+
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Enter, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(PasteAwareEnterHandler::new(
+            paste_state.clone(),
+        ))),
+    );
+
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Char('m'), rustyline::Modifiers::CTRL),
+        rustyline::EventHandler::Conditional(Box::new(PasteAwareEnterHandler::new(
+            paste_state.clone(),
+        ))),
+    );
+
     editor.bind_sequence(
         rustyline::KeyEvent(
-            rustyline::KeyCode::Char(newline_key),
+            rustyline::KeyCode::Char(get_newline_key()),
             rustyline::Modifiers::CTRL,
         ),
         rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
@@ -149,9 +181,7 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
-    let prompt = get_input_prompt_string();
-
-    let input = match editor.readline(&prompt) {
+    let input = match read_paste_aware_input(editor, paste_state) {
         Ok(text) => text,
         Err(e) => match e {
             rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
@@ -198,6 +228,8 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_EXTENSION: &str = "/extension ";
     const CMD_BUILTIN: &str = "/builtin ";
     const CMD_MODE: &str = "/mode ";
+    const CMD_MODEL: &str = "/model";
+    const CMD_MODEL_WITH_SPACE: &str = "/model ";
     const CMD_PLAN: &str = "/plan";
     const CMD_ENDPLAN: &str = "/endplan";
     const CMD_CLEAR: &str = "/clear";
@@ -263,6 +295,19 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s.starts_with(CMD_MODE) => Some(InputResult::GooseMode(
             s.get(CMD_MODE.len()..).unwrap_or("").to_string(),
         )),
+        s if s == CMD_MODEL => Some(InputResult::Model(None)),
+        s if s.starts_with(CMD_MODEL_WITH_SPACE) => {
+            let model = s
+                .get(CMD_MODEL_WITH_SPACE.len()..)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if model.is_empty() {
+                Some(InputResult::Model(None))
+            } else {
+                Some(InputResult::Model(Some(model)))
+            }
+        }
         s if s.starts_with(CMD_PLAN) => {
             parse_plan_command(s.get(CMD_PLAN.len()..).unwrap_or("").trim().to_string())
         }
@@ -387,28 +432,17 @@ fn parse_plan_command(input: String) -> Option<InputResult> {
     Some(InputResult::Plan(options))
 }
 
-fn get_input_prompt_string() -> String {
-    if is_vte_with_broken_emoji_width() {
-        return "> ".to_string();
-    }
-    "🪿 ".to_string()
-}
-
-/// VTE < 0.70 renders 🪿 as 1 cell while unicode-width counts 2, causing cursor offset.
-fn is_vte_with_broken_emoji_width() -> bool {
-    let Ok(vte_version) = std::env::var("VTE_VERSION") else {
-        return false;
-    };
-    let Ok(version) = vte_version.parse::<u32>() else {
-        return true;
-    };
-    version < 7000
-}
-
-fn print_help() {
-    let newline_key = get_newline_key().to_ascii_uppercase();
+fn help_text() -> String {
     let modes = GooseMode::VARIANTS.join(", ");
-    println!(
+    let newline_key = get_newline_key().to_ascii_uppercase();
+    let additional_builtin_help = additional_builtin_help();
+    let additional_builtin_help = if additional_builtin_help.is_empty() {
+        String::new()
+    } else {
+        format!("{additional_builtin_help}\n")
+    };
+
+    format!(
         "Available commands:
 /exit or /quit - Exit the session
 /t - Toggle Light/Dark/Ansi theme
@@ -419,6 +453,7 @@ fn print_help() {
 /prompts [--extension <name>] - List all available prompts, optionally filtered by extension
 /prompt <n> [--info] [key=value...] - Get prompt info or execute a prompt
 /mode <name> - Set the goose mode to use ({modes})
+/model [name] - Show the current model, or switch models for this session while keeping the same provider
 /plan <message_text> -  Enters 'plan' mode with optional message. Create a plan based on the current messages and asks user if they want to act on it.
                         If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.
                         To warm up goose before using '/plan', we recommend setting '/mode approve' & putting appropriate context into goose.
@@ -428,6 +463,7 @@ fn print_help() {
 /recipe [filepath] - Generate a recipe from the current conversation and save it to the specified filepath (must end with .yaml).
                        If no filepath is provided, it will be saved to ./recipe.yaml.
 /compact - Compact the current conversation to reduce context length while preserving key information.
+{additional_builtin_help}/status - Show session status: model, provider, mode, and token usage.
 /edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
                Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
 /skills - List available skills or enable skills by name (usage: /skills [<name>...])
@@ -435,10 +471,27 @@ fn print_help() {
 /clear - Clears the current chat history
 
 Navigation:
-Ctrl+C - Clear current line if text is entered, otherwise exit the session
+Enter - Send message
 Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
+Ctrl+C - Clear current line if text is entered, otherwise exit the session
 Up/Down arrows - Navigate through command history"
-    );
+    )
+}
+
+fn additional_builtin_help() -> String {
+    const DOCUMENTED_BUILTINS: &[&str] =
+        &["prompts", "prompt", "compact", "clear", "skills", "status"];
+
+    goose::agents::execute_commands::list_commands()
+        .iter()
+        .filter(|command| !DOCUMENTED_BUILTINS.contains(&command.name))
+        .map(|command| format!("/{} - {}", command.name, command.description))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn print_help() {
+    println!("{}", help_text());
 }
 
 /// Extract recent messages for editor context
@@ -518,8 +571,36 @@ mod tests {
             panic!("Expected AddBuiltin");
         }
 
+        // Test model command
+        assert!(matches!(
+            handle_slash_command("/model"),
+            Some(InputResult::Model(None))
+        ));
+        assert!(matches!(
+            handle_slash_command("/model   "),
+            Some(InputResult::Model(None))
+        ));
+        if let Some(InputResult::Model(Some(model))) = handle_slash_command("/model gpt-4.1") {
+            assert_eq!(model, "gpt-4.1");
+        } else {
+            panic!("Expected Model");
+        }
+
         // Test unknown commands
         assert!(handle_slash_command("/unknown").is_none());
+    }
+
+    #[test]
+    fn help_lists_builtin_agent_commands() {
+        let help = help_text();
+
+        for command in goose::agents::execute_commands::list_commands() {
+            assert!(
+                help.contains(&format!("/{}", command.name)),
+                "help output should list /{}",
+                command.name
+            );
+        }
     }
 
     #[test]

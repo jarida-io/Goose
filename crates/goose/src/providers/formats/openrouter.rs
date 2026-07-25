@@ -1,5 +1,7 @@
 use crate::conversation::message::{Message, MessageContent, ProviderMetadata};
-use crate::providers::formats::openai;
+use goose_providers::formats::openai;
+use goose_providers::model::ModelConfig;
+use goose_providers::thinking::ThinkingEffort;
 use rmcp::model::Role;
 use serde_json::{json, Value};
 
@@ -87,9 +89,50 @@ pub fn add_reasoning_details_to_request(payload: &mut Value, messages: &[Message
     }
 }
 
+fn reasoning_effort_for_openrouter(effort: ThinkingEffort) -> Option<&'static str> {
+    match effort {
+        ThinkingEffort::Off => None,
+        ThinkingEffort::Low => Some("low"),
+        ThinkingEffort::Medium => Some("medium"),
+        ThinkingEffort::High => Some("high"),
+        ThinkingEffort::Max => Some("xhigh"),
+    }
+}
+
+pub fn apply_reasoning_config(payload: &mut Value, model_config: &ModelConfig) {
+    let Some(effort) = model_config.thinking_effort() else {
+        return;
+    };
+
+    if let Some(obj) = payload.as_object_mut() {
+        if obj.contains_key("reasoning") {
+            obj.remove("reasoning_effort");
+            return;
+        }
+
+        let clamped_effort = obj
+            .remove("reasoning_effort")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        if effort == ThinkingEffort::Off {
+            return;
+        }
+        if clamped_effort.is_none() && !model_config.is_reasoning_model() {
+            return;
+        }
+
+        let effort = clamped_effort
+            .as_deref()
+            .or_else(|| reasoning_effort_for_openrouter(effort));
+        if let Some(effort) = effort {
+            obj.insert("reasoning".to_string(), json!({ "effort": effort }));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_extract_reasoning_details() {
@@ -148,5 +191,145 @@ mod tests {
         assert!(tool_request.metadata.is_some());
         let details = get_reasoning_details(&tool_request.metadata).unwrap();
         assert_eq!(details.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_reasoning_config_uses_openrouter_reasoning_object() {
+        let mut payload = json!({
+            "model": "openai/gpt-5",
+            "messages": [],
+            "reasoning_effort": "high"
+        });
+        let mut model_config = ModelConfig::new("openai/gpt-5");
+        let mut params = HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("max"));
+        model_config.request_params = Some(params);
+
+        apply_reasoning_config(&mut payload, &model_config);
+
+        assert_eq!(payload["reasoning"], json!({ "effort": "high" }));
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_config_preserves_user_reasoning() {
+        let mut payload = json!({
+            "model": "openai/gpt-5",
+            "messages": [],
+            "reasoning": { "max_tokens": 2000 },
+            "reasoning_effort": "high"
+        });
+        let mut model_config = ModelConfig::new("openai/gpt-5");
+        let mut params = HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("high"));
+        model_config.request_params = Some(params);
+
+        apply_reasoning_config(&mut payload, &model_config);
+
+        assert_eq!(payload["reasoning"], json!({ "max_tokens": 2000 }));
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_config_omits_off_reasoning_capable_model() {
+        let mut payload = json!({
+            "model": "google/gemini-2.5-flash",
+            "messages": []
+        });
+        let mut model_config = ModelConfig::new("google/gemini-2.5-flash");
+        model_config.reasoning = Some(true);
+        let mut params = HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("off"));
+        model_config.request_params = Some(params);
+
+        apply_reasoning_config(&mut payload, &model_config);
+
+        assert!(payload.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_config_uses_reasoning_metadata() {
+        let mut payload = json!({
+            "model": "x-ai/grok-4",
+            "messages": []
+        });
+        let mut model_config = ModelConfig::new("x-ai/grok-4");
+        let mut params = HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("high"));
+        model_config.request_params = Some(params);
+        model_config.reasoning = Some(true);
+
+        apply_reasoning_config(&mut payload, &model_config);
+
+        assert_eq!(payload["reasoning"], json!({ "effort": "high" }));
+    }
+
+    #[test]
+    fn test_apply_reasoning_config_uses_model_detection() {
+        let mut payload = json!({
+            "model": "anthropic/claude-sonnet-4",
+            "messages": []
+        });
+        let mut model_config = ModelConfig::new("anthropic/claude-sonnet-4");
+        let mut params = HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("high"));
+        model_config.request_params = Some(params);
+
+        apply_reasoning_config(&mut payload, &model_config);
+
+        assert_eq!(payload["reasoning"], json!({ "effort": "high" }));
+    }
+
+    #[test]
+    fn test_apply_reasoning_config_skips_non_reasoning_models() {
+        let mut payload = json!({
+            "model": "openai/gpt-4o",
+            "messages": []
+        });
+        let mut model_config = ModelConfig::new("openai/gpt-4o");
+        let mut params = HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("high"));
+        model_config.request_params = Some(params);
+        model_config.reasoning = Some(false);
+
+        apply_reasoning_config(&mut payload, &model_config);
+
+        assert!(payload.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_config_off_omits_reasoning() {
+        let mut payload = json!({
+            "model": "x-ai/grok-4",
+            "messages": []
+        });
+        let mut model_config = ModelConfig::new("x-ai/grok-4");
+        let mut params = HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("off"));
+        model_config.request_params = Some(params);
+        model_config.reasoning = Some(true);
+
+        apply_reasoning_config(&mut payload, &model_config);
+
+        assert!(payload.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_apply_reasoning_config_off_ignores_clamped_effort() {
+        let mut payload = json!({
+            "model": "openai/gpt-5",
+            "messages": [],
+            "reasoning_effort": "low"
+        });
+        let mut model_config = ModelConfig::new("openai/gpt-5");
+        let mut params = HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("off"));
+        model_config.request_params = Some(params);
+        model_config.reasoning = Some(true);
+
+        apply_reasoning_config(&mut payload, &model_config);
+
+        assert!(payload.get("reasoning").is_none());
+        assert!(payload.get("reasoning_effort").is_none());
     }
 }

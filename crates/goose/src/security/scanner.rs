@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::conversation::message::Message;
-use crate::security::classification_client::ClassificationClient;
+use crate::security::classification_client::{ChunkedScan, ClassificationClient};
 use crate::security::patterns::{PatternMatch, PatternMatcher};
 use crate::utils::safe_truncate;
 use anyhow::Result;
@@ -68,9 +68,19 @@ impl PromptInjectionScanner {
             ClassifierType::Prompt => "PROMPT",
         };
 
-        let enabled = config
-            .get_param::<bool>(&format!("SECURITY_{}_CLASSIFIER_ENABLED", prefix))
-            .unwrap_or(false);
+        let enabled = match classifier_type {
+            ClassifierType::Command => {
+                crate::security::get_override("SECURITY_COMMAND_CLASSIFIER_ENABLED_OVERRIDE")
+                    .unwrap_or_else(|| {
+                        config
+                            .get_param::<bool>("SECURITY_COMMAND_CLASSIFIER_ENABLED")
+                            .unwrap_or(false)
+                    })
+            }
+            ClassifierType::Prompt => config
+                .get_param::<bool>("SECURITY_PROMPT_CLASSIFIER_ENABLED")
+                .unwrap_or(false),
+        };
 
         if !enabled {
             anyhow::bail!("{} classifier not enabled", prefix);
@@ -160,15 +170,16 @@ impl PromptInjectionScanner {
             self.combine_confidences(tool_result.confidence, context_result.ml_confidence);
 
         tracing::info!(
-            tool_confidence = %tool_result.confidence,
-            context_confidence = ?context_result.ml_confidence,
-            final_confidence = %final_confidence,
-            used_command_ml = tool_result.ml_confidence.is_some(),
-            used_prompt_ml = context_result.ml_confidence.is_some(),
-            used_pattern_detection = tool_result.used_pattern_detection,
-            threshold = %threshold,
-            malicious = final_confidence >= threshold,
-            "Security analysis complete"
+            security.event_type = "prompt_injection_scan",
+            security.confidence = final_confidence,
+            security.threshold = threshold,
+            security.above_threshold = final_confidence >= threshold,
+            scanner.tool_confidence = tool_result.confidence,
+            scanner.context_confidence = ?context_result.ml_confidence,
+            scanner.used_command_ml = tool_result.ml_confidence.is_some(),
+            scanner.used_prompt_ml = context_result.ml_confidence.is_some(),
+            scanner.used_pattern_detection = tool_result.used_pattern_detection,
+            "prompt injection scan: analysis complete"
         );
 
         let final_result = DetailedScanResult {
@@ -188,14 +199,42 @@ impl PromptInjectionScanner {
 
     async fn analyze_text(&self, text: &str) -> Result<DetailedScanResult> {
         if let Some(classifier) = self.command_classifier.as_ref() {
-            if let Some(ml_confidence) = self
-                .scan_with_classifier(text, classifier, ClassifierType::Command)
-                .await
-            {
+            let scan = classifier.classify_chunked(text).await;
+            let threshold = self.get_threshold_from_config();
+
+            if scan.has_unscanned_tail() {
+                tracing::warn!(
+                    monotonic_counter.goose.command_classifier_oversized_flagged = 1,
+                    security.event_type = "command_classifier_chunking",
+                    security.threat_type = "command_injection",
+                    security.confidence = 1.0,
+                    scanner.unscanned_windows = scan.unscanned,
+                    "command too large to fully classify; flagging as suspicious rather than trusting a partial scan"
+                );
                 return Ok(DetailedScanResult {
-                    confidence: ml_confidence,
+                    confidence: 1.0,
                     pattern_matches: Vec::new(),
-                    ml_confidence: Some(ml_confidence),
+                    ml_confidence: Some(1.0),
+                    used_pattern_detection: false,
+                });
+            }
+
+            let detected = scan.succeeded > 0 && scan.max_confidence >= threshold;
+
+            if detected {
+                return Ok(DetailedScanResult {
+                    confidence: scan.max_confidence,
+                    pattern_matches: Vec::new(),
+                    ml_confidence: Some(scan.max_confidence),
+                    used_pattern_detection: false,
+                });
+            }
+
+            if chunked_scan_is_trustworthy(&scan, threshold) {
+                return Ok(DetailedScanResult {
+                    confidence: scan.max_confidence,
+                    pattern_matches: Vec::new(),
+                    ml_confidence: Some(scan.max_confidence),
                     used_pattern_detection: false,
                 });
             }
@@ -380,6 +419,13 @@ impl PromptInjectionScanner {
     }
 }
 
+fn chunked_scan_is_trustworthy(scan: &ChunkedScan, threshold: f32) -> bool {
+    let detected = scan.succeeded > 0 && scan.max_confidence >= threshold;
+    let clean_and_complete =
+        !scan.had_failures() && !scan.has_unscanned_tail() && !scan.all_failed();
+    detected || clean_and_complete
+}
+
 fn is_shell_tool_name(name: &str) -> bool {
     matches!(name, "shell")
 }
@@ -393,6 +439,62 @@ impl Default for PromptInjectionScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detection_survives_a_failed_window() {
+        let scan = ChunkedScan {
+            max_confidence: 0.99,
+            succeeded: 2,
+            failed: 1,
+            unscanned: 0,
+        };
+        assert!(chunked_scan_is_trustworthy(&scan, 0.8));
+    }
+
+    #[test]
+    fn clean_result_with_a_failed_window_is_not_trusted() {
+        let scan = ChunkedScan {
+            max_confidence: 0.1,
+            succeeded: 2,
+            failed: 1,
+            unscanned: 0,
+        };
+        assert!(!chunked_scan_is_trustworthy(&scan, 0.8));
+    }
+
+    #[test]
+    fn clean_result_with_no_failures_is_trusted() {
+        let scan = ChunkedScan {
+            max_confidence: 0.1,
+            succeeded: 3,
+            failed: 0,
+            unscanned: 0,
+        };
+        assert!(chunked_scan_is_trustworthy(&scan, 0.8));
+    }
+
+    #[test]
+    fn all_windows_failed_is_not_trusted() {
+        let scan = ChunkedScan {
+            max_confidence: 0.0,
+            succeeded: 0,
+            failed: 3,
+            unscanned: 0,
+        };
+        assert!(!chunked_scan_is_trustworthy(&scan, 0.8));
+    }
+
+    #[test]
+    fn unscanned_tail_is_reported() {
+        let scan = ChunkedScan {
+            max_confidence: 0.0,
+            succeeded: 12,
+            failed: 0,
+            unscanned: 5,
+        };
+        assert!(scan.has_unscanned_tail());
+        assert!(!chunked_scan_is_trustworthy(&scan, 0.8));
+    }
     use rmcp::object;
 
     #[tokio::test]

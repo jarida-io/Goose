@@ -1,4 +1,6 @@
 use crate::config::paths::Paths;
+use crate::providers::private_file::write_private_file;
+use crate::utils::bytes_to_hex;
 use anyhow::Result;
 use axum::{extract::Query, response::Html, routing::get, Router};
 use base64::Engine;
@@ -56,7 +58,7 @@ impl TokenCache {
         hasher.update(host.as_bytes());
         hasher.update(client_id.as_bytes());
         hasher.update(scopes.join(",").as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = bytes_to_hex(hasher.finalize());
 
         fs::create_dir_all(get_base_path()).unwrap();
         let cache_path = get_base_path().join(format!("{}.json", hash));
@@ -87,11 +89,8 @@ impl TokenCache {
     }
 
     fn save_token(&self, token_data: &TokenData) -> Result<()> {
-        if let Some(parent) = self.cache_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let contents = serde_json::to_string(token_data)?;
-        fs::write(&self.cache_path, contents)?;
+        write_private_file(&self.cache_path, &contents)?;
         Ok(())
     }
 }
@@ -341,7 +340,10 @@ impl OAuthFlow {
 
         // If no port is specified (or port is explicitly 0), let the OS assign one
         // Otherwise, use the requested port
-        let bind_port = requested_port.unwrap_or(0);
+        let env_port: Option<u16> = std::env::var("GOOSE_OAUTH_CALLBACK_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok());
+        let bind_port = requested_port.or(env_port).unwrap_or(0);
         let addr = SocketAddr::from(([127, 0, 0, 1], bind_port));
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -540,6 +542,31 @@ mod tests {
         assert!(loaded_token.expires_at.is_none());
 
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_cache_replaces_loose_file_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache_path = directory.path().join("token.json");
+        fs::write(&cache_path, "{}").unwrap();
+        fs::set_permissions(&cache_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let cache = TokenCache {
+            cache_path: cache_path.clone(),
+        };
+
+        cache
+            .save_token(&TokenData {
+                access_token: "access".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: None,
+            })
+            .unwrap();
+
+        let mode = fs::metadata(cache_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

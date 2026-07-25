@@ -5,7 +5,7 @@ mod tests;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, RngExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,7 +42,7 @@ struct TokenRequest {
 
 impl PkceAuthFlow {
     pub fn new() -> Result<Self> {
-        let code_verifier: String = rand::thread_rng()
+        let code_verifier: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(128)
             .map(char::from)
@@ -162,7 +162,10 @@ use crate::config::Config;
 
 pub fn configure_tetrate(config: &Config, api_key: String) -> Result<()> {
     config.set_secret("TETRATE_API_KEY", &api_key)?;
-    config.set_goose_provider("tetrate")?;
-    config.set_goose_model(TETRATE_DEFAULT_MODEL)?;
+    crate::config::set_active_provider(
+        config,
+        crate::providers::tetrate::TETRATE_PROVIDER_NAME,
+        TETRATE_DEFAULT_MODEL,
+    )?;
     Ok(())
 }

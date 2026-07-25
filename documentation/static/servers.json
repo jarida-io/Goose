@@ -36,7 +36,7 @@
   {
     "id": "apify",
     "name": "Apify",
-    "description": "Extract data from any website with thousands of scrapers, crawlers, and automations on Apify Store ⚡",
+    "description": "Extract data from any website with thousands of scrapers, crawlers, and automations on Apify Store \u26a1",
     "command": "npx -y @apify/actors-mcp-server",
     "link": "https://github.com/apify/apify-mcp-server",
     "installation_notes": "Install using npx. Requires an Apify API token.",
@@ -104,14 +104,24 @@
     "id": "browserbase-mcp",
     "name": "Browserbase",
     "description": "Browser automation and web scraping",
-    "command": "npx -y @browserbasehq/mcp-server-browserbase",
+    "command": "npx -y @browserbasehq/mcp",
     "link": "https://github.com/browserbase/mcp-server-browserbase",
     "installation_notes": "Install using npx package manager.",
     "is_builtin": false,
     "endorsed": true,
     "environmentVariables": [
       {
+        "name": "BROWSERBASE_PROJECT_ID",
+        "description": "Required environment variable",
+        "required": true
+      },
+      {
         "name": "BROWSERBASE_API_KEY",
+        "description": "Required environment variable",
+        "required": true
+      },
+      {
+        "name": "GEMINI_API_KEY",
         "description": "Required environment variable",
         "required": true
       }
@@ -141,24 +151,6 @@
       {
         "name": "CLOUDINARY_URL",
         "description": "Your Cloudinary URL (cloudinary://api_key:api_secret@cloud_name)",
-        "required": true
-      }
-    ]
-  },
-  {
-    "id": "cognee-mcp",
-    "name": "Cognee",
-    "description": "Knowledge graph and cognitive AI capabilities (requires local server setup)",
-    "command": "uv --directory /path/to/cognee-mcp run python src/server.py",
-    "link": "https://github.com/topoteretes/cognee",
-    "installation_notes": "This is a local extension. You must first clone and install the Cognee MCP server locally before using this extension. Update the placeholder path before running the 'goose session' command.",
-    "is_builtin": false,
-    "endorsed": true,
-    "show_install_link": false,
-    "environmentVariables": [
-      {
-        "name": "LLM_API_KEY",
-        "description": "API key for your LLM provider",
         "required": true
       }
     ]
@@ -332,17 +324,6 @@
     "environmentVariables": []
   },
   {
-    "id": "filesystem",
-    "name": "Filesystem",
-    "description": "File system operations and management (requires updating local paths)",
-    "command": "npx -y @modelcontextprotocol/server-filesystem /path/to/dir1 /path/to/dir2",
-    "link": "https://github.com/modelcontextprotocol/servers",
-    "installation_notes": "Install using npx package manager. Update the placeholder paths before running the 'goose session' command. If installing from the link, you must update the paths from the Extensions page before activating the extension.",
-    "is_builtin": false,
-    "endorsed": true,
-    "environmentVariables": []
-  },
-  {
     "id": "github-mcp",
     "name": "GitHub",
     "description": "GitHub repository management and operations",
@@ -388,17 +369,6 @@
     "command": "npx -y @gotohuman/mcp-server",
     "link": "https://github.com/gotohuman/gotohuman-mcp-server",
     "installation_notes": "Install using npx package manager.",
-    "is_builtin": false,
-    "endorsed": false,
-    "environmentVariables": []
-  },
-  {
-    "id": "i-ching",
-    "name": "I Ching",
-    "description": "I Ching divination readings with Wilhelm-Baynes translation - provides traditional three coins method divination with complete hexagram meanings, judgments, and line interpretations",
-    "command": "i-ching-mcp-server",
-    "link": "https://github.com/threemachines/i-ching",
-    "installation_notes": "Install from crates.io using: cargo install i-ching",
     "is_builtin": false,
     "endorsed": false,
     "environmentVariables": []
@@ -455,34 +425,6 @@
     ]
   },
   {
-    "id": "mbot-mcp",
-    "name": "MBot",
-    "description": "Control a MakeBlock mbot2 rover through MQTT (requires local setup)",
-    "command": "/path/to/java -jar /path/to/mbotmcp-0.0.1-SNAPSHOT.jar",
-    "link": "https://github.com/deemkeen/mbotmcp",
-    "installation_notes": "This is a local extension. You must first download the JAR file from the repository, install Java, and update the placeholder paths before running the 'goose session' command.",
-    "is_builtin": false,
-    "endorsed": false,
-    "show_install_link": false,
-    "environmentVariables": [
-      {
-        "name": "MQTT_SERVER_URI",
-        "description": "MQTT server URI (example: tcp://1.2.3.4:1883)",
-        "required": true
-      },
-      {
-        "name": "MQTT_USERNAME",
-        "description": "MQTT username (empty string if no auth required)",
-        "required": true
-      },
-      {
-        "name": "MQTT_PASSWORD",
-        "description": "MQTT password (empty string if no auth required)",
-        "required": true
-      }
-    ]
-  },
-  {
     "id": "memory",
     "name": "Memory",
     "description": "Built-in memory system for persistent context and information storage",
@@ -497,9 +439,9 @@
     "id": "mongodb",
     "name": "MongoDB",
     "description": "MongoDB database integration",
-    "command": "npx -y mongodb-mcp-server --connection-string mongodb://localhost:27017",
+    "command": "npx -y mongodb-mcp-server --connectionString mongodb://localhost:27017",
     "link": "https://github.com/mongodb-js/mongodb-mcp-server",
-    "installation_notes": "Install using npx package manager. Update connection-string as needed to match your MongoDB environment.",
+    "installation_notes": "Install using npx package manager. Update connectionString as needed to match your MongoDB environment.",
     "is_builtin": false,
     "endorsed": true,
     "environmentVariables": []
@@ -579,6 +521,18 @@
     ]
   },
   {
+    "id": "ophis",
+    "name": "Ophis",
+    "description": "Natural-language intent DEX aggregator with a keyless MCP server for AI agents",
+    "type": "streamable-http",
+    "url": "https://mcp.ophis.fi/mcp",
+    "link": "https://github.com/ophis-fi/ophis",
+    "installation_notes": "Streamable HTTP extension. No API key or environment variables required.",
+    "is_builtin": false,
+    "endorsed": false,
+    "environmentVariables": []
+  },
+  {
     "id": "pdf_read",
     "name": "PDF Reader",
     "description": "Read large and complex PDF documents",
@@ -632,23 +586,12 @@
     "id": "reddit-mcp",
     "name": "Reddit",
     "description": "Reddit API integration for posts and comments",
-    "command": "npx -y reddit-mcp",
+    "command": "uvx --from git+https://github.com/adhikasp/mcp-reddit.git mcp-reddit",
     "link": "https://github.com/adhikasp/mcp-reddit",
-    "installation_notes": "Install using npx package manager.",
+    "installation_notes": "Install using uvx.",
     "is_builtin": false,
     "endorsed": false,
-    "environmentVariables": [
-      {
-        "name": "REDDIT_CLIENT_ID",
-        "description": "Required environment variable",
-        "required": true
-      },
-      {
-        "name": "REDDIT_CLIENT_SECRET",
-        "description": "Required environment variable",
-        "required": true
-      }
-    ]
+    "environmentVariables": []
   },
   {
     "id": "rendex-mcp",
@@ -674,7 +617,7 @@
     "id": "repomix-mcp",
     "name": "Repomix",
     "description": "Repository analysis and code organization",
-    "command": "npx -y repomix-mcp",
+    "command": "npx -y repomix --mcp",
     "link": "https://github.com/yamadashy/repomix",
     "installation_notes": "Install using npx package manager.",
     "is_builtin": false,
@@ -697,7 +640,7 @@
     "id": "selenium-mcp",
     "name": "Selenium",
     "description": "Web browser automation and testing",
-    "command": "npx -y selenium-mcp",
+    "command": "npx -y @angiejones/mcp-selenium",
     "link": "https://github.com/angiejones/mcp-selenium",
     "installation_notes": "Install using npx package manager.",
     "is_builtin": false,
@@ -751,23 +694,6 @@
       {
         "name": "SUPABASE_PERSONAL_ACCESS_TOKEN",
         "description": "Personal access token (optional; use if not authenticating via browser OAuth)",
-        "required": false
-      }
-    ]
-  },
-  {
-    "id": "sugar",
-    "name": "Sugar",
-    "description": "Autonomous AI development system - delegate tasks, run 24/7, auto-discover work from errors and GitHub issues",
-    "command": "npx -y sugarai-mcp",
-    "link": "https://github.com/cdnsteve/sugar",
-    "installation_notes": "Requires Python 3.11+ and Sugar CLI: pip install sugarai && sugar init",
-    "is_builtin": false,
-    "endorsed": false,
-    "environmentVariables": [
-      {
-        "name": "SUGAR_PROJECT_ROOT",
-        "description": "Project directory for Sugar operations (defaults to current directory)",
         "required": false
       }
     ]
@@ -848,7 +774,7 @@
   {
     "id": "cash-app",
     "name": "Cash App",
-    "description": "Cash App brings local food ordering into the AI era. Discover nearby sellers, browse menus with calories and allergen info, customize orders, and complete checkout—all conversationally.",
+    "description": "Cash App brings local food ordering into the AI era. Discover nearby sellers, browse menus with calories and allergen info, customize orders, and complete checkout\u2014all conversationally.",
     "type": "streamable-http",
     "url": "https://connect.squareup.com/v2/mcp/cash-app",
     "link": "",
@@ -856,5 +782,28 @@
     "is_builtin": false,
     "endorsed": true,
     "environmentVariables": []
-  }
+  },
+  {
+  "id": "scholar-sidekick",
+  "name": "Scholar Sidekick",
+  "description": "Resolve, format, export, and verify academic citations (DOI, PMID, ISBN, arXiv) plus retraction and open-access checks",
+  "command": "npx -y scholar-sidekick-mcp@latest",
+  "link": "https://github.com/mlava/scholar-sidekick-mcp",
+  "installation_notes": "No API key required — works anonymously on a free, rate-limited tier. Optionally set SCHOLAR_API_KEY (a free first-party ssk_ key from https://scholar-sidekick.com/account) for higher limits, or RAPIDAPI_KEY for paid tiers via RapidAPI.",
+  "is_builtin": false,
+  "endorsed": false,
+  "environmentVariables": [
+    {
+      "name": "SCHOLAR_API_KEY",
+      "description": "Optional first-party API key (ssk_) from https://scholar-sidekick.com/account; raises rate limits. Sent as Authorization: Bearer.",
+      "required": false
+    },
+    {
+      "name": "RAPIDAPI_KEY",
+      "description": "Optional RapidAPI key for paid/managed tiers; routes calls through the RapidAPI gateway.",
+      "required": false
+    }
+  ]
+}
+
 ]

@@ -1,8 +1,9 @@
 use super::{anthropic, google};
 use crate::conversation::message::Message;
-use crate::model::ModelConfig;
-use crate::providers::base::Usage;
 use anyhow::{Context, Result};
+use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
+use goose_providers::formats::anthropic::AnthropicFormatOptions;
+use goose_providers::model::ModelConfig;
 use rmcp::model::Tool;
 use serde_json::Value;
 
@@ -10,12 +11,8 @@ use std::fmt;
 
 pub type StreamingMessageStream = std::pin::Pin<
     Box<
-        dyn futures::Stream<
-                Item = anyhow::Result<(
-                    Option<Message>,
-                    Option<crate::providers::base::ProviderUsage>,
-                )>,
-            > + Send
+        dyn futures::Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>>
+            + Send
             + 'static,
     >,
 >;
@@ -75,6 +72,8 @@ pub const KNOWN_MODELS: &[&str] = &[
     "claude-sonnet-4@20250514",
     "claude-3-5-haiku@20241022",
     "claude-3-haiku@20240307",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-pro-preview",
     "gemini-3-pro-preview",
     "gemini-3-flash-preview",
     "gemini-2.5-pro",
@@ -112,13 +111,15 @@ impl fmt::Display for GcpVertexAIModel {
 impl GcpVertexAIModel {
     /// Returns the default GCP location for the model.
     ///
-    /// Each model family has a well-known location based on availability:
-    /// - Claude models default to Ohio (us-east5)
-    /// - Gemini models default to Iowa (us-central1)
-    /// - MaaS models default to Iowa (us-central1)
+    /// Location routing by model family:
+    /// - Claude models: Ohio (us-east5)
+    /// - Gemini 3.x models: Global
+    /// - Other Gemini models: Iowa (us-central1)
+    /// - MaaS models: Iowa (us-central1)
     pub fn known_location(&self) -> GcpLocation {
         match self {
             Self::Claude(_) => GcpLocation::Ohio,
+            Self::Gemini(name) if name.starts_with("gemini-3") => GcpLocation::Global,
             Self::Gemini(_) => GcpLocation::Iowa,
             Self::MaaS(_, _) => GcpLocation::Iowa,
         }
@@ -220,7 +221,14 @@ fn create_anthropic_request(
     messages: &[Message],
     tools: &[Tool],
 ) -> Result<Value> {
-    let mut request = anthropic::create_request(model_config, system, messages, tools)?;
+    let mut request = anthropic::create_request(
+        "anthropic",
+        model_config,
+        system,
+        messages,
+        tools,
+        AnthropicFormatOptions::default(),
+    )?;
 
     let obj = request
         .as_object_mut()
@@ -368,6 +376,9 @@ mod tests {
 
         let gemini_model = GcpVertexAIModel::try_from("gemini-2.5-flash")?;
         assert_eq!(gemini_model.known_location(), GcpLocation::Iowa);
+
+        let gemini_3_model = GcpVertexAIModel::try_from("gemini-3.1-flash-lite")?;
+        assert_eq!(gemini_3_model.known_location(), GcpLocation::Global);
 
         Ok(())
     }
