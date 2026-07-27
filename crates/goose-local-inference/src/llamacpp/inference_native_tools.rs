@@ -21,10 +21,11 @@ pub(super) fn generate_with_native_tools(
     let mut first_piece_at: Option<std::time::Instant> = None;
     let prepared = prepare_generation(ctx, oai_messages_json, full_tools_json, compact_tools)?;
     let template_result = prepared.template_result;
-    let mut llama_ctx = prepared.llama_ctx;
     let prompt_token_count = prepared.prompt_token_count;
     let effective_ctx = prepared.effective_ctx;
     let prefill_ms = prepared.prefill_ms;
+    let reused_prefix_tokens = prepared.reused_prefix_tokens;
+    let mut transient_session = prepared.transient;
 
     let message_id = ctx.message_id;
     let tx = ctx.tx;
@@ -53,12 +54,22 @@ pub(super) fn generate_with_native_tools(
         &template_result.generation_prompt,
     );
 
+    let mut decoded_tokens: Vec<llama_cpp_2::token::LlamaToken> = Vec::new();
+    let llama_ctx = match transient_session.as_mut() {
+        Some(kv) => kv.context_mut(),
+        None => ctx
+            .session
+            .as_mut()
+            .expect("prepare_generation retains a generation context")
+            .context_mut(),
+    };
     let output_token_count = generation_loop(
-        &ctx.loaded.model,
-        &mut llama_ctx,
+        ctx.model,
+        llama_ctx,
         ctx.settings,
         prompt_token_count,
         effective_ctx,
+        &mut decoded_tokens,
         |piece| {
             first_piece_at.get_or_insert_with(std::time::Instant::now);
             generated_text.push_str(piece);
@@ -137,6 +148,19 @@ pub(super) fn generate_with_native_tools(
             }
         },
     )?;
+
+    // The next turn's prompt embeds this reply, so folding the decoded tokens
+    // into the retained sequence maximises the shared prefix. A sacrificial
+    // generation leaves the retained cache alone by design.
+    if transient_session.is_none() {
+        if let Some(session) = ctx.session.as_mut() {
+            session.record_generated(&decoded_tokens);
+        }
+    }
+    // Release the throwaway KV cache as soon as the tokens are drained rather
+    // than at end of scope, so it overlaps the retained one for as short a time
+    // as possible.
+    drop(transient_session);
 
     // Finalize the streaming parser with is_partial=false
     if let Ok(final_deltas) = stream_parser.update("", false) {
@@ -226,6 +250,7 @@ pub(super) fn generate_with_native_tools(
         draft: None,
         prefill_ms: Some(prefill_ms),
         effective_context_tokens: Some(effective_ctx),
+        reused_prefix_tokens: Some(reused_prefix_tokens),
     };
     let provider_usage = finalize_usage(
         ctx.log,

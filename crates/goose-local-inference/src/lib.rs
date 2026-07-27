@@ -38,8 +38,8 @@ use mlx::{MlxBackend, MLX_BACKEND_ID};
 use rmcp::model::Tool;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
@@ -48,6 +48,10 @@ type ModelSlotHandle = Arc<ModelSlot>;
 struct ModelSlot {
     state: Mutex<ModelSlotState>,
     notify: Notify,
+    /// Every model id that has resolved to this slot. One set of weights can be
+    /// addressed by several ids (see [`ModelCacheKey`]), and the id-keyed public
+    /// API still has to answer for all of them.
+    model_ids: StdMutex<HashSet<String>>,
 }
 
 enum ModelSlotState {
@@ -61,29 +65,66 @@ impl ModelSlot {
         Self {
             state: Mutex::new(ModelSlotState::Empty),
             notify: Notify::new(),
+            model_ids: StdMutex::new(HashSet::new()),
         }
+    }
+
+    fn record_model_id(&self, model_id: &str) {
+        let mut ids = self.model_ids.lock().expect("model id lock poisoned");
+        if !ids.contains(model_id) {
+            ids.insert(model_id.to_string());
+        }
+    }
+
+    fn model_ids(&self) -> HashSet<String> {
+        self.model_ids
+            .lock()
+            .expect("model id lock poisoned")
+            .clone()
+    }
+
+    fn has_model_id(&self, model_id: &str) -> bool {
+        self.model_ids
+            .lock()
+            .expect("model id lock poisoned")
+            .contains(model_id)
     }
 }
 
+/// Identity of a set of loaded weights.
+///
+/// Keyed on the **resolved file** rather than the caller's model id, because a
+/// single GGUF is routinely addressed by several ids: a host may register
+/// `gemma-4-E2B-it`, `gemma-4-E2B-it:Q4_K_M` and `gemma-4-E2B-it-Q4_K_M` for one
+/// file, and separate provider instances in the same process (a chat provider
+/// and, say, a memory-extraction provider — or several desktop sessions) each
+/// pass whichever spelling they were configured with. Keying on the id string
+/// forked those into one slot each, which meant two multi-GB residencies of the
+/// same weights and, worse, an evict-then-load ping-pong: every generation cold
+/// loaded the model and destroyed the previous slot's retained KV cache.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ModelCacheKey {
     backend_id: &'static str,
-    model_id: String,
+    model_path: PathBuf,
     chat_template: ChatTemplate,
 }
 
 impl ModelCacheKey {
-    fn new(
-        backend_id: &'static str,
-        model_id: impl Into<String>,
-        chat_template: ChatTemplate,
-    ) -> Self {
+    fn new(backend_id: &'static str, model_path: &Path, chat_template: ChatTemplate) -> Self {
         Self {
             backend_id,
-            model_id: model_id.into(),
+            model_path: canonical_model_path(model_path),
             chat_template,
         }
     }
+}
+
+/// Resolve a model path to a stable identity, following symlinks so that two
+/// links into the same blob store share one slot. Falls back to the path as
+/// given when it cannot be canonicalized (missing file, permissions), which
+/// only costs the dedupe — never correctness.
+fn canonical_model_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub struct InferenceRuntime {
@@ -96,17 +137,26 @@ pub fn builtin_chat_template_names() -> Vec<String> {
     llamacpp::builtin_chat_template_names()
 }
 
-static RUNTIME: StdMutex<Weak<InferenceRuntime>> = StdMutex::new(Weak::new());
+/// The process-wide model registry.
+///
+/// This holds a *strong* reference, so the runtime — and with it the loaded
+/// model map and the `LlamaBackend` those models were loaded against — lives
+/// for the life of the process once built. A `Weak` here would tie residency to
+/// the lifetime of whichever `LocalInferenceProvider` happened to exist: a host
+/// that rebuilds its provider on a settings change, or that drops one provider
+/// while another is idle, would silently unload every model. Weights are
+/// released by [`evict_model`], never by provider churn.
+static RUNTIME: StdMutex<Option<Arc<InferenceRuntime>>> = StdMutex::new(None);
 
 fn current_runtime() -> Option<Arc<InferenceRuntime>> {
-    RUNTIME.lock().expect("runtime lock poisoned").upgrade()
+    RUNTIME.lock().expect("runtime lock poisoned").clone()
 }
 
 impl InferenceRuntime {
     pub fn get_or_init() -> Result<Arc<Self>> {
         let mut guard = RUNTIME.lock().expect("runtime lock poisoned");
-        if let Some(runtime) = guard.upgrade() {
-            return Ok(runtime);
+        if let Some(runtime) = guard.as_ref() {
+            return Ok(runtime.clone());
         }
         let llamacpp_backend: Arc<dyn LocalInferenceBackend> = Arc::new(LlamaCppBackend::new()?);
         let mlx_backend: Arc<dyn LocalInferenceBackend> = Arc::new(MlxBackend::new());
@@ -118,7 +168,7 @@ impl InferenceRuntime {
             cold_load_lock: Mutex::new(()),
             backends,
         });
-        *guard = Arc::downgrade(&runtime);
+        *guard = Some(runtime.clone());
         Ok(runtime)
     }
 
@@ -145,11 +195,15 @@ impl InferenceRuntime {
         })
     }
 
-    fn get_or_create_model_slot(&self, key: ModelCacheKey) -> ModelSlotHandle {
-        let mut map = self.models.lock().expect("model cache lock poisoned");
-        map.entry(key)
-            .or_insert_with(|| Arc::new(ModelSlot::new()))
-            .clone()
+    fn get_or_create_model_slot(&self, key: ModelCacheKey, model_id: &str) -> ModelSlotHandle {
+        let slot = {
+            let mut map = self.models.lock().expect("model cache lock poisoned");
+            map.entry(key)
+                .or_insert_with(|| Arc::new(ModelSlot::new()))
+                .clone()
+        };
+        slot.record_model_id(model_id);
+        slot
     }
 
     fn model_slot(&self, key: &ModelCacheKey) -> Option<ModelSlotHandle> {
@@ -177,7 +231,7 @@ pub async fn is_model_loaded(model_name: &str) -> Result<bool, ProviderError> {
     let backend = runtime.backend_for_model(&resolved)?;
     let key = ModelCacheKey::new(
         backend.id(),
-        model_name.to_string(),
+        &resolved.model_path,
         resolved.settings.chat_template,
     );
     let Some(slot) = runtime.model_slot(&key) else {
@@ -194,19 +248,18 @@ pub async fn loaded_model_ids() -> Result<HashSet<String>, ProviderError> {
     };
     let slots = {
         let map = runtime.models.lock().expect("model cache lock poisoned");
-        map.iter()
-            .map(|(key, slot)| (key.model_id.clone(), slot.clone()))
-            .collect::<Vec<_>>()
+        map.values().cloned().collect::<Vec<_>>()
     };
 
     let mut loaded = HashSet::new();
-    for (model_id, slot) in slots {
-        if let Ok(state) = slot.state.try_lock() {
-            if matches!(*state, ModelSlotState::Loaded(_)) {
-                loaded.insert(model_id);
-            }
-        } else {
-            loaded.insert(model_id);
+    for slot in slots {
+        // A contended slot is mid-generation, which implies it is loaded.
+        let resident = match slot.state.try_lock() {
+            Ok(state) => matches!(*state, ModelSlotState::Loaded(_)),
+            Err(_) => true,
+        };
+        if resident {
+            loaded.extend(slot.model_ids());
         }
     }
     Ok(loaded)
@@ -216,10 +269,15 @@ pub async fn evict_model(model_name: &str) -> Result<bool, ProviderError> {
     let Some(runtime) = current_runtime() else {
         return Ok(false);
     };
+    // Match on the resolved file as well as the recorded ids: the caller may
+    // name the model with a spelling that has never reached the slot map.
+    let target_path = resolve_model_path(model_name).map(|r| canonical_model_path(&r.model_path));
     let slots = {
         let map = runtime.models.lock().expect("model cache lock poisoned");
         map.iter()
-            .filter(|(key, _)| key.model_id == model_name)
+            .filter(|(key, slot)| {
+                target_path.as_ref() == Some(&key.model_path) || slot.has_model_id(model_name)
+            })
             .map(|(_, slot)| slot.clone())
             .collect::<Vec<_>>()
     };
@@ -691,10 +749,12 @@ impl Provider for LocalInferenceProvider {
 
         let cache_key = ModelCacheKey::new(
             backend.id(),
-            model_config.model_name.clone(),
+            &resolved.model_path,
             model_settings.chat_template.clone(),
         );
-        let model_slot = self.runtime.get_or_create_model_slot(cache_key.clone());
+        let model_slot = self
+            .runtime
+            .get_or_create_model_slot(cache_key.clone(), &model_config.model_name);
         let runtime = self.runtime.clone();
 
         let cache_key = cache_key.clone();
@@ -774,6 +834,14 @@ impl Provider for LocalInferenceProvider {
                             return;
                         }
 
+                        // Only genuinely different weights are evicted: slots are
+                        // keyed by resolved file, so another provider instance
+                        // asking for this same model shares this slot rather than
+                        // appearing here. Taking each slot's state lock is what
+                        // makes this safe against a concurrent user — a slot that
+                        // is mid-generation holds that lock for the whole
+                        // generation, so this waits rather than pulling the model
+                        // out from under it.
                         let other_model_slots = runtime.other_model_slots(&cache_key);
                         for slot in other_model_slots {
                             let mut other = slot.state.lock().await;
@@ -916,6 +984,85 @@ impl Provider for LocalInferenceProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_for(path: &Path) -> ModelCacheKey {
+        ModelCacheKey::new("llamacpp", path, ChatTemplate::Embedded)
+    }
+
+    #[test]
+    fn model_cache_key_collapses_ids_naming_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("gemma-4-E2B-it-Q4_K_M.gguf");
+        std::fs::write(&model, b"gguf").unwrap();
+
+        // What three registry ids for one file produce: identical resolved
+        // paths, therefore one slot.
+        assert_eq!(key_for(&model), key_for(&model));
+
+        let with_dot = dir.path().join(".").join("gemma-4-E2B-it-Q4_K_M.gguf");
+        assert_eq!(
+            key_for(&model),
+            key_for(&with_dot),
+            "an unnormalized path to the same file must not fork the slot"
+        );
+    }
+
+    #[test]
+    fn model_cache_key_follows_symlinks_to_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, b"gguf").unwrap();
+        let link = dir.path().join("gemma-4-E2B-it-Q4_K_M.gguf");
+        std::os::unix::fs::symlink(&blob, &link).unwrap();
+
+        assert_eq!(key_for(&blob), key_for(&link));
+    }
+
+    #[test]
+    fn model_cache_key_separates_distinct_files_and_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.gguf");
+        let b = dir.path().join("b.gguf");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        assert_ne!(key_for(&a), key_for(&b));
+        assert_ne!(
+            key_for(&a),
+            ModelCacheKey::new(
+                "llamacpp",
+                &a,
+                ChatTemplate::Builtin {
+                    name: "chatml".to_string()
+                }
+            )
+        );
+        assert_ne!(
+            key_for(&a),
+            ModelCacheKey::new("mlx", &a, ChatTemplate::Embedded)
+        );
+    }
+
+    #[test]
+    fn missing_model_file_still_yields_a_stable_key() {
+        let path = Path::new("/nonexistent/gemma-4-E2B-it-Q4_K_M.gguf");
+        assert_eq!(key_for(path), key_for(path));
+    }
+
+    #[test]
+    fn model_slot_accumulates_every_id_that_resolves_to_it() {
+        let slot = ModelSlot::new();
+        assert!(slot.model_ids().is_empty());
+
+        slot.record_model_id("gemma-4-E2B-it");
+        slot.record_model_id("gemma-4-E2B-it-Q4_K_M");
+        slot.record_model_id("gemma-4-E2B-it");
+
+        assert_eq!(slot.model_ids().len(), 2);
+        assert!(slot.has_model_id("gemma-4-E2B-it"));
+        assert!(slot.has_model_id("gemma-4-E2B-it-Q4_K_M"));
+        assert!(!slot.has_model_id("gemma-4-E4B-it"));
+    }
 
     #[test]
     fn converts_marker_in_string_content_to_media_marker_part() {

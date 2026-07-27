@@ -4,18 +4,27 @@ use crate::multimodal::ExtractedImage;
 use goose_provider_types::errors::ProviderError;
 use goose_provider_types::request_log::{LoggerHandleExt, RequestLogHandle};
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, ChatTemplateResult, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdInputText};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use super::super::StreamSender;
 use super::LlamaCppBackend;
 
+/// Shortest shared prompt prefix worth a partial KV cache removal. Below this
+/// the bookkeeping costs more than the decode it saves.
+const REUSE_MIN_TOKENS: usize = 256;
+
 pub(super) struct GenerationContext<'a> {
-    pub loaded: &'a LoadedModel,
+    pub model: &'a Arc<LlamaModel>,
+    pub mtmd_ctx: Option<&'a MtmdContext>,
+    pub session: &'a mut Option<SessionKv>,
     pub backend: &'a LlamaCppBackend,
     pub template: &'a LlamaChatTemplate,
     pub settings: &'a ModelSettings,
@@ -31,10 +40,13 @@ pub(super) struct GenerationContext<'a> {
 }
 
 pub(super) struct LoadedModel {
-    pub model: LlamaModel,
+    pub model: Arc<LlamaModel>,
     pub templates: LoadedChatTemplates,
     /// Multimodal context for vision models. None for text-only models.
     pub mtmd_ctx: Option<MtmdContext>,
+    /// Generation context retained between requests for prompt prefix reuse.
+    /// Dropped with the rest of the model when the slot is evicted.
+    pub session: Option<SessionKv>,
 }
 
 pub(super) struct LoadedChatTemplates {
@@ -43,14 +55,178 @@ pub(super) struct LoadedChatTemplates {
     pub force_default: bool,
 }
 
-pub(super) struct PreparedGeneration<'model> {
+/// A llama context retained across generations, paired with the token sequence
+/// it holds in the KV cache of sequence 0.
+///
+/// Invariant: `tokens` is a *prefix* of the KV cache contents — position `i`
+/// of sequence 0 holds `tokens[i]` for every `i < tokens.len()`. The cache may
+/// hold further positions beyond `tokens.len()`; every reuse path removes
+/// everything from its resume position onwards, so unrecorded trailing
+/// positions can never be attended to.
+pub(super) struct SessionKv {
+    /// Declared before `_model`: fields drop in declaration order, so the
+    /// context is destroyed before the model allocation it points into.
+    ctx: LlamaContext<'static>,
+    tokens: Vec<LlamaToken>,
+    /// The `n_ctx` this context was *requested* with. Compared against the
+    /// effective context of an incoming request; llama.cpp may round the
+    /// realised `n_ctx` up, so the requested value is the stable identity.
+    n_ctx: u32,
+    _model: Arc<LlamaModel>,
+}
+
+// SAFETY: `LlamaContext` is `!Send` only because it holds a raw
+// `NonNull<llama_context>`. A llama.cpp context has no thread affinity: it
+// keeps no thread-local state and reads its thread pool out of the context on
+// every decode, so it may be moved between threads provided access is never
+// concurrent. Every access to a `SessionKv` happens inside
+// `LocalInferenceBackend::generate`, which `InferenceRuntime::generate` calls
+// while holding the owning model slot's mutex, so accesses are serialized.
+// `LlamaModel` and `MtmdContext` are marked `Send` upstream on the same basis.
+unsafe impl Send for SessionKv {}
+
+impl SessionKv {
+    fn create(
+        model: &Arc<LlamaModel>,
+        backend: &LlamaCppBackend,
+        n_ctx: u32,
+        settings: &ModelSettings,
+    ) -> Result<Self, ProviderError> {
+        let model = Arc::clone(model);
+        let ctx = model
+            .new_context(
+                backend.llama_backend(),
+                build_context_params(n_ctx, settings),
+            )
+            .map_err(|e| ProviderError::ExecutionError(format!("Failed to create context: {e}")))?;
+
+        // SAFETY: `ctx` borrows the `LlamaModel` owned by the `Arc` allocation,
+        // whose address is stable for as long as any strong handle exists.
+        // Erasing the lifetime is sound because it is immediately re-tied to
+        // `_model`, a strong handle stored in this same struct and dropped
+        // *after* `ctx` by field declaration order. The context can therefore
+        // never outlive the model it points at.
+        let ctx = unsafe { std::mem::transmute::<LlamaContext<'_>, LlamaContext<'static>>(ctx) };
+
+        Ok(Self {
+            ctx,
+            tokens: Vec::new(),
+            n_ctx,
+            _model: model,
+        })
+    }
+
+    pub(super) fn context_mut(&mut self) -> &mut LlamaContext<'static> {
+        &mut self.ctx
+    }
+
+    pub(super) fn record_generated(&mut self, tokens: &[LlamaToken]) {
+        self.tokens.extend_from_slice(tokens);
+    }
+}
+
+/// Context-window size of a retained KV cache, or 0 when nothing is retained.
+fn retained_kv_tokens(session: &Option<SessionKv>) -> usize {
+    session.as_ref().map_or(0, |kv| kv.n_ctx as usize)
+}
+
+pub(super) struct PreparedGeneration {
     pub template_result: ChatTemplateResult,
-    pub llama_ctx: llama_cpp_2::context::LlamaContext<'model>,
     pub prompt_token_count: usize,
     pub effective_ctx: usize,
     /// Wall-clock time for template application + tokenization + prompt
     /// prefill decode.
     pub prefill_ms: u64,
+    /// Leading prompt tokens served from the retained KV cache.
+    pub reused_prefix_tokens: usize,
+    /// Context owning this generation's KV cache when the retained session was
+    /// deliberately left intact. Dropped once the generation drains. `None`
+    /// means the generation runs on `GenerationContext::session`.
+    pub transient: Option<SessionKv>,
+}
+
+/// How the prompt for an incoming request relates to a retained KV cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrefillPlan {
+    /// No usable retained context; build one and decode the whole prompt.
+    CreateContext,
+    /// The retained context fits but its contents do not; clear the cache and
+    /// decode the whole prompt into it.
+    FullPrefillInPlace,
+    /// The retained cache shares this many leading tokens with the prompt.
+    ReusePrefix(usize),
+    /// The prompt shares nothing useful with a much larger retained cache. Run
+    /// in a throwaway context and leave the retained cache intact.
+    SacrificialContext,
+}
+
+pub(super) fn common_prefix_len(cached: &[LlamaToken], prompt: &[LlamaToken]) -> usize {
+    cached
+        .iter()
+        .zip(prompt)
+        .take_while(|(cached, prompt)| cached == prompt)
+        .count()
+}
+
+/// Whether a non-matching prompt is small enough that the retained cache is
+/// worth more than this generation's convenience.
+///
+/// Retention belongs to the most expensive prefix. A prompt at most half the
+/// size of the cache prefills in a fraction of the cache's rebuild cost and
+/// gains nothing from being retained itself, so it runs somewhere else rather
+/// than evicting a prefix that costs seconds to reconstruct. Hosts routinely
+/// interleave exactly this shape: a short side call (memory extraction,
+/// summarisation) between long conversational turns.
+fn is_sacrificial_prompt(prompt_tokens: usize, cached_tokens: usize) -> bool {
+    prompt_tokens > 0 && prompt_tokens.saturating_mul(2) < cached_tokens
+}
+
+/// Decide how to prefill `prompt` given the retained cache's `(tokens, n_ctx)`.
+pub(super) fn prefill_plan(
+    retained: Option<(&[LlamaToken], u32)>,
+    prompt: &[LlamaToken],
+    effective_ctx: u32,
+) -> PrefillPlan {
+    let Some((cached, cached_n_ctx)) = retained else {
+        return PrefillPlan::CreateContext;
+    };
+    if cached_n_ctx != effective_ctx {
+        return PrefillPlan::CreateContext;
+    }
+    // llama.cpp needs a non-empty batch to produce logits, so at least the
+    // final prompt token must always be decoded.
+    let reusable = common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1));
+    if reusable >= REUSE_MIN_TOKENS {
+        return PrefillPlan::ReusePrefix(reusable);
+    }
+    if is_sacrificial_prompt(prompt.len(), cached.len()) {
+        return PrefillPlan::SacrificialContext;
+    }
+    PrefillPlan::FullPrefillInPlace
+}
+
+/// Output budget granted to a sacrificial generation when the model settings do
+/// not cap it.
+///
+/// A throwaway context is sized to the prompt plus this budget rather than to
+/// the full window, because it is resident *alongside* the retained cache and
+/// llama.cpp commits KV memory for the whole `n_ctx` up front. On an 8 GB Jetson
+/// two full 4096-token caches is the difference between fitting and an NvMap
+/// allocation failure. The trade is that a sacrificial turn cannot generate more
+/// than this many tokens, well above what the short side calls this path exists
+/// for ever produce.
+const SACRIFICIAL_OUTPUT_TOKENS: usize = 2048;
+
+/// Window for a throwaway context: enough for the prompt and a full output
+/// budget, never more than the request's own effective context.
+fn sacrificial_context_size(
+    prompt_tokens: usize,
+    max_output_tokens: Option<usize>,
+    effective_ctx: u32,
+) -> u32 {
+    let budget = max_output_tokens.unwrap_or(SACRIFICIAL_OUTPUT_TOKENS);
+    let wanted = prompt_tokens.saturating_add(budget);
+    u32::try_from(wanted).unwrap_or(u32::MAX).min(effective_ctx)
 }
 
 pub(super) struct StopSuffixTrimmer {
@@ -117,22 +293,22 @@ impl StopSuffixTrimmer {
 /// Estimate the maximum context length that can fit in available accelerator/CPU
 /// memory based on the model's KV cache requirements.
 ///
+/// `retained_kv_tokens` is the window size of a KV cache already held for this
+/// model. That memory is released before any replacement is allocated, so it
+/// counts towards what this request can spend; without it the estimate would
+/// shrink on every turn that keeps a cache alive.
+///
 /// Returns `None` if the model architecture values are unavailable.
 pub(super) fn estimate_max_context_for_memory(
     model: &LlamaModel,
     backend: &LlamaCppBackend,
     mmproj_overhead_bytes: u64,
+    retained_kv_tokens: usize,
 ) -> Option<usize> {
     let raw_available = backend.available_memory_bytes();
     if raw_available == 0 {
         return None;
     }
-    let available = raw_available.saturating_sub(mmproj_overhead_bytes);
-
-    // Reserve memory for computation scratch buffers (attention, etc.) and other overhead.
-    // The compute buffer can be 40-50% of the KV cache size for large models, so we
-    // conservatively use only half the available memory for the KV cache.
-    let usable = (available as f64 * 0.5) as u64;
 
     let n_layer = model.n_layer() as u64;
     let n_head_kv = model.n_head_kv() as u64;
@@ -166,6 +342,15 @@ pub(super) fn estimate_max_context_for_memory(
     if bytes_per_token == 0 {
         return None;
     }
+
+    let available = raw_available
+        .saturating_add(retained_kv_tokens as u64 * bytes_per_token)
+        .saturating_sub(mmproj_overhead_bytes);
+
+    // Reserve memory for computation scratch buffers (attention, etc.) and other overhead.
+    // The compute buffer can be 40-50% of the KV cache size for large models, so we
+    // conservatively use only half the available memory for the KV cache.
+    let usable = (available as f64 * 0.5) as u64;
 
     Some((usable / bytes_per_token) as usize)
 }
@@ -307,19 +492,22 @@ pub(super) fn build_sampler(settings: &crate::local_model_registry::ModelSetting
 /// Validate prompt tokens against memory limits and compute the effective
 /// context size. Returns `(prompt_token_count, effective_ctx)`.
 pub(super) fn validate_and_compute_context(
-    loaded: &LoadedModel,
+    model: &LlamaModel,
+    has_mtmd: bool,
     backend: &LlamaCppBackend,
     prompt_token_count: usize,
     context_limit: usize,
     settings: &crate::local_model_registry::ModelSettings,
+    retained_kv_tokens: usize,
 ) -> Result<(usize, usize), ProviderError> {
-    let n_ctx_train = loaded.model.n_ctx_train() as usize;
-    let mmproj_overhead = if loaded.mtmd_ctx.is_some() {
+    let n_ctx_train = model.n_ctx_train() as usize;
+    let mmproj_overhead = if has_mtmd {
         settings.mmproj_size_bytes
     } else {
         0
     };
-    let memory_max_ctx = estimate_max_context_for_memory(&loaded.model, backend, mmproj_overhead);
+    let memory_max_ctx =
+        estimate_max_context_for_memory(model, backend, mmproj_overhead, retained_kv_tokens);
     let effective_ctx = effective_context_size(
         prompt_token_count,
         settings,
@@ -346,44 +534,238 @@ pub(super) fn validate_and_compute_context(
     Ok((prompt_token_count, effective_ctx))
 }
 
-/// Create a llama context and prefill (decode) all prompt tokens.
-pub(super) fn create_and_prefill_context<'model>(
-    loaded: &'model LoadedModel,
-    backend: &LlamaCppBackend,
-    tokens: &[llama_cpp_2::token::LlamaToken],
-    effective_ctx: usize,
-    settings: &crate::local_model_registry::ModelSettings,
-) -> Result<llama_cpp_2::context::LlamaContext<'model>, ProviderError> {
-    let ctx_params = build_context_params(effective_ctx as u32, settings);
-    let mut ctx = loaded
-        .model
-        .new_context(backend.llama_backend(), ctx_params)
-        .map_err(|e| ProviderError::ExecutionError(format!("Failed to create context: {}", e)))?;
-
-    let n_batch = ctx.n_batch() as usize;
-    for chunk in tokens.chunks(n_batch) {
-        let mut batch = LlamaBatch::get_one(chunk)
-            .map_err(|e| ProviderError::ExecutionError(format!("Failed to create batch: {}", e)))?;
-        ctx.decode(&mut batch)
-            .map_err(|e| ProviderError::ExecutionError(format!("Prefill decode failed: {}", e)))?;
+/// Decode `tokens` into sequence 0 starting at absolute position `start_pos`.
+///
+/// Positions are explicit so the caller controls where the batch lands relative
+/// to whatever the KV cache already holds; llama.cpp requires them to continue
+/// exactly from the sequence's highest cached position. The last token of each
+/// chunk requests logits, matching `llama_batch_get_one`, so only the position
+/// assignment differs from an implicitly positioned batch.
+fn decode_tokens(
+    ctx: &mut LlamaContext<'_>,
+    tokens: &[LlamaToken],
+    start_pos: usize,
+) -> Result<(), ProviderError> {
+    if tokens.is_empty() {
+        return Ok(());
     }
 
-    Ok(ctx)
+    let n_batch = (ctx.n_batch() as usize).max(1);
+    let mut batch = LlamaBatch::new(n_batch.min(tokens.len()), 1);
+
+    for (chunk_index, chunk) in tokens.chunks(n_batch).enumerate() {
+        batch.clear();
+        let chunk_last = chunk.len() - 1;
+        for (offset, token) in chunk.iter().enumerate() {
+            let pos = i32::try_from(start_pos + chunk_index * n_batch + offset).map_err(|_| {
+                ProviderError::ExecutionError("Prompt position exceeds i32 range".to_string())
+            })?;
+            batch
+                .add(*token, pos, &[0], offset == chunk_last)
+                .map_err(|e| {
+                    ProviderError::ExecutionError(format!("Failed to build batch: {e}"))
+                })?;
+        }
+        ctx.decode(&mut batch)
+            .map_err(|e| ProviderError::ExecutionError(format!("Prefill decode failed: {e}")))?;
+    }
+
+    Ok(())
 }
 
-/// Tokenize text + images via mtmd and prefill the context.
+/// Why a partial KV cache reuse could not be completed.
+enum PrefixReuseError {
+    /// llama.cpp declined the partial removal; the cache is untouched.
+    Refused,
+    /// The suffix decode failed; the cache contents can no longer be trusted.
+    Poisoned(ProviderError),
+}
+
+fn reuse_prefix(
+    kv: &mut SessionKv,
+    prompt: &[LlamaToken],
+    reusable: usize,
+) -> Result<(), PrefixReuseError> {
+    let p0 = u32::try_from(reusable).map_err(|_| PrefixReuseError::Refused)?;
+    match kv.ctx.clear_kv_cache_seq(Some(0), Some(p0), None) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Err(PrefixReuseError::Refused),
+    }
+
+    kv.tokens.truncate(reusable);
+    decode_tokens(&mut kv.ctx, &prompt[reusable..], reusable)
+        .map_err(PrefixReuseError::Poisoned)?;
+    kv.tokens.extend_from_slice(&prompt[reusable..]);
+    Ok(())
+}
+
+/// Decode the whole prompt from position 0, reusing the retained context when
+/// its window matches and building a new one otherwise.
+fn full_prefill(
+    session: &mut Option<SessionKv>,
+    model: &Arc<LlamaModel>,
+    backend: &LlamaCppBackend,
+    settings: &ModelSettings,
+    prompt: &[LlamaToken],
+    n_ctx: u32,
+) -> Result<(), ProviderError> {
+    if session.as_ref().is_none_or(|kv| kv.n_ctx != n_ctx) {
+        // Release the old context before allocating its replacement so both
+        // KV caches are never resident at once.
+        *session = None;
+        *session = Some(SessionKv::create(model, backend, n_ctx, settings)?);
+    }
+
+    let kv = session
+        .as_mut()
+        .expect("session was just populated or already matched n_ctx");
+    kv.tokens.clear();
+    kv.ctx.clear_kv_cache();
+    match decode_tokens(&mut kv.ctx, prompt, 0) {
+        Ok(()) => {
+            kv.tokens.extend_from_slice(prompt);
+            Ok(())
+        }
+        Err(e) => {
+            *session = None;
+            Err(e)
+        }
+    }
+}
+
+/// Outcome of preparing a KV cache for one generation.
+struct PrefilledPrompt {
+    /// Leading prompt tokens served from a cache rather than decoded.
+    reused_prefix_tokens: usize,
+    /// Throwaway context owning this generation's KV cache. `None` means the
+    /// generation runs on the retained session.
+    transient: Option<SessionKv>,
+    /// Window the generation must respect: the throwaway context's own, smaller
+    /// window on a sacrificial turn, otherwise the request's effective context.
+    effective_ctx: usize,
+}
+
+/// Prepare a KV cache holding `prompt`, with logits available for its last
+/// token.
+fn prefill_prompt(
+    session: &mut Option<SessionKv>,
+    model: &Arc<LlamaModel>,
+    backend: &LlamaCppBackend,
+    settings: &ModelSettings,
+    prompt: &[LlamaToken],
+    effective_ctx: usize,
+) -> Result<PrefilledPrompt, ProviderError> {
+    let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
+        ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
+    })?;
+
+    let plan = prefill_plan(
+        session.as_ref().map(|kv| (kv.tokens.as_slice(), kv.n_ctx)),
+        prompt,
+        n_ctx,
+    );
+    tracing::debug!(
+        ?plan,
+        cached_tokens = session.as_ref().map(|kv| kv.tokens.len()),
+        cached_n_ctx = session.as_ref().map(|kv| kv.n_ctx),
+        prompt_tokens = prompt.len(),
+        n_ctx,
+        "prompt prefill plan"
+    );
+
+    match plan {
+        PrefillPlan::ReusePrefix(reusable) => {
+            let kv = session
+                .as_mut()
+                .expect("ReusePrefix is only produced when a session is retained");
+            match reuse_prefix(kv, prompt, reusable) {
+                Ok(()) => {
+                    return Ok(PrefilledPrompt {
+                        reused_prefix_tokens: reusable,
+                        transient: None,
+                        effective_ctx,
+                    })
+                }
+                Err(PrefixReuseError::Refused) => {
+                    tracing::debug!(
+                        reusable,
+                        "llama.cpp declined partial KV removal; prefilling the whole prompt"
+                    );
+                }
+                Err(PrefixReuseError::Poisoned(e)) => {
+                    tracing::warn!(error = %e, "suffix decode failed; rebuilding the generation context");
+                    *session = None;
+                }
+            }
+        }
+        PrefillPlan::SacrificialContext => {
+            let transient_n_ctx =
+                sacrificial_context_size(prompt.len(), settings.max_output_tokens, n_ctx);
+            match sacrificial_prefill(model, backend, settings, prompt, transient_n_ctx) {
+                Ok(kv) => {
+                    return Ok(PrefilledPrompt {
+                        reused_prefix_tokens: 0,
+                        transient: Some(kv),
+                        effective_ctx: transient_n_ctx as usize,
+                    })
+                }
+                Err(e) => {
+                    // Keeping the turn alive matters more than keeping the
+                    // cache; fall through and prefill in place.
+                    tracing::warn!(error = %e, "throwaway context unavailable; prefilling over the retained cache");
+                }
+            }
+        }
+        PrefillPlan::CreateContext | PrefillPlan::FullPrefillInPlace => {}
+    }
+
+    let retained = session.is_some();
+    match full_prefill(session, model, backend, settings, prompt, n_ctx) {
+        Ok(()) => {}
+        Err(e) if retained => {
+            // `full_prefill` dropped the poisoned context, so this attempt runs
+            // against a freshly created one.
+            tracing::warn!(error = %e, "prompt prefill failed; retrying with a new context");
+            full_prefill(session, model, backend, settings, prompt, n_ctx)?;
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(PrefilledPrompt {
+        reused_prefix_tokens: 0,
+        transient: None,
+        effective_ctx,
+    })
+}
+
+/// Build a context that lives only for this generation and decode the whole
+/// prompt into it, leaving any retained cache untouched.
+fn sacrificial_prefill(
+    model: &Arc<LlamaModel>,
+    backend: &LlamaCppBackend,
+    settings: &ModelSettings,
+    prompt: &[LlamaToken],
+    n_ctx: u32,
+) -> Result<SessionKv, ProviderError> {
+    let mut kv = SessionKv::create(model, backend, n_ctx, settings)?;
+    decode_tokens(&mut kv.ctx, prompt, 0)?;
+    Ok(kv)
+}
+
+/// Tokenize text + images via mtmd into a freshly built context.
 ///
-/// Returns the llama context, the number of prompt tokens consumed,
-/// and the effective context size.
-pub(super) fn create_and_prefill_multimodal<'model>(
-    loaded: &'model LoadedModel,
+/// Image embeddings are not a plain token prefix, so the resulting session is
+/// stored with an empty token list: the next text-only request falls through to
+/// a full prefill instead of attempting reuse.
+fn prefill_multimodal(
+    model: &Arc<LlamaModel>,
+    mtmd_ctx: Option<&MtmdContext>,
     backend: &LlamaCppBackend,
     prompt_text: &str,
     images: &[ExtractedImage],
     context_limit: usize,
     settings: &ModelSettings,
-) -> Result<(llama_cpp_2::context::LlamaContext<'model>, usize, usize), ProviderError> {
-    let mtmd_ctx = loaded.mtmd_ctx.as_ref().ok_or_else(|| {
+) -> Result<(SessionKv, usize, usize), ProviderError> {
+    let mtmd_ctx = mtmd_ctx.ok_or_else(|| {
         ProviderError::ExecutionError(
             "This model does not have vision support. Download the vision encoder from \
              Settings > Local Inference, or use a text-only message."
@@ -412,9 +794,9 @@ pub(super) fn create_and_prefill_multimodal<'model>(
 
     let prompt_token_count = chunks.total_tokens();
 
-    let n_ctx_train = loaded.model.n_ctx_train() as usize;
+    let n_ctx_train = model.n_ctx_train() as usize;
     let mmproj_overhead = settings.mmproj_size_bytes;
-    let memory_max_ctx = estimate_max_context_for_memory(&loaded.model, backend, mmproj_overhead);
+    let memory_max_ctx = estimate_max_context_for_memory(model, backend, mmproj_overhead, 0);
     let effective_ctx = effective_context_size(
         prompt_token_count,
         settings,
@@ -431,26 +813,25 @@ pub(super) fn create_and_prefill_multimodal<'model>(
         )));
     }
 
-    let ctx_params = build_context_params(effective_ctx as u32, settings);
-    let llama_ctx = loaded
-        .model
-        .new_context(backend.llama_backend(), ctx_params)
-        .map_err(|e| ProviderError::ExecutionError(format!("Failed to create context: {e}")))?;
+    let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
+        ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
+    })?;
+    let session = SessionKv::create(model, backend, n_ctx, settings)?;
 
-    let n_batch = llama_ctx.n_batch() as i32;
+    let n_batch = session.ctx.n_batch() as i32;
     let _n_past = chunks
-        .eval_chunks(mtmd_ctx, &llama_ctx, 0, 0, n_batch, true)
+        .eval_chunks(mtmd_ctx, &session.ctx, 0, 0, n_batch, true)
         .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
 
-    Ok((llama_ctx, prompt_token_count, effective_ctx))
+    Ok((session, prompt_token_count, effective_ctx))
 }
 
-pub(super) fn prepare_generation<'model>(
-    ctx: &mut GenerationContext<'model>,
+pub(super) fn prepare_generation(
+    ctx: &mut GenerationContext<'_>,
     oai_messages_json: &str,
     full_tools_json: Option<&str>,
     compact_tools_json: Option<&str>,
-) -> Result<PreparedGeneration<'model>, ProviderError> {
+) -> Result<PreparedGeneration, ProviderError> {
     let prefill_started = std::time::Instant::now();
     let apply_template = |tools: Option<&str>| {
         let params = OpenAIChatTemplateParams {
@@ -473,20 +854,24 @@ pub(super) fn prepare_generation<'model>(
             add_eos: false,
             parse_tool_calls: true,
         };
-        ctx.loaded
-            .model
+        ctx.model
             .apply_chat_template_oaicompat(ctx.template, &params)
     };
 
     let min_generation_headroom = 512;
-    let n_ctx_train = ctx.loaded.model.n_ctx_train() as usize;
-    let mmproj_overhead = if ctx.loaded.mtmd_ctx.is_some() {
+    let n_ctx_train = ctx.model.n_ctx_train() as usize;
+    let mmproj_overhead = if ctx.mtmd_ctx.is_some() {
         ctx.settings.mmproj_size_bytes
     } else {
         0
     };
-    let memory_max_ctx =
-        estimate_max_context_for_memory(&ctx.loaded.model, ctx.backend, mmproj_overhead);
+    let retained_kv_tokens = retained_kv_tokens(ctx.session);
+    let memory_max_ctx = estimate_max_context_for_memory(
+        ctx.model,
+        ctx.backend,
+        mmproj_overhead,
+        retained_kv_tokens,
+    );
     let cap = context_cap(ctx.settings, ctx.context_limit, n_ctx_train, memory_max_ctx);
     let token_budget = cap.saturating_sub(min_generation_headroom);
     let estimated_image_tokens = ctx.images.len() * ctx.settings.image_token_estimate;
@@ -494,7 +879,6 @@ pub(super) fn prepare_generation<'model>(
     let template_result = match apply_template(full_tools_json) {
         Ok(r) => {
             let token_count = ctx
-                .loaded
                 .model
                 .str_to_token(&r.prompt, AddBos::Never)
                 .map(|t| t.len())
@@ -526,39 +910,60 @@ pub(super) fn prepare_generation<'model>(
         None,
     );
 
-    let (llama_ctx, prompt_token_count, effective_ctx) = if !ctx.images.is_empty() {
-        create_and_prefill_multimodal(
-            ctx.loaded,
+    let (prompt_token_count, prefilled) = if !ctx.images.is_empty() {
+        // A prompt carrying image embeddings never reuses a retained cache:
+        // release it first so the two KV caches are not resident together.
+        *ctx.session = None;
+        let (session, ptc, ectx) = prefill_multimodal(
+            ctx.model,
+            ctx.mtmd_ctx,
             ctx.backend,
             &template_result.prompt,
             ctx.images,
             ctx.context_limit,
             ctx.settings,
-        )?
+        )?;
+        *ctx.session = Some(session);
+        (
+            ptc,
+            PrefilledPrompt {
+                reused_prefix_tokens: 0,
+                transient: None,
+                effective_ctx: ectx,
+            },
+        )
     } else {
         let tokens = ctx
-            .loaded
             .model
             .str_to_token(&template_result.prompt, AddBos::Never)
             .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
         let (ptc, ectx) = validate_and_compute_context(
-            ctx.loaded,
+            ctx.model,
+            ctx.mtmd_ctx.is_some(),
             ctx.backend,
             tokens.len(),
             ctx.context_limit,
             ctx.settings,
+            retained_kv_tokens,
         )?;
-        let lctx =
-            create_and_prefill_context(ctx.loaded, ctx.backend, &tokens, ectx, ctx.settings)?;
-        (lctx, ptc, ectx)
+        let prefilled = prefill_prompt(
+            ctx.session,
+            ctx.model,
+            ctx.backend,
+            ctx.settings,
+            &tokens,
+            ectx,
+        )?;
+        (ptc, prefilled)
     };
 
     Ok(PreparedGeneration {
         template_result,
-        llama_ctx,
         prompt_token_count,
-        effective_ctx,
+        effective_ctx: prefilled.effective_ctx,
         prefill_ms: prefill_started.elapsed().as_millis() as u64,
+        reused_prefix_tokens: prefilled.reused_prefix_tokens,
+        transient: prefilled.transient,
     })
 }
 
@@ -572,12 +977,18 @@ pub(super) enum TokenAction {
 /// token piece. The callback returns `TokenAction::Stop` to break early.
 /// Returns the total number of generated tokens, or `ContextLengthExceeded`
 /// if the model exhausted the available context window.
+///
+/// Every token appended to the KV cache is pushed onto `decoded`, so the caller
+/// can extend a retained token sequence with exactly what the cache now holds.
+/// The token a stop condition fires on is sampled but never decoded, and is
+/// therefore absent from `decoded`.
 pub(super) fn generation_loop(
     model: &LlamaModel,
-    ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+    ctx: &mut LlamaContext<'_>,
     settings: &crate::local_model_registry::ModelSettings,
     prompt_token_count: usize,
     effective_ctx: usize,
+    decoded: &mut Vec<LlamaToken>,
     mut on_piece: impl FnMut(&str) -> Result<TokenAction, ProviderError>,
 ) -> Result<i32, ProviderError> {
     let mut sampler = build_sampler(settings);
@@ -619,6 +1030,7 @@ pub(super) fn generation_loop(
             .map_err(|e| ProviderError::ExecutionError(format!("Failed to create batch: {}", e)))?;
         ctx.decode(&mut next_batch)
             .map_err(|e| ProviderError::ExecutionError(format!("Decode failed: {}", e)))?;
+        decoded.push(token);
     }
 
     if exhausted_loop && hit_context_limit {
@@ -708,6 +1120,226 @@ mod tests {
         assert_eq!(
             context_cap(&default_settings(), 4096, 8192, Some(2048)),
             2048
+        );
+    }
+
+    fn tokens(ids: impl IntoIterator<Item = i32>) -> Vec<LlamaToken> {
+        ids.into_iter().map(LlamaToken::new).collect()
+    }
+
+    /// A prompt whose first `shared` tokens match `cached`, then diverges.
+    fn diverging_prompt(shared: usize, extra: usize) -> Vec<LlamaToken> {
+        tokens((0..shared as i32).chain((0..extra as i32).map(|i| 100_000 + i)))
+    }
+
+    #[test]
+    fn common_prefix_len_counts_shared_leading_tokens() {
+        assert_eq!(
+            common_prefix_len(&tokens([1, 2, 3, 4]), &tokens([1, 2, 9, 4])),
+            2
+        );
+        assert_eq!(common_prefix_len(&tokens([1, 2]), &tokens([1, 2, 3])), 2);
+        assert_eq!(common_prefix_len(&tokens([1, 2, 3]), &tokens([1, 2])), 2);
+        assert_eq!(common_prefix_len(&tokens([9]), &tokens([1, 2])), 0);
+        assert_eq!(common_prefix_len(&[], &tokens([1, 2])), 0);
+        assert_eq!(common_prefix_len(&tokens([1, 2]), &[]), 0);
+    }
+
+    #[test]
+    fn prefill_plan_without_retained_session_creates_context() {
+        assert_eq!(
+            prefill_plan(None, &diverging_prompt(1000, 8), 4096),
+            PrefillPlan::CreateContext
+        );
+    }
+
+    #[test]
+    fn prefill_plan_on_context_size_change_creates_context() {
+        let cached = tokens(0..1000);
+        let prompt = diverging_prompt(1000, 8);
+        assert_eq!(
+            prefill_plan(Some((&cached, 2048)), &prompt, 4096),
+            PrefillPlan::CreateContext
+        );
+    }
+
+    #[test]
+    fn prefill_plan_reuses_long_shared_prefix() {
+        let cached = tokens(0..1000);
+        let prompt = diverging_prompt(900, 40);
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            PrefillPlan::ReusePrefix(900)
+        );
+    }
+
+    #[test]
+    fn prefill_plan_rejects_short_shared_prefix() {
+        // Comparable in size to the cache, so the sacrificial path does not
+        // apply and a genuinely new conversation shape takes the context over.
+        let cached = tokens(0..1000);
+        let prompt = diverging_prompt(REUSE_MIN_TOKENS - 1, 745);
+        assert_eq!(prompt.len(), 1000);
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            PrefillPlan::FullPrefillInPlace
+        );
+    }
+
+    #[test]
+    fn prefill_plan_reuses_at_exactly_the_threshold() {
+        let cached = tokens(0..1000);
+        let prompt = diverging_prompt(REUSE_MIN_TOKENS, 40);
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            PrefillPlan::ReusePrefix(REUSE_MIN_TOKENS)
+        );
+    }
+
+    #[test]
+    fn prefill_plan_always_leaves_a_token_to_decode() {
+        let cached = tokens(0..1000);
+        let prompt = tokens(0..1000);
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            PrefillPlan::ReusePrefix(999)
+        );
+    }
+
+    #[test]
+    fn prefill_plan_reuses_when_prompt_extends_the_cache() {
+        let cached = tokens(0..1000);
+        let prompt = tokens(0..1400);
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            PrefillPlan::ReusePrefix(1000)
+        );
+    }
+
+    #[test]
+    fn sacrificial_boundary_is_exactly_half_the_cache() {
+        // prompt * 2 < cached
+        assert!(is_sacrificial_prompt(499, 1000));
+        // prompt * 2 == cached — not smaller, so no sacrifice
+        assert!(!is_sacrificial_prompt(500, 1000));
+        assert!(!is_sacrificial_prompt(501, 1000));
+        assert!(!is_sacrificial_prompt(1000, 1000));
+        assert!(!is_sacrificial_prompt(7157, 772));
+        // No cache to protect.
+        assert!(!is_sacrificial_prompt(0, 0));
+        assert!(!is_sacrificial_prompt(100, 0));
+        // A degenerate empty prompt has nothing to decode elsewhere.
+        assert!(!is_sacrificial_prompt(0, 1000));
+    }
+
+    #[test]
+    fn prefill_plan_sacrifices_a_small_non_matching_prompt() {
+        // The observed interleave: a 378-token side call against a 7138-token
+        // conversational cache must not evict it.
+        let cached = tokens(0..7138);
+        let prompt = diverging_prompt(8, 370);
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            PrefillPlan::SacrificialContext
+        );
+    }
+
+    #[test]
+    fn prefill_plan_just_below_the_sacrificial_threshold() {
+        let cached = tokens(0..1000);
+        // 499 tokens, sharing fewer than REUSE_MIN: 499 * 2 < 1000.
+        let prompt = diverging_prompt(8, 491);
+        assert_eq!(prompt.len(), 499);
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            PrefillPlan::SacrificialContext
+        );
+    }
+
+    #[test]
+    fn prefill_plan_just_above_the_sacrificial_threshold_prefills_in_place() {
+        let cached = tokens(0..1000);
+        // 500 tokens: 500 * 2 == 1000, so the cache is not worth protecting.
+        let prompt = diverging_prompt(8, 492);
+        assert_eq!(prompt.len(), 500);
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            PrefillPlan::FullPrefillInPlace
+        );
+    }
+
+    #[test]
+    fn reuse_wins_over_sacrifice_when_the_prefix_is_long_enough() {
+        // A small prompt that nonetheless shares REUSE_MIN tokens with the cache
+        // is cheaper to serve from it than to prefill elsewhere.
+        let cached = tokens(0..7138);
+        let prompt = diverging_prompt(REUSE_MIN_TOKENS, 40);
+        assert!(is_sacrificial_prompt(prompt.len(), cached.len()));
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            PrefillPlan::ReusePrefix(REUSE_MIN_TOKENS)
+        );
+    }
+
+    #[test]
+    fn sacrifice_needs_a_retained_context_of_the_same_size() {
+        let cached = tokens(0..7138);
+        let prompt = diverging_prompt(8, 370);
+        // A window change forces a rebuild regardless of prompt size.
+        assert_eq!(
+            prefill_plan(Some((&cached, 2048)), &prompt, 4096),
+            PrefillPlan::CreateContext
+        );
+        assert_eq!(
+            prefill_plan(None, &prompt, 4096),
+            PrefillPlan::CreateContext
+        );
+    }
+
+    #[test]
+    fn sacrificial_context_is_sized_to_the_prompt_plus_an_output_budget() {
+        assert_eq!(
+            sacrificial_context_size(378, None, 4096),
+            378 + SACRIFICIAL_OUTPUT_TOKENS as u32
+        );
+        // Never larger than the request's own window.
+        assert_eq!(sacrificial_context_size(378, None, 1024), 1024);
+        // An explicit output cap is respected instead of the default budget.
+        assert_eq!(sacrificial_context_size(378, Some(256), 4096), 634);
+        // Saturating arithmetic, not a panic.
+        assert_eq!(sacrificial_context_size(usize::MAX, None, 4096), 4096);
+    }
+
+    #[test]
+    fn sacrificial_context_stays_smaller_than_the_retained_window() {
+        // Sacrifice requires prompt * 2 < cached <= n_ctx, so any prompt that
+        // reaches this path is under half the window. At the Jetson's 4096 that
+        // bounds the throwaway cache strictly below a second full one.
+        let n_ctx: u32 = 4096;
+        for prompt in [1usize, 378, 1000, 2047] {
+            assert!(is_sacrificial_prompt(prompt, n_ctx as usize));
+            let transient = sacrificial_context_size(prompt, None, n_ctx);
+            assert!(
+                transient < n_ctx,
+                "prompt {prompt} produced a throwaway window of {transient}, not below {n_ctx}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_plan_with_empty_cached_tokens_prefills_in_place() {
+        assert_eq!(
+            prefill_plan(Some((&[], 4096)), &diverging_prompt(1000, 8), 4096),
+            PrefillPlan::FullPrefillInPlace
+        );
+    }
+
+    #[test]
+    fn prefill_plan_on_empty_prompt_prefills_in_place() {
+        let cached = tokens(0..1000);
+        assert_eq!(
+            prefill_plan(Some((&cached, 4096)), &[], 4096),
+            PrefillPlan::FullPrefillInPlace
         );
     }
 }

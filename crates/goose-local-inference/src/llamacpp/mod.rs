@@ -5,6 +5,7 @@ mod inference_native_tools;
 use std::any::Any;
 use std::ffi::CStr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -352,8 +353,8 @@ impl LlamaCppBackend {
             Ok(backend) => backend,
             Err(llama_cpp_2::LlamaCppError::BackendAlreadyInitialized) => {
                 unreachable!(
-                    "LlamaBackend already initialized but Weak was dead; \
-                     the runtime mutex prevents concurrent re-init"
+                    "the runtime holds the only LlamaBackend for the life of the \
+                     process and is built exactly once under the runtime mutex"
                 )
             }
             Err(e) => {
@@ -455,9 +456,10 @@ impl LocalInferenceBackend for LlamaCppBackend {
         );
 
         Ok(Box::new(LoadedModel {
-            model,
+            model: Arc::new(model),
             templates,
             mtmd_ctx,
+            session: None,
         }))
     }
 
@@ -573,8 +575,15 @@ impl LocalInferenceBackend for LlamaCppBackend {
             !request.tools.is_empty(),
         )?;
 
+        tracing::debug!(
+            loaded_ptr = ?(loaded as *const LoadedModel),
+            session_retained = loaded.session.is_some(),
+            "generate: model slot identity"
+        );
         let mut gen_ctx = GenerationContext {
-            loaded,
+            model: &loaded.model,
+            mtmd_ctx: loaded.mtmd_ctx.as_ref(),
+            session: &mut loaded.session,
             backend: self,
             template,
             settings: request.settings,

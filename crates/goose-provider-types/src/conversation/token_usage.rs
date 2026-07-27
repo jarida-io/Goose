@@ -35,6 +35,10 @@ pub struct ProviderStats {
     /// Actual context-window size (n_ctx) used for this generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_context_tokens: Option<usize>,
+    /// Prompt tokens served from a retained KV cache instead of being decoded.
+    /// `Some(0)` means the backend supports prefix reuse but reused nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_prefix_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
