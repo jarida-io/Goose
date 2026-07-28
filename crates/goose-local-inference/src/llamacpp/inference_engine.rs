@@ -7,7 +7,9 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, ChatTemplateResult, LlamaChatTemplate, LlamaModel};
-use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdInputText};
+use llama_cpp_2::mtmd::{
+    MtmdBitmap, MtmdContext, MtmdInputChunk, MtmdInputChunkType, MtmdInputChunks, MtmdInputText,
+};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
@@ -55,18 +57,165 @@ pub(super) struct LoadedChatTemplates {
     pub force_default: bool,
 }
 
-/// A llama context retained across generations, paired with the token sequence
-/// it holds in the KV cache of sequence 0.
+/// One span of a retained cache's media-bearing head, in decode order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum HeadChunk {
+    /// Text tokens, one KV position each.
+    Text(Vec<LlamaToken>),
+    /// Media embeddings. Opaque here: what they contain is pinned by the source
+    /// images `MediaHead` holds alongside, not by anything in this variant.
+    Media { n_tokens: usize, n_pos: usize },
+}
+
+impl HeadChunk {
+    fn n_pos(&self) -> usize {
+        match self {
+            Self::Text(tokens) => tokens.len(),
+            Self::Media { n_pos, .. } => *n_pos,
+        }
+    }
+}
+
+/// Why an incoming prompt could not resume from a retained media head.
 ///
-/// Invariant: `tokens` is a *prefix* of the KV cache contents — position `i`
-/// of sequence 0 holds `tokens[i]` for every `i < tokens.len()`. The cache may
-/// hold further positions beyond `tokens.len()`; every reuse path removes
-/// everything from its resume position onwards, so unrecorded trailing
-/// positions can never be attended to.
+/// Carried rather than collapsed to a bool so the log says which input moved.
+/// The causes have very different meanings for whoever is reading it: an image
+/// change is the user sending a different picture, or the host replaying a
+/// different number of them (both expected), whereas a chunk-shape change with
+/// identical images is the *prompt around* the pictures having been rewritten.
+///
+/// The checks in [`MediaHead::mismatch`] run narrowest-cause first, so the
+/// reported variant is the most specific one that explains the miss. A change
+/// usually trips several at once — an extra image is also an extra chunk and
+/// more positions. Order decides only which reason is logged: the head matches
+/// if and only if every check agrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HeadMismatch {
+    /// A different number of images. This is the growing-image-list
+    /// conversation, and the reason that shape gets no reuse.
+    ImageCount,
+    /// The same number of images, but different pixels in at least one.
+    ImageBytes,
+    /// Same images, different chunk list: the text around the pictures was
+    /// rewritten. Two routine causes, both of which also move every media
+    /// position — the chunk list is simply the narrower way to say it. The
+    /// first is `prepare_generation` flipping between the full and compact tool
+    /// schemas, which rewrites the whole rendered prompt including everything
+    /// ahead of the first image. The second is any growth in the transcript
+    /// ahead of the images. Either way no part of the head survives.
+    ChunkShape,
+    /// The head would occupy a different number of KV positions despite an
+    /// identical chunk list. Not reachable from mtmd, whose position count is
+    /// the sum over exactly those chunks on both sides. It is the tripwire for
+    /// a `MediaHead` whose recorded `n_pos` disagrees with its own chunks,
+    /// which would resume the decode at the wrong absolute position.
+    Positions,
+}
+
+/// The leading part of a retained KV cache that carries media embeddings.
+///
+/// # Why the match is all-or-nothing
+///
+/// Media KV contents are not tokens, so they cannot be compared position by
+/// position the way `SessionKv::tokens` is. The head is therefore matched
+/// atomically: a prompt may resume from it only when it reproduces the head
+/// exactly — the same chunk shape in the same order, built from the same image
+/// bytes in the same order. That suffices because mtmd's tokenization and
+/// preprocessing are deterministic functions of (prompt text, bitmaps), so
+/// equal inputs place equal pixel batches at equal positions.
+///
+/// There is deliberately no partial head match. The head ends at the last media
+/// chunk, so anything that changes it changes a chunk at or before an image, and
+/// every image after that point moves to a different KV position. Matching a
+/// prefix of the head would resume behind embeddings that no longer describe
+/// what the prompt says they do. Degrading to no reuse is the correct outcome;
+/// the cost is a rebuild, and the alternative is a wrong answer.
+///
+/// # What this actually buys, honestly
+///
+/// Only conversations whose image list is *already stable* turn by turn. The
+/// four-turn production trace that motivated caching here (1 then 2 then 3
+/// encodes per turn, prefill climbing 28s to 37s) is not one of them: its image
+/// list grows every turn, so [`MediaHead::mismatch`] returns
+/// [`HeadMismatch::ImageCount`] and reuse never fires on it. That trace is
+/// addressed upstream of this engine, by the host capping how many historical
+/// images it replays — not by this cache.
+///
+/// The shape this does serve is the one left over once that cap holds the list
+/// steady: "here is a photo" followed by questions about that same photo. Turns
+/// 2..N present a byte-identical image list, so they skip the vision encode and
+/// the prefill of everything ahead of the tail.
+///
+/// Images promoted out of tool results (a camera look) never form a stable head
+/// at all, and not only when the camera is looked at again. GIAP's provider shim
+/// re-derives them from the newest frames every turn and appends them in a fresh
+/// trailing carrier message, after the whole conversation. Two consequences:
+/// the last image sits at the very end of the prompt, so the head is
+/// effectively the entire prompt; and the transcript ahead of it grows each
+/// turn, so the chunk list moves each turn. Even a session that looks once and
+/// then asks follow-ups misses on [`HeadMismatch::ChunkShape`]. Only images
+/// carried in the conversation itself, at a position the transcript no longer
+/// changes, are reused here.
+pub(super) struct MediaHead {
+    chunks: Vec<HeadChunk>,
+    /// Positions the head occupies: `[0, n_pos)`.
+    n_pos: usize,
+    /// Source bytes of every image in the request that built this head, in
+    /// order. Compared byte for byte rather than hashed — a hash collision here
+    /// would silently answer about a different picture, and images are small
+    /// enough next to a resident model that the copy is not worth the risk.
+    images: Vec<Vec<u8>>,
+}
+
+impl MediaHead {
+    /// `None` when `(chunks, images)` reproduce this head exactly.
+    ///
+    /// Ordered narrowest cause first — see [`HeadMismatch`]. The byte compare
+    /// runs ahead of the chunk compare so `ChunkShape` keeps the meaning its
+    /// doc gives it ("same images, rewritten text"); that costs one memcmp of
+    /// a few hundred KB on the rewritten-prompt path, against a rebuild
+    /// measured in seconds.
+    fn mismatch(
+        &self,
+        n_pos: usize,
+        chunks: &[HeadChunk],
+        images: &[ExtractedImage],
+    ) -> Option<HeadMismatch> {
+        if self.images.len() != images.len() {
+            return Some(HeadMismatch::ImageCount);
+        }
+        if !self
+            .images
+            .iter()
+            .zip(images)
+            .all(|(cached, incoming)| cached.as_slice() == incoming.bytes.as_slice())
+        {
+            return Some(HeadMismatch::ImageBytes);
+        }
+        if self.chunks != chunks {
+            return Some(HeadMismatch::ChunkShape);
+        }
+        if self.n_pos != n_pos {
+            return Some(HeadMismatch::Positions);
+        }
+        None
+    }
+}
+
+/// A llama context retained across generations, paired with a description of
+/// what it holds in the KV cache of sequence 0.
+///
+/// Invariant: positions `[0, media_pos())` hold `head`, and position
+/// `media_pos() + i` holds `tokens[i]` for every `i < tokens.len()`. With no
+/// head — the text-only case — that reduces to `tokens` being a plain prefix of
+/// the cache. The cache may hold further positions beyond the recorded ones;
+/// every reuse path removes everything from its resume position onwards, so
+/// unrecorded trailing positions can never be attended to.
 pub(super) struct SessionKv {
     /// Declared before `_model`: fields drop in declaration order, so the
     /// context is destroyed before the model allocation it points into.
     ctx: LlamaContext<'static>,
+    head: Option<MediaHead>,
     tokens: Vec<LlamaToken>,
     /// The `n_ctx` this context was *requested* with. Compared against the
     /// effective context of an incoming request; llama.cpp may round the
@@ -110,6 +259,7 @@ impl SessionKv {
 
         Ok(Self {
             ctx,
+            head: None,
             tokens: Vec::new(),
             n_ctx,
             _model: model,
@@ -122,6 +272,16 @@ impl SessionKv {
 
     pub(super) fn record_generated(&mut self, tokens: &[LlamaToken]) {
         self.tokens.extend_from_slice(tokens);
+    }
+
+    /// First position `tokens` describes.
+    fn media_pos(&self) -> usize {
+        self.head.as_ref().map_or(0, |head| head.n_pos)
+    }
+
+    /// Every position the cache is known to hold, reusable or not.
+    fn occupied(&self) -> usize {
+        self.media_pos() + self.tokens.len()
     }
 }
 
@@ -153,11 +313,60 @@ pub(super) enum PrefillPlan {
     /// The retained context fits but its contents do not; clear the cache and
     /// decode the whole prompt into it.
     FullPrefillInPlace,
-    /// The retained cache shares this many leading tokens with the prompt.
+    /// The cache already holds everything below this absolute KV position.
+    /// Decode resumes there.
     ReusePrefix(usize),
     /// The prompt shares nothing useful with a much larger retained cache. Run
     /// in a throwaway context and leave the retained cache intact.
     SacrificialContext,
+}
+
+/// What a retained KV cache offers an incoming prompt.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RetainedPrefix<'a> {
+    /// Positions `[0, media_pos)` hold media the prompt has *already been
+    /// shown* to reproduce. Zero for a text-only cache, and zero whenever the
+    /// prompt cannot reproduce the head — in which case `tokens` is empty too,
+    /// so nothing behind a head is ever resumed at the wrong position.
+    media_pos: usize,
+    /// Tokens held at positions `[media_pos, media_pos + tokens.len())`.
+    tokens: &'a [LlamaToken],
+    /// Every position the cache occupies, reusable or not. Only its size
+    /// matters: it decides whether the cache is worth protecting.
+    occupied: usize,
+    n_ctx: u32,
+}
+
+impl<'a> RetainedPrefix<'a> {
+    /// A cache the incoming prompt can resume from: either it holds no media,
+    /// or the caller has already verified the prompt reproduces the head.
+    fn resumable(kv: &'a SessionKv) -> Self {
+        Self {
+            media_pos: kv.media_pos(),
+            tokens: &kv.tokens,
+            occupied: kv.occupied(),
+            n_ctx: kv.n_ctx,
+        }
+    }
+
+    /// A cache the incoming prompt cannot resume from. Its size still decides
+    /// whether it deserves protection from a small unrelated prompt.
+    ///
+    /// `occupied` counts KV *positions*, while `is_sacrificial_prompt` weighs it
+    /// against a prompt measured in tokens. The two agree for every model this
+    /// engine runs today (Gemma included: one position per image token). Under
+    /// M-RoPE, where an image occupies fewer positions than it costs tokens, the
+    /// comparison undercounts the cache and the protection is weaker than
+    /// intended — a small prompt evicts a cache it should have run beside. That
+    /// direction is a lost optimisation, never a wrong answer.
+    fn opaque(kv: &SessionKv) -> Self {
+        Self {
+            media_pos: 0,
+            tokens: &[],
+            occupied: kv.occupied(),
+            n_ctx: kv.n_ctx,
+        }
+    }
 }
 
 pub(super) fn common_prefix_len(cached: &[LlamaToken], prompt: &[LlamaToken]) -> usize {
@@ -181,25 +390,31 @@ fn is_sacrificial_prompt(prompt_tokens: usize, cached_tokens: usize) -> bool {
     prompt_tokens > 0 && prompt_tokens.saturating_mul(2) < cached_tokens
 }
 
-/// Decide how to prefill `prompt` given the retained cache's `(tokens, n_ctx)`.
+/// Decide how to prefill a prompt whose plain-token part is `prompt`.
+///
+/// For a text-only request `prompt` is the whole prompt. For a request that
+/// reproduces a retained media head it is only the tail that follows the head,
+/// and the returned position is absolute — the head's positions count towards
+/// the reuse threshold because they are the expensive ones.
 pub(super) fn prefill_plan(
-    retained: Option<(&[LlamaToken], u32)>,
+    retained: Option<RetainedPrefix<'_>>,
     prompt: &[LlamaToken],
     effective_ctx: u32,
 ) -> PrefillPlan {
-    let Some((cached, cached_n_ctx)) = retained else {
+    let Some(cached) = retained else {
         return PrefillPlan::CreateContext;
     };
-    if cached_n_ctx != effective_ctx {
+    if cached.n_ctx != effective_ctx {
         return PrefillPlan::CreateContext;
     }
     // llama.cpp needs a non-empty batch to produce logits, so at least the
     // final prompt token must always be decoded.
-    let reusable = common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1));
-    if reusable >= REUSE_MIN_TOKENS {
-        return PrefillPlan::ReusePrefix(reusable);
+    let reusable = common_prefix_len(cached.tokens, prompt).min(prompt.len().saturating_sub(1));
+    let resume = cached.media_pos + reusable;
+    if resume >= REUSE_MIN_TOKENS && reusable < prompt.len() {
+        return PrefillPlan::ReusePrefix(resume);
     }
-    if is_sacrificial_prompt(prompt.len(), cached.len()) {
+    if is_sacrificial_prompt(prompt.len(), cached.occupied) {
         return PrefillPlan::SacrificialContext;
     }
     PrefillPlan::FullPrefillInPlace
@@ -421,11 +636,31 @@ pub(super) fn effective_context_size(
     limit
 }
 
+/// LOAD-BEARING FOR KV REUSE: every partial-resume path in this file depends on
+/// `swa_full` being true, so it is pinned here rather than inherited.
+///
+/// A sliding-window model (Gemma among them) normally keeps only a window of KV
+/// per SWA layer, so positions behind `seq_pos_max - window` have already been
+/// evicted. Resuming a decode at such a position would attend to KV that is no
+/// longer there and quietly produce different output — no error, just a worse
+/// answer. `swa_full = true` makes llama.cpp allocate the full-size SWA cache
+/// instead, which is what makes `reuse_prefix` (and the multimodal head resume
+/// built on it) sound. The text-path prefix reuse has the same dependency.
+///
+/// The pin costs nothing today: it is also the vendored default
+/// (`llama_context_default_params()` in `llama.cpp/src/llama-context.cpp`, and
+/// llama-cpp-2 0.1.146's own `swa_full()` doctest asserts it). Stating it in
+/// code is what stops a future goose/llama.cpp sync from flipping that default
+/// and silently un-sounding every resume path. IF THIS LINE IS EVER REMOVED,
+/// partial resume must go with it: `prefill_plan` must stop returning
+/// `ReusePrefix` and `reuse_media_head` must stop resuming behind a head.
 pub(super) fn build_context_params(
     ctx_size: u32,
     settings: &crate::local_model_registry::ModelSettings,
 ) -> LlamaContextParams {
-    let mut params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(ctx_size));
+    let mut params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(ctx_size))
+        .with_swa_full(true);
 
     if let Some(n_batch) = settings.n_batch {
         params = params.with_n_batch(n_batch);
@@ -581,21 +816,64 @@ enum PrefixReuseError {
     Poisoned(ProviderError),
 }
 
+/// How many of `prompt`'s tokens survive a resume at absolute `resume_pos`, or
+/// `None` when the position is not one this cache can honour.
+///
+/// Three bounds, all of them load-bearing:
+///
+/// - `resume_pos >= media_pos`: a resume inside the media head would land in KV
+///   that is not token-addressable at all.
+/// - `kept <= prompt_len`: a range bound on `prompt[kept..]`, and nothing more.
+///   It does NOT establish that the kept tokens are ones the incoming prompt
+///   reproduces — no prefix equality is checked here. That property comes from
+///   the caller: `prefill_plan` derives `resume_pos` from a `common_prefix_len`
+///   of the cached and incoming tokens. A future caller that computes
+///   `resume_pos` some other way must establish prefix equality itself, or it
+///   will resume over KV the prompt no longer describes.
+/// - `kept <= cached_len`: the caller truncates the token ledger to `kept`, and
+///   `Vec::truncate` past the end is a silent no-op. Without this bound a
+///   `resume_pos` past the recorded tail would leave `tokens` claiming
+///   positions the KV cache was just trimmed of — the ledger and the cache
+///   would disagree, which is the precise failure this cache exists to avoid.
+///
+/// `prefill_plan` never produces a position that violates the last two, since
+/// its `reusable` is a common-prefix length of both slices. They are checked
+/// anyway because this function is what makes the truncate safe, and the only
+/// caller that computes `resume_pos` from something other than a fresh
+/// `prefill_plan` would be a future one.
+fn kept_prefix_tokens(
+    resume_pos: usize,
+    media_pos: usize,
+    prompt_len: usize,
+    cached_len: usize,
+) -> Option<usize> {
+    resume_pos
+        .checked_sub(media_pos)
+        .filter(|kept| *kept <= prompt_len && *kept <= cached_len)
+}
+
+/// Trim the KV cache back to absolute position `resume_pos` and decode the rest
+/// of `prompt` there. `prompt` starts at the cache's `media_pos`, so the tokens
+/// it keeps are those before `resume_pos - media_pos`.
+///
+/// Sound only while contexts are built with `swa_full = true`; see
+/// [`build_context_params`].
 fn reuse_prefix(
     kv: &mut SessionKv,
     prompt: &[LlamaToken],
-    reusable: usize,
+    resume_pos: usize,
 ) -> Result<(), PrefixReuseError> {
-    let p0 = u32::try_from(reusable).map_err(|_| PrefixReuseError::Refused)?;
+    let kept = kept_prefix_tokens(resume_pos, kv.media_pos(), prompt.len(), kv.tokens.len())
+        .ok_or(PrefixReuseError::Refused)?;
+    let p0 = u32::try_from(resume_pos).map_err(|_| PrefixReuseError::Refused)?;
     match kv.ctx.clear_kv_cache_seq(Some(0), Some(p0), None) {
         Ok(true) => {}
         Ok(false) | Err(_) => return Err(PrefixReuseError::Refused),
     }
 
-    kv.tokens.truncate(reusable);
-    decode_tokens(&mut kv.ctx, &prompt[reusable..], reusable)
-        .map_err(PrefixReuseError::Poisoned)?;
-    kv.tokens.extend_from_slice(&prompt[reusable..]);
+    kv.tokens.truncate(kept);
+    decode_tokens(&mut kv.ctx, &prompt[kept..], resume_pos).map_err(PrefixReuseError::Poisoned)?;
+    kv.tokens.extend_from_slice(&prompt[kept..]);
     Ok(())
 }
 
@@ -619,6 +897,7 @@ fn full_prefill(
     let kv = session
         .as_mut()
         .expect("session was just populated or already matched n_ctx");
+    kv.head = None;
     kv.tokens.clear();
     kv.ctx.clear_kv_cache();
     match decode_tokens(&mut kv.ctx, prompt, 0) {
@@ -660,13 +939,22 @@ fn prefill_prompt(
     })?;
 
     let plan = prefill_plan(
-        session.as_ref().map(|kv| (kv.tokens.as_slice(), kv.n_ctx)),
+        session.as_ref().map(|kv| {
+            // A text-only prompt carries no media, so it can never reproduce a
+            // retained media head and nothing behind that head is resumable.
+            if kv.head.is_some() {
+                RetainedPrefix::opaque(kv)
+            } else {
+                RetainedPrefix::resumable(kv)
+            }
+        }),
         prompt,
         n_ctx,
     );
     tracing::debug!(
         ?plan,
         cached_tokens = session.as_ref().map(|kv| kv.tokens.len()),
+        cached_media_pos = session.as_ref().map(SessionKv::media_pos),
         cached_n_ctx = session.as_ref().map(|kv| kv.n_ctx),
         prompt_tokens = prompt.len(),
         n_ctx,
@@ -674,21 +962,21 @@ fn prefill_prompt(
     );
 
     match plan {
-        PrefillPlan::ReusePrefix(reusable) => {
+        PrefillPlan::ReusePrefix(resume) => {
             let kv = session
                 .as_mut()
                 .expect("ReusePrefix is only produced when a session is retained");
-            match reuse_prefix(kv, prompt, reusable) {
+            match reuse_prefix(kv, prompt, resume) {
                 Ok(()) => {
                     return Ok(PrefilledPrompt {
-                        reused_prefix_tokens: reusable,
+                        reused_prefix_tokens: resume,
                         transient: None,
                         effective_ctx,
                     })
                 }
                 Err(PrefixReuseError::Refused) => {
                     tracing::debug!(
-                        reusable,
+                        resume,
                         "llama.cpp declined partial KV removal; prefilling the whole prompt"
                     );
                 }
@@ -751,12 +1039,184 @@ fn sacrificial_prefill(
     Ok(kv)
 }
 
-/// Tokenize text + images via mtmd into a freshly built context.
+/// A prompt's mtmd chunk list, split at its last media chunk.
+struct SplitChunks {
+    head: Vec<HeadChunk>,
+    /// Positions the head occupies. The tail starts here.
+    head_pos: usize,
+    /// Tokens of every chunk after the last media chunk, concatenated. They
+    /// take one position each from `head_pos`, exactly where `mtmd_helper`
+    /// would place them.
+    tail: Vec<LlamaToken>,
+}
+
+/// Describe one chunk, or refuse it.
 ///
-/// Image embeddings are not a plain token prefix, so the resulting session is
-/// stored with an empty token list: the next text-only request falls through to
-/// a full prefill instead of attempting reuse.
+/// `None` means "this chunk cannot be modelled position for position", which
+/// makes the whole cache ineligible for reuse. The refusal that fires on real
+/// input is the audio chunk, whose position model this code has never
+/// exercised. The text-chunk check below is a tripwire, not a live filter:
+/// mtmd returns the same value from `get_n_tokens` and `get_n_pos` for a text
+/// chunk, so `n_pos != n_tokens` is unreachable today and only earns its place
+/// if that ever stops being true.
+///
+/// # On an unrecognised chunk type
+///
+/// The `match` below is exhaustive on purpose — no `_` arm. If a future
+/// llama-cpp-2 adds a fourth `MtmdInputChunkType`, this stops compiling, which
+/// is the outcome we want: someone decides what the new type means for the
+/// position model rather than a wildcard silently refusing (or worse,
+/// mis-describing) it.
+///
+/// The other direction — llama.cpp starting to emit a chunk type the *binding*
+/// does not know — cannot be turned into a refusal here, and it is worth being
+/// precise about why rather than leaving it looking like an oversight:
+///
+/// - `MtmdInputChunkType::from` panics on an unrecognised discriminant
+///   (llama-cpp-2 0.1.146 `mtmd.rs:48`), and the release profile sets
+///   `panic = "abort"`, so `catch_unwind` cannot convert it into a refusal.
+/// - Reading the discriminant ourselves is not possible either: both
+///   `MtmdInputChunks::chunks` and `MtmdInputChunk::chunk` are `pub(crate)`, so
+///   there is no way to reach `mtmd_input_chunk_get_type` from outside the
+///   crate.
+/// - It would not help if there were. The vendored llama.cpp aborts on the same
+///   input in three places this code cannot avoid:
+///   `mtmd_input_chunk_get_n_tokens` and `mtmd_input_chunk_get_n_pos`
+///   (`mtmd.cpp:1187`, `:1199`) and `mtmd_helper_eval_chunk_single`
+///   (`mtmd-helper.cpp:378`). The first of those is reached from
+///   `MtmdInputChunks::total_tokens()`, which `prefill_multimodal` calls to size
+///   the context — before this function runs, and on the pre-cache code path
+///   too. The fallback this function's refusal leads to is `eval_chunks`, which
+///   aborts as well.
+///
+/// So an unknown chunk type kills the process either way, at the same point in
+/// the same request, with or without this cache. That is a llama.cpp property,
+/// not something this file introduced or can contain; the mitigation that does
+/// exist is the compile error above, plus keeping the vendored version pinned.
+fn describe_chunk(chunk: &MtmdInputChunk) -> Option<HeadChunk> {
+    let n_tokens = chunk.n_tokens();
+    let n_pos = usize::try_from(chunk.n_positions()).ok()?;
+    match chunk.chunk_type() {
+        MtmdInputChunkType::Text => {
+            let tokens = chunk.text_tokens().unwrap_or(&[]);
+            if tokens.len() != n_tokens || n_pos != n_tokens {
+                return None;
+            }
+            Some(HeadChunk::Text(tokens.to_vec()))
+        }
+        MtmdInputChunkType::Image => Some(HeadChunk::Media { n_tokens, n_pos }),
+        MtmdInputChunkType::Audio => None,
+    }
+}
+
+/// Describe every chunk mtmd produced, or refuse the list.
+fn read_chunks(chunks: &MtmdInputChunks) -> Option<Vec<HeadChunk>> {
+    let mut described = Vec::with_capacity(chunks.len());
+    for index in 0..chunks.len() {
+        described.push(describe_chunk(&chunks.get(index)?)?);
+    }
+    Some(described)
+}
+
+/// Split a described chunk list at its last media chunk.
+///
+/// Everything after that point is plain text, which is the whole reason the
+/// reuse path can run without calling mtmd again: llama-cpp-2 0.1.146 exposes
+/// no way to evaluate a subset of chunks, but ordinary token decode at an
+/// explicit position is exactly what `mtmd_helper` does for text anyway.
+fn split_at_last_media(mut chunks: Vec<HeadChunk>) -> Option<SplitChunks> {
+    let last_media = chunks
+        .iter()
+        .rposition(|chunk| matches!(chunk, HeadChunk::Media { .. }))?;
+    let rest = chunks.split_off(last_media + 1);
+    let head_pos = chunks.iter().map(HeadChunk::n_pos).sum();
+
+    let mut tail = Vec::new();
+    for chunk in &rest {
+        match chunk {
+            HeadChunk::Text(tokens) => tail.extend_from_slice(tokens),
+            // Unreachable past the last media chunk; refuse rather than drop it
+            // silently, because a dropped chunk would mis-position the tail.
+            HeadChunk::Media { .. } => return None,
+        }
+    }
+
+    Some(SplitChunks {
+        head: chunks,
+        head_pos,
+        tail,
+    })
+}
+
+/// Try to serve a media-bearing prompt from the retained cache.
+///
+/// Returns the absolute position decode resumed at. Every refusal leaves the
+/// cache exactly as it was found (or drops it, when a failed decode makes its
+/// contents untrustworthy) and the caller rebuilds, so a miss only costs the
+/// comparison.
+///
+/// A refusal is logged with the reason it refused. That is the only way the
+/// tool-schema flip described on [`HeadMismatch::ChunkShape`] is observable: it
+/// silently and permanently ends reuse for a session, and without a reason in
+/// the log the symptom is "the cache just stopped working" with nothing to point
+/// at.
+fn reuse_media_head(
+    session: &mut Option<SessionKv>,
+    split: &SplitChunks,
+    images: &[ExtractedImage],
+    n_ctx: u32,
+) -> Option<usize> {
+    let kv = session.as_mut()?;
+    let head = kv.head.as_ref()?;
+    if let Some(reason) = head.mismatch(split.head_pos, &split.head, images) {
+        tracing::debug!(
+            ?reason,
+            cached_head_pos = head.n_pos,
+            cached_images = head.images.len(),
+            prompt_head_pos = split.head_pos,
+            prompt_images = images.len(),
+            "retained media head does not match this prompt; rebuilding it"
+        );
+        return None;
+    }
+
+    let PrefillPlan::ReusePrefix(resume) =
+        prefill_plan(Some(RetainedPrefix::resumable(kv)), &split.tail, n_ctx)
+    else {
+        return None;
+    };
+
+    match reuse_prefix(kv, &split.tail, resume) {
+        Ok(()) => Some(resume),
+        Err(PrefixReuseError::Refused) => {
+            tracing::debug!(
+                resume,
+                "llama.cpp declined partial KV removal; rebuilding the multimodal prompt"
+            );
+            None
+        }
+        Err(PrefixReuseError::Poisoned(e)) => {
+            tracing::warn!(error = %e, "suffix decode failed; rebuilding the generation context");
+            *session = None;
+            None
+        }
+    }
+}
+
+/// Tokenize text + images via mtmd and prefill them.
+///
+/// When the retained cache already holds this exact image list at these exact
+/// positions, only the text that follows the last image is decoded — the encode
+/// and the prefill of everything before it are skipped. Otherwise the cache is
+/// rebuilt from scratch, which is what this always used to do.
+///
+/// "This exact image list" is a strict condition and it is the reason the win
+/// is narrower than it first looks: a conversation that accumulates pictures
+/// misses every turn. See [`MediaHead`] for which conversation shapes actually
+/// benefit and which do not.
+#[allow(clippy::too_many_arguments)]
 fn prefill_multimodal(
+    session: &mut Option<SessionKv>,
     model: &Arc<LlamaModel>,
     mtmd_ctx: Option<&MtmdContext>,
     backend: &LlamaCppBackend,
@@ -764,7 +1224,7 @@ fn prefill_multimodal(
     images: &[ExtractedImage],
     context_limit: usize,
     settings: &ModelSettings,
-) -> Result<(SessionKv, usize, usize), ProviderError> {
+) -> Result<(usize, PrefilledPrompt), ProviderError> {
     let mtmd_ctx = mtmd_ctx.ok_or_else(|| {
         ProviderError::ExecutionError(
             "This model does not have vision support. Download the vision encoder from \
@@ -792,11 +1252,24 @@ fn prefill_multimodal(
         ProviderError::ExecutionError(format!("Multimodal tokenization failed: {e}"))
     })?;
 
+    // Walks every chunk and sums `mtmd_input_chunk_get_n_tokens`, which aborts
+    // inside llama.cpp on a chunk type it does not know. It runs before this
+    // function describes anything, and it ran on the pre-cache code path too —
+    // which is what makes the exhaustive match in `describe_chunk` the only
+    // unknown-chunk-type mitigation available here rather than a missing one.
     let prompt_token_count = chunks.total_tokens();
 
     let n_ctx_train = model.n_ctx_train() as usize;
     let mmproj_overhead = settings.mmproj_size_bytes;
-    let memory_max_ctx = estimate_max_context_for_memory(model, backend, mmproj_overhead, 0);
+    // The retained window counts towards what this request can spend: it is
+    // either kept (the reuse path allocates nothing) or released before its
+    // replacement is allocated.
+    let memory_max_ctx = estimate_max_context_for_memory(
+        model,
+        backend,
+        mmproj_overhead,
+        retained_kv_tokens(session),
+    );
     let effective_ctx = effective_context_size(
         prompt_token_count,
         settings,
@@ -816,14 +1289,98 @@ fn prefill_multimodal(
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
     })?;
-    let session = SessionKv::create(model, backend, n_ctx, settings)?;
 
-    let n_batch = session.ctx.n_batch() as i32;
-    let _n_past = chunks
-        .eval_chunks(mtmd_ctx, &session.ctx, 0, 0, n_batch, true)
+    let split = read_chunks(&chunks).and_then(split_at_last_media);
+    tracing::debug!(
+        described = split.is_some(),
+        head_pos = split.as_ref().map(|s| s.head_pos),
+        tail_tokens = split.as_ref().map(|s| s.tail.len()),
+        cached_media_pos = session.as_ref().map(SessionKv::media_pos),
+        prompt_tokens = prompt_token_count,
+        "multimodal prefill plan"
+    );
+
+    if let Some(split) = split.as_ref() {
+        if let Some(resume) = reuse_media_head(session, split, images, n_ctx) {
+            return Ok((
+                prompt_token_count,
+                PrefilledPrompt {
+                    reused_prefix_tokens: resume,
+                    transient: None,
+                    effective_ctx,
+                },
+            ));
+        }
+    }
+
+    // Release the retained cache before allocating its replacement so the two
+    // KV caches are never resident together.
+    *session = None;
+    let mut kv = SessionKv::create(model, backend, n_ctx, settings)?;
+
+    let n_batch = kv.ctx.n_batch() as i32;
+    let n_past = chunks
+        .eval_chunks(mtmd_ctx, &kv.ctx, 0, 0, n_batch, true)
         .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
 
-    Ok((session, prompt_token_count, effective_ctx))
+    // Retain the cache only when the chunk list was describable AND the position
+    // model it produced is addressable.
+    //
+    // The `i32::try_from` is the part that carries weight. Positions are
+    // `llama_pos`, an i32, everywhere in llama.cpp; a model whose end position
+    // does not fit cannot be trimmed back to or resumed at, and `reuse_prefix`
+    // would be handed a `resume_pos` it has to refuse anyway. Better to decline
+    // retention now than to hold a cache nothing can address.
+    //
+    // The `== n_past` half is NOT a ledger check, despite reading like one, and
+    // should not be relied on as a safety property. `n_past` is llama.cpp's own
+    // running sum of the very `n_pos` values this code already read: text chunks
+    // accumulate their batched token counts and media chunks add
+    // `mtmd_input_chunk_get_n_pos` (`mtmd-helper.cpp`), so the equality holds by
+    // construction whenever `eval_chunks` returns `Ok`. It says nothing about
+    // *what* is in the cache. It is kept only as a near-free tripwire against a
+    // future `mtmd_helper` that stops walking the list early without reporting
+    // an error — an eventuality with no other detector here.
+    //
+    // Failing either test means the cache must never be reused, so it becomes a
+    // throwaway context that serves this generation and is then dropped —
+    // including the token bookkeeping, which would otherwise record generated
+    // tokens against positions the prompt already occupies.
+    let retainable = split.as_ref().is_some_and(|split| {
+        i32::try_from(split.head_pos + split.tail.len()).is_ok_and(|total| total == n_past)
+    });
+    if !retainable {
+        tracing::debug!(
+            n_past,
+            "multimodal cache is not addressable by the recorded position model; not retaining it"
+        );
+        return Ok((
+            prompt_token_count,
+            PrefilledPrompt {
+                reused_prefix_tokens: 0,
+                transient: Some(kv),
+                effective_ctx,
+            },
+        ));
+    }
+
+    let split = split.expect("retainable is only true when the chunks were described");
+    kv.head = Some(MediaHead {
+        chunks: split.head,
+        n_pos: split.head_pos,
+        images: images.iter().map(|img| img.bytes.clone()).collect(),
+    });
+    kv.tokens = split.tail;
+    *session = Some(kv);
+
+    Ok((
+        prompt_token_count,
+        PrefilledPrompt {
+            reused_prefix_tokens: 0,
+            transient: None,
+            effective_ctx,
+        },
+    ))
 }
 
 pub(super) fn prepare_generation(
@@ -884,7 +1441,45 @@ pub(super) fn prepare_generation(
                 .map(|t| t.len())
                 .unwrap_or(0);
             if token_count + estimated_image_tokens > token_budget {
-                apply_template(compact_tools_json).unwrap_or(r)
+                // Logged only once the compact render has actually succeeded.
+                // A failed compact render keeps the full one, and the prefix
+                // does not move — claiming otherwise would send whoever reads
+                // this log hunting a reuse loss that never happened.
+                //
+                // When it does succeed it rewrites the whole rendered prompt,
+                // system prefix included, invalidating every form of KV reuse
+                // for the session it fires in: the text path drops to whatever
+                // short prefix survives, and a retained media head stops
+                // matching outright (`HeadMismatch::ChunkShape`).
+                //
+                // Worth logging because the trigger is not a setting anyone
+                // turned on — the threshold moves with transcript length and
+                // image count, so on a small context it can flip partway
+                // through a conversation and never flip back, and the only
+                // visible symptom is that reuse quietly stopped.
+                match apply_template(compact_tools_json) {
+                    Ok(compact) => {
+                        tracing::debug!(
+                            token_count,
+                            estimated_image_tokens,
+                            token_budget,
+                            "prompt exceeds the tool budget; re-rendered with compact tool \
+                             schemas (this changed the prompt prefix and ends KV reuse for \
+                             this session)"
+                        );
+                        compact
+                    }
+                    Err(compact_err) => {
+                        tracing::debug!(
+                            error = %compact_err,
+                            token_count,
+                            token_budget,
+                            "prompt exceeds the tool budget but the compact render failed; \
+                             keeping the full render"
+                        );
+                        r
+                    }
+                }
             } else {
                 r
             }
@@ -895,7 +1490,13 @@ pub(super) fn prepare_generation(
                 "Failed to apply llama.cpp OpenAI-compatible chat template"
             );
             match apply_template(compact_tools_json) {
-                Ok(r) => r,
+                Ok(r) => {
+                    tracing::debug!(
+                        "rendered with compact tool schemas after the full render failed \
+                         (this changed the prompt prefix and ends KV reuse for this session)"
+                    );
+                    r
+                }
                 Err(compact_err) => {
                     return Err(ProviderError::ExecutionError(format!(
                         "Failed to apply chat template with llama.cpp's Jinja renderer. This usually means the selected built-in template name does not exist, the embedded or custom template is invalid, or the template is incompatible with the current message shape. Select a valid llama.cpp built-in template name, configure a custom inline Jinja template, or use a GGUF with valid tokenizer.chat_template metadata. Full tools error: {e}; compact tools error: {compact_err}"
@@ -911,10 +1512,8 @@ pub(super) fn prepare_generation(
     );
 
     let (prompt_token_count, prefilled) = if !ctx.images.is_empty() {
-        // A prompt carrying image embeddings never reuses a retained cache:
-        // release it first so the two KV caches are not resident together.
-        *ctx.session = None;
-        let (session, ptc, ectx) = prefill_multimodal(
+        prefill_multimodal(
+            ctx.session,
             ctx.model,
             ctx.mtmd_ctx,
             ctx.backend,
@@ -922,16 +1521,7 @@ pub(super) fn prepare_generation(
             ctx.images,
             ctx.context_limit,
             ctx.settings,
-        )?;
-        *ctx.session = Some(session);
-        (
-            ptc,
-            PrefilledPrompt {
-                reused_prefix_tokens: 0,
-                transient: None,
-                effective_ctx: ectx,
-            },
-        )
+        )?
     } else {
         let tokens = ctx
             .model
@@ -1127,6 +1717,46 @@ mod tests {
         ids.into_iter().map(LlamaToken::new).collect()
     }
 
+    /// A text-only retained cache: no media head, so every cached token sits at
+    /// its own index.
+    fn retained(tokens: &[LlamaToken], n_ctx: u32) -> RetainedPrefix<'_> {
+        RetainedPrefix {
+            media_pos: 0,
+            tokens,
+            occupied: tokens.len(),
+            n_ctx,
+        }
+    }
+
+    /// A cache whose media head the incoming prompt reproduces: `tokens` are the
+    /// tail that follows `media_pos` positions of media-bearing prefix.
+    fn retained_behind_media(
+        media_pos: usize,
+        tokens: &[LlamaToken],
+        n_ctx: u32,
+    ) -> RetainedPrefix<'_> {
+        RetainedPrefix {
+            media_pos,
+            tokens,
+            occupied: media_pos + tokens.len(),
+            n_ctx,
+        }
+    }
+
+    fn image(bytes: &[u8]) -> ExtractedImage {
+        ExtractedImage {
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn media_head(chunks: Vec<HeadChunk>, images: &[&[u8]]) -> MediaHead {
+        MediaHead {
+            n_pos: chunks.iter().map(HeadChunk::n_pos).sum(),
+            chunks,
+            images: images.iter().map(|bytes| bytes.to_vec()).collect(),
+        }
+    }
+
     /// A prompt whose first `shared` tokens match `cached`, then diverges.
     fn diverging_prompt(shared: usize, extra: usize) -> Vec<LlamaToken> {
         tokens((0..shared as i32).chain((0..extra as i32).map(|i| 100_000 + i)))
@@ -1158,7 +1788,7 @@ mod tests {
         let cached = tokens(0..1000);
         let prompt = diverging_prompt(1000, 8);
         assert_eq!(
-            prefill_plan(Some((&cached, 2048)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 2048)), &prompt, 4096),
             PrefillPlan::CreateContext
         );
     }
@@ -1168,7 +1798,7 @@ mod tests {
         let cached = tokens(0..1000);
         let prompt = diverging_prompt(900, 40);
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &prompt, 4096),
             PrefillPlan::ReusePrefix(900)
         );
     }
@@ -1181,7 +1811,7 @@ mod tests {
         let prompt = diverging_prompt(REUSE_MIN_TOKENS - 1, 745);
         assert_eq!(prompt.len(), 1000);
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &prompt, 4096),
             PrefillPlan::FullPrefillInPlace
         );
     }
@@ -1191,7 +1821,7 @@ mod tests {
         let cached = tokens(0..1000);
         let prompt = diverging_prompt(REUSE_MIN_TOKENS, 40);
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &prompt, 4096),
             PrefillPlan::ReusePrefix(REUSE_MIN_TOKENS)
         );
     }
@@ -1201,7 +1831,7 @@ mod tests {
         let cached = tokens(0..1000);
         let prompt = tokens(0..1000);
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &prompt, 4096),
             PrefillPlan::ReusePrefix(999)
         );
     }
@@ -1211,7 +1841,7 @@ mod tests {
         let cached = tokens(0..1000);
         let prompt = tokens(0..1400);
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &prompt, 4096),
             PrefillPlan::ReusePrefix(1000)
         );
     }
@@ -1239,7 +1869,7 @@ mod tests {
         let cached = tokens(0..7138);
         let prompt = diverging_prompt(8, 370);
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &prompt, 4096),
             PrefillPlan::SacrificialContext
         );
     }
@@ -1251,7 +1881,7 @@ mod tests {
         let prompt = diverging_prompt(8, 491);
         assert_eq!(prompt.len(), 499);
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &prompt, 4096),
             PrefillPlan::SacrificialContext
         );
     }
@@ -1263,7 +1893,7 @@ mod tests {
         let prompt = diverging_prompt(8, 492);
         assert_eq!(prompt.len(), 500);
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &prompt, 4096),
             PrefillPlan::FullPrefillInPlace
         );
     }
@@ -1276,7 +1906,7 @@ mod tests {
         let prompt = diverging_prompt(REUSE_MIN_TOKENS, 40);
         assert!(is_sacrificial_prompt(prompt.len(), cached.len()));
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &prompt, 4096),
             PrefillPlan::ReusePrefix(REUSE_MIN_TOKENS)
         );
     }
@@ -1287,7 +1917,7 @@ mod tests {
         let prompt = diverging_prompt(8, 370);
         // A window change forces a rebuild regardless of prompt size.
         assert_eq!(
-            prefill_plan(Some((&cached, 2048)), &prompt, 4096),
+            prefill_plan(Some(retained(&cached, 2048)), &prompt, 4096),
             PrefillPlan::CreateContext
         );
         assert_eq!(
@@ -1329,7 +1959,7 @@ mod tests {
     #[test]
     fn prefill_plan_with_empty_cached_tokens_prefills_in_place() {
         assert_eq!(
-            prefill_plan(Some((&[], 4096)), &diverging_prompt(1000, 8), 4096),
+            prefill_plan(Some(retained(&[], 4096)), &diverging_prompt(1000, 8), 4096),
             PrefillPlan::FullPrefillInPlace
         );
     }
@@ -1338,7 +1968,346 @@ mod tests {
     fn prefill_plan_on_empty_prompt_prefills_in_place() {
         let cached = tokens(0..1000);
         assert_eq!(
-            prefill_plan(Some((&cached, 4096)), &[], 4096),
+            prefill_plan(Some(retained(&cached, 4096)), &[], 4096),
+            PrefillPlan::FullPrefillInPlace
+        );
+    }
+
+    // --- media head reuse ---
+
+    #[test]
+    fn head_chunk_positions_count_text_tokens_and_media_positions() {
+        assert_eq!(HeadChunk::Text(tokens(0..7)).n_pos(), 7);
+        assert_eq!(
+            HeadChunk::Media {
+                n_tokens: 256,
+                n_pos: 64
+            }
+            .n_pos(),
+            64
+        );
+    }
+
+    #[test]
+    fn split_at_last_media_puts_every_trailing_text_chunk_in_the_tail() {
+        let split = split_at_last_media(vec![
+            HeadChunk::Text(tokens(0..10)),
+            HeadChunk::Media {
+                n_tokens: 256,
+                n_pos: 256,
+            },
+            HeadChunk::Text(tokens(100..104)),
+            HeadChunk::Text(tokens(200..203)),
+        ])
+        .expect("a list with a media chunk splits");
+
+        assert_eq!(split.head_pos, 266);
+        assert_eq!(split.head.len(), 2);
+        assert_eq!(split.tail, tokens((100..104).chain(200..203)));
+    }
+
+    #[test]
+    fn split_at_last_media_splits_after_the_last_of_several_media_chunks() {
+        let media = HeadChunk::Media {
+            n_tokens: 64,
+            n_pos: 64,
+        };
+        let split = split_at_last_media(vec![
+            HeadChunk::Text(tokens(0..5)),
+            media.clone(),
+            HeadChunk::Text(tokens(10..15)),
+            media,
+            HeadChunk::Text(tokens(20..25)),
+        ])
+        .expect("a list with media chunks splits");
+
+        // Everything up to and including the second image stays in the head, so
+        // no image ever has to be re-evaluated on the reuse path.
+        assert_eq!(split.head.len(), 4);
+        assert_eq!(split.head_pos, 5 + 64 + 5 + 64);
+        assert_eq!(split.tail, tokens(20..25));
+    }
+
+    #[test]
+    fn split_at_last_media_refuses_a_chunk_list_without_media() {
+        assert!(split_at_last_media(vec![HeadChunk::Text(tokens(0..10))]).is_none());
+        assert!(split_at_last_media(Vec::new()).is_none());
+    }
+
+    /// What `reuse_media_head` passes as the incoming head's position count:
+    /// `SplitChunks::head_pos`, i.e. the sum over the incoming chunks.
+    fn incoming_head_pos(chunks: &[HeadChunk]) -> usize {
+        chunks.iter().map(HeadChunk::n_pos).sum()
+    }
+
+    fn mismatch(
+        head: &MediaHead,
+        chunks: &[HeadChunk],
+        images: &[ExtractedImage],
+    ) -> Option<HeadMismatch> {
+        head.mismatch(incoming_head_pos(chunks), chunks, images)
+    }
+
+    #[test]
+    fn media_head_matches_identical_shape_and_images() {
+        let head = media_head(
+            vec![
+                HeadChunk::Text(tokens(0..10)),
+                HeadChunk::Media {
+                    n_tokens: 256,
+                    n_pos: 256,
+                },
+            ],
+            &[b"png-bytes"],
+        );
+        let same = head.chunks.clone();
+        assert_eq!(mismatch(&head, &same, &[image(b"png-bytes")]), None);
+    }
+
+    #[test]
+    fn media_head_rejects_different_image_bytes() {
+        let head = media_head(
+            vec![HeadChunk::Media {
+                n_tokens: 256,
+                n_pos: 256,
+            }],
+            &[b"first-picture"],
+        );
+        let same_shape = head.chunks.clone();
+        // Same chunk shape, different picture: the token counts cannot tell
+        // these apart, so the bytes have to.
+        assert_eq!(
+            mismatch(&head, &same_shape, &[image(b"second-picture")]),
+            Some(HeadMismatch::ImageBytes)
+        );
+    }
+
+    /// One image's worth of chunks, at the size mtmd gives a fixed resolution.
+    fn media_chunk() -> HeadChunk {
+        HeadChunk::Media {
+            n_tokens: 256,
+            n_pos: 256,
+        }
+    }
+
+    /// The head a single-image prompt produces: a preamble, then the picture.
+    fn one_image_head() -> MediaHead {
+        media_head(vec![HeadChunk::Text(tokens(0..10)), media_chunk()], &[b"a"])
+    }
+
+    #[test]
+    fn media_head_rejects_a_grown_image_list() {
+        // The growing-image-list conversation, shaped the way mtmd actually
+        // presents it: a second picture arrives as a second media chunk *and* a
+        // second image, so the chunk list and the position count move with the
+        // count. All three checks would fire; ImageCount is the narrowest, and
+        // it is the reason the trace that motivated this cache gets nothing
+        // from it.
+        let head = one_image_head();
+        let two_images = vec![
+            HeadChunk::Text(tokens(0..10)),
+            media_chunk(),
+            HeadChunk::Text(tokens(20..24)),
+            media_chunk(),
+        ];
+        assert_eq!(
+            mismatch(&head, &two_images, &[image(b"a"), image(b"b")]),
+            Some(HeadMismatch::ImageCount)
+        );
+    }
+
+    #[test]
+    fn media_head_rejects_a_rewritten_preamble() {
+        // The tool-schema flip: same picture, rewritten text ahead of it. The
+        // compact schema renders shorter, so the image moves too — but the
+        // chunk list is the narrower way to say that, and it is what gets
+        // logged.
+        let head = one_image_head();
+        let shorter = vec![HeadChunk::Text(tokens(500..506)), media_chunk()];
+        assert_eq!(
+            mismatch(&head, &shorter, &[image(b"a")]),
+            Some(HeadMismatch::ChunkShape)
+        );
+
+        // A rewrite that happens to render to the same token count is caught by
+        // the same check, and only because chunks are compared token for token.
+        // Catching it is what keeps the resume from attending to a preamble the
+        // prompt no longer contains.
+        let same_length = vec![HeadChunk::Text(tokens(500..510)), media_chunk()];
+        assert_eq!(incoming_head_pos(&same_length), head.n_pos);
+        assert_eq!(
+            mismatch(&head, &same_length, &[image(b"a")]),
+            Some(HeadMismatch::ChunkShape)
+        );
+    }
+
+    #[test]
+    fn media_head_rejects_a_recorded_size_that_disagrees_with_its_chunks() {
+        // Deliberately not an input mtmd can produce: `head_pos` is the sum over
+        // exactly these chunks on both sides, so an identical chunk list always
+        // means an identical position count. This is the tripwire for a
+        // `MediaHead` built with an `n_pos` that does not describe its own
+        // chunks — the one state in which a matching head would resume the
+        // decode at the wrong absolute position.
+        let mut head = one_image_head();
+        head.n_pos += 1;
+        let same = head.chunks.clone();
+        assert_eq!(
+            mismatch(&head, &same, &[image(b"a")]),
+            Some(HeadMismatch::Positions)
+        );
+    }
+
+    // --- the bound that keeps the token ledger and the KV cache in step ---
+
+    #[test]
+    fn kept_prefix_tokens_counts_from_the_end_of_the_media_head() {
+        assert_eq!(kept_prefix_tokens(1040, 1000, 52, 90), Some(40));
+        // Text-only cache: the resume position is the kept count.
+        assert_eq!(kept_prefix_tokens(900, 0, 1000, 1000), Some(900));
+    }
+
+    #[test]
+    fn kept_prefix_tokens_refuses_a_resume_inside_the_media_head() {
+        assert_eq!(kept_prefix_tokens(999, 1000, 90, 90), None);
+    }
+
+    #[test]
+    fn kept_prefix_tokens_refuses_a_resume_past_the_incoming_prompt() {
+        assert_eq!(kept_prefix_tokens(1050, 1000, 40, 90), None);
+    }
+
+    #[test]
+    fn kept_prefix_tokens_refuses_a_resume_past_the_recorded_tail() {
+        // The bound that matters most: `Vec::truncate` past the end is a silent
+        // no-op, so allowing this would leave the ledger claiming tokens at
+        // positions `clear_kv_cache_seq` had just removed.
+        assert_eq!(kept_prefix_tokens(1090, 1000, 200, 80), None);
+        // Exactly at the end of the tail is fine — nothing is dropped.
+        assert_eq!(kept_prefix_tokens(1080, 1000, 200, 80), Some(80));
+    }
+
+    #[test]
+    fn prefill_plan_resumes_at_an_absolute_position_behind_a_media_head() {
+        // Turn 2 of an image conversation: the head and the first 40 tail tokens
+        // are already in the cache, so decode resumes at 1000 + 40.
+        let cached = tokens(0..90);
+        let prompt = diverging_prompt(40, 12);
+        assert_eq!(
+            prefill_plan(
+                Some(retained_behind_media(1000, &cached, 4096)),
+                &prompt,
+                4096
+            ),
+            PrefillPlan::ReusePrefix(1040)
+        );
+    }
+
+    #[test]
+    fn a_media_head_alone_can_carry_the_prompt_over_the_reuse_threshold() {
+        // Only two tail tokens match, but they sit behind 900 positions of image
+        // that would otherwise be re-encoded and re-prefilled from scratch.
+        let cached = tokens(0..80);
+        let prompt = diverging_prompt(2, 30);
+        assert_eq!(
+            prefill_plan(
+                Some(retained_behind_media(900, &cached, 4096)),
+                &prompt,
+                4096
+            ),
+            PrefillPlan::ReusePrefix(902)
+        );
+    }
+
+    #[test]
+    fn a_media_head_too_short_to_reach_the_threshold_does_not_reuse() {
+        // The head is real but small, and the tail shares nothing with it, so
+        // the resume position stays under REUSE_MIN. Sized so the cache is not
+        // worth sacrificing for either, which isolates the threshold.
+        let cached = tokens(0..80);
+        let prompt = diverging_prompt(0, 180);
+        assert_eq!(
+            prefill_plan(
+                Some(retained_behind_media(100, &cached, 4096)),
+                &prompt,
+                4096
+            ),
+            PrefillPlan::FullPrefillInPlace
+        );
+    }
+
+    #[test]
+    fn a_media_cache_the_prompt_cannot_reproduce_offers_no_tokens() {
+        // What `RetainedPrefix::opaque` produces: a text-only prompt facing a
+        // media cache. The tail tokens must not be matched against it, because
+        // they sit at positions the text prompt would not put them at.
+        let opaque = RetainedPrefix {
+            media_pos: 0,
+            tokens: &[],
+            occupied: 3000,
+            n_ctx: 4096,
+        };
+        let prompt = tokens(0..2000);
+        assert_eq!(
+            prefill_plan(Some(opaque), &prompt, 4096),
+            PrefillPlan::FullPrefillInPlace
+        );
+    }
+
+    #[test]
+    fn a_side_call_is_sacrificed_against_the_positions_a_media_cache_occupies() {
+        // The memory-extraction interleave, now against an image conversation.
+        // `occupied` counts the media head, so the expensive cache is protected
+        // even though its recorded token tail is short.
+        let opaque = RetainedPrefix {
+            media_pos: 0,
+            tokens: &[],
+            occupied: 3000,
+            n_ctx: 4096,
+        };
+        let prompt = tokens(0..378);
+        assert_eq!(
+            prefill_plan(Some(opaque), &prompt, 4096),
+            PrefillPlan::SacrificialContext
+        );
+    }
+
+    #[test]
+    fn a_media_cache_of_a_different_window_is_rebuilt() {
+        let cached = tokens(0..90);
+        let prompt = diverging_prompt(40, 12);
+        assert_eq!(
+            prefill_plan(
+                Some(retained_behind_media(1000, &cached, 2048)),
+                &prompt,
+                4096
+            ),
+            PrefillPlan::CreateContext
+        );
+    }
+
+    #[test]
+    fn reuse_behind_a_media_head_always_leaves_a_token_to_decode() {
+        // The tail is fully cached. llama.cpp still needs a non-empty batch for
+        // logits, so the last tail token is re-decoded.
+        let cached = tokens(0..90);
+        let prompt = tokens(0..90);
+        assert_eq!(
+            prefill_plan(
+                Some(retained_behind_media(1000, &cached, 4096)),
+                &prompt,
+                4096
+            ),
+            PrefillPlan::ReusePrefix(1089)
+        );
+    }
+
+    #[test]
+    fn an_empty_tail_behind_a_media_head_is_never_reused() {
+        // No token left to decode means no logits, so the prompt has to be
+        // rebuilt rather than resumed at the end of the head.
+        assert_eq!(
+            prefill_plan(Some(retained_behind_media(1000, &[], 4096)), &[], 4096),
             PrefillPlan::FullPrefillInPlace
         );
     }
