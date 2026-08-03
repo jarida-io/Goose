@@ -71,6 +71,19 @@ const DEFAULT_STOP_HOOK_BLOCK_CAP: u32 = 8;
 const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation...";
 const MAX_TURNS_MESSAGE: &str = "I've reached the maximum number of actions I can do without user input. Would you like me to continue?";
 const MAX_EMPTY_TURN_RETRIES: u32 = 3;
+
+/// Retry budget for empty turns, overridable via `GOOSE_MAX_EMPTY_TURN_RETRIES`.
+///
+/// The built-in retry re-sends an unchanged conversation, so a provider that is
+/// deterministic at the current sampling settings returns the same empty turn
+/// every time. A host that varies the prompt itself between attempts can set
+/// this to `0` and own recovery, rather than paying for blind repeats first.
+fn max_empty_turn_retries() -> u32 {
+    std::env::var("GOOSE_MAX_EMPTY_TURN_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(MAX_EMPTY_TURN_RETRIES)
+}
 const EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
 const DEFAULT_FRONTEND_INSTRUCTIONS: &str = "The following tools are provided directly by the frontend and will be executed by the frontend when called.";
@@ -2107,13 +2120,17 @@ impl Agent {
                                     match content {
                                         MessageContent::Text(text) => !text.text.is_empty(),
                                         MessageContent::Image(image) => !image.data.is_empty(),
-                                        MessageContent::Thinking(thinking) => {
-                                            !thinking.thinking.is_empty()
-                                                || !thinking.signature.is_empty()
-                                        }
-                                        MessageContent::RedactedThinking(thinking) => {
-                                            !thinking.data.is_empty()
-                                        }
+                                        // Reasoning alone leaves the user with
+                                        // nothing, so it must not mask an empty turn
+                                        // from the retry below. Safe because the flag
+                                        // accumulates over the chunk loop: thinking
+                                        // followed by text still sets it via the Text
+                                        // arm, and thinking followed by a tool call is
+                                        // covered by `no_tools_called`. Small local
+                                        // models hit this — gemma-4-E2B closes its
+                                        // thinking block and emits end_of_turn.
+                                        MessageContent::Thinking(_) => false,
+                                        MessageContent::RedactedThinking(_) => false,
                                         MessageContent::SystemNotification(notification) => {
                                             !notification.msg.is_empty()
                                         }
@@ -2775,18 +2792,28 @@ impl Agent {
                                     // silent exit. Retry a bounded number of
                                     // times, then surface a visible message so
                                     // the user is never left with no response.
-                                    if empty_turn_retries < MAX_EMPTY_TURN_RETRIES {
+                                    let retry_budget = max_empty_turn_retries();
+                                    if empty_turn_retries < retry_budget {
                                         empty_turn_retries += 1;
                                         retrying_after_empty_turn = true;
                                         warn!(
                                             "Provider returned an empty response; retrying ({}/{})",
-                                            empty_turn_retries, MAX_EMPTY_TURN_RETRIES
+                                            empty_turn_retries, retry_budget
                                         );
                                     } else {
                                         warn!("Provider returned an empty response after retries; ending turn");
                                         last_assistant_text = EMPTY_TURN_MESSAGE.to_string();
                                         let message = Message::assistant().with_text(EMPTY_TURN_MESSAGE);
-                                        messages_to_add.push(message.clone());
+                                        // With the budget at 0 the host owns recovery, so this
+                                        // is a signal that the turn failed, not an answer.
+                                        // Yield it either way, but only persist it when goose
+                                        // itself gave up — otherwise every host retry leaves a
+                                        // junk assistant turn in the conversation, which the
+                                        // next attempt then reads as context and which moves
+                                        // the KV prefix.
+                                        if retry_budget > 0 {
+                                            messages_to_add.push(message.clone());
+                                        }
                                         yield AgentEvent::Message(message);
                                         exit_chat = true;
                                     }
