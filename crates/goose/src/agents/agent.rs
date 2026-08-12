@@ -273,6 +273,19 @@ pub struct Agent {
     stop_hook_block_cap_override: Option<u32>,
     container: Mutex<Option<Container>>,
     goal: Mutex<Option<String>>,
+    /// Per-SESSION goals, consulted before the process-wide [`Agent::goal`].
+    ///
+    /// `goal` is a single slot on an `Agent`, and an `Agent` is shared: a host
+    /// serving several conversations concurrently holds one `Arc<Agent>`, so
+    /// `set_goal` is process-wide mutable state. One conversation's goal then
+    /// reaches another conversation's turn — which for a multi-user host means
+    /// one person's request text injected into a different person's turn.
+    ///
+    /// Keyed by `SessionConfig::id`, which is already per-reply, so a goal set
+    /// here cannot race or leak across conversations. Entries are removed when
+    /// the goal is cleared and when a turn ends with nothing further to do, so
+    /// the map does not grow with dead sessions.
+    session_goals: Mutex<std::collections::HashMap<String, String>>,
     grind: Mutex<Option<String>>,
     pending_steers: Mutex<HashMap<String, VecDeque<Message>>>,
 }
@@ -432,6 +445,7 @@ impl Agent {
             stop_hook_block_cap_override: None,
             container: Mutex::new(None),
             goal: Mutex::new(None),
+            session_goals: Mutex::new(std::collections::HashMap::new()),
             grind: Mutex::new(None),
             pending_steers: Mutex::new(HashMap::new()),
         }
@@ -2734,9 +2748,19 @@ impl Agent {
                             // continue from last user message after recovery compact
                         }
                         None if self.has_pending_steers(&session_config.id).await => {}
-                        None if self.goal.lock().await.is_some() && !goal_check_pending => {
+                        None if (self.get_session_goal(&session_config.id).await.is_some()
+                            || self.goal.lock().await.is_some())
+                            && !goal_check_pending =>
+                        {
                             goal_check_pending = true;
-                            let goal = self.goal.lock().await.clone().unwrap();
+                            // This session's goal wins over the process-wide
+                            // one. A host driving several conversations from one
+                            // Arc<Agent> sets the former; `set_goal` remains for
+                            // single-conversation callers and is unaffected.
+                            let goal = match self.get_session_goal(&session_config.id).await {
+                                Some(goal) => goal,
+                                None => self.goal.lock().await.clone().unwrap(),
+                            };
                             let nudge = format!(
                                 "Before finishing, check whether the following goal has been fully met:\n\n\
                                  **Goal:** {goal}\n\n\
@@ -2773,6 +2797,7 @@ impl Agent {
 
                         None => {
                             self.set_goal(None).await;
+                            self.set_session_goal(&session_config.id, None).await;
                             self.set_grind(None).await;
                             // Recipe retry logic owns the turn whenever a
                             // retry_config is present: it runs success checks,
@@ -2968,6 +2993,26 @@ impl Agent {
 
     pub async fn set_goal(&self, goal: Option<String>) {
         *self.goal.lock().await = goal;
+    }
+
+    /// Set (or clear, with `None`) the goal for ONE session.
+    ///
+    /// Prefer this to [`Agent::set_goal`] whenever the agent may be serving more
+    /// than one conversation: see [`Agent::session_goals`].
+    pub async fn set_session_goal(&self, session_id: &str, goal: Option<String>) {
+        let mut goals = self.session_goals.lock().await;
+        match goal {
+            Some(goal) => {
+                goals.insert(session_id.to_string(), goal);
+            }
+            None => {
+                goals.remove(session_id);
+            }
+        }
+    }
+
+    pub async fn get_session_goal(&self, session_id: &str) -> Option<String> {
+        self.session_goals.lock().await.get(session_id).cloned()
     }
 
     pub async fn get_goal(&self) -> Option<String> {

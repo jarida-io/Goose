@@ -2350,6 +2350,100 @@ mod tests {
             Ok(())
         }
 
+        /// A goal set for one session must not nudge a DIFFERENT session.
+        ///
+        /// `Agent::goal` is a single slot, and an `Agent` is shared: a host that
+        /// serves several conversations concurrently holds one `Arc<Agent>`, so
+        /// `set_goal` is process-wide mutable state. Whatever one conversation
+        /// sets is what every other conversation's turn gets nudged with — for a
+        /// multi-user host, one person's request text injected into another
+        /// person's turn.
+        ///
+        /// `set_session_goal` is keyed on `SessionConfig::id`, which is already
+        /// per-reply. This asserts the isolation directly: session A has a goal
+        /// and takes the extra provider call; session B has none and exits after
+        /// one, on the same agent.
+        #[tokio::test]
+        async fn test_a_session_goal_does_not_leak_into_another_session() -> Result<()> {
+            let temp_dir = TempDir::new()?;
+            let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+            let agent = create_agent_with_session_naming_disabled(session_manager.clone());
+            let provider = Arc::new(GoalTextProvider::new());
+
+            let mut ids = Vec::new();
+            for name in ["goal-owner", "innocent-bystander"] {
+                let session = session_manager
+                    .create_session(
+                        PathBuf::default(),
+                        name.to_string(),
+                        SessionType::Hidden,
+                        GooseMode::default(),
+                    )
+                    .await?;
+                ids.push(session.id);
+            }
+            agent
+                .update_provider(provider.clone(), ModelConfig::new("mock-model"), &ids[0])
+                .await?;
+
+            // Only the FIRST session gets a goal.
+            agent
+                .set_session_goal(&ids[0], Some("Ensure the sky is blue".to_string()))
+                .await;
+            assert_eq!(
+                agent.get_session_goal(&ids[1]).await,
+                None,
+                "setting one session's goal wrote another session's"
+            );
+
+            let drain = |id: String| {
+                let agent = &agent;
+                async move {
+                    let cfg = SessionConfig {
+                        id,
+                        schedule_id: None,
+                        max_turns: Some(10),
+                        retry_config: None,
+                    };
+                    let stream = agent
+                        .reply(Message::user().with_text("Hello"), cfg, None)
+                        .await?;
+                    tokio::pin!(stream);
+                    while let Some(event) = stream.next().await {
+                        event?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+            };
+
+            // The BYSTANDER runs FIRST, and the order is the test. Draining the
+            // goal-owner first clears the process-wide slot on its own way out
+            // (the `None` arm calls `set_goal(None)`), so a leak would already
+            // have been tidied away before the bystander ever ran — the first
+            // version of this test did exactly that and passed with the leak
+            // reintroduced. Running the bystander while the owner's goal is
+            // still live is the only ordering that can observe it.
+            drain(ids[1].clone()).await?;
+            let without_goal = provider.call_count.swap(0, Ordering::SeqCst);
+            assert_eq!(
+                without_goal, 1,
+                "a session with no goal of its own was nudged anyway ({without_goal} provider \
+                 calls, expected 1) — another session's goal reached it on a shared agent, which \
+                 is precisely what keying on the session id exists to prevent"
+            );
+
+            // And the owner still gets its check, so the isolation above is not
+            // just the feature being off.
+            drain(ids[0].clone()).await?;
+            let with_goal = provider.call_count.load(Ordering::SeqCst);
+            assert_eq!(
+                with_goal, 2,
+                "the session that HAS a goal must take the extra completeness call, got {with_goal}"
+            );
+
+            Ok(())
+        }
+
         #[tokio::test]
         async fn test_goal_command_set_and_clear() -> Result<()> {
             let temp_dir = TempDir::new()?;
