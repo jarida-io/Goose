@@ -2274,17 +2274,22 @@ mod tests {
                 "Expected at most 3 provider calls (1 initial + 1 goal check + 1 exit), got {call_count}"
             );
 
-            // The goal nudge should NOT appear in yielded events (it's internal)
+            // The nudge should NOT appear in yielded events (it's internal).
+            //
+            // Anchored on the CURRENT wording. It used to look for "check whether
+            // the following goal", which the nudge stopped saying when it was
+            // reworded to be unquotable — leaving an assertion that passed
+            // because its needle had ceased to exist anywhere.
             let nudge_messages: Vec<_> = messages
                 .iter()
                 .filter(|m| {
                     m.as_concat_text()
-                        .contains("check whether the following goal")
+                        .contains("does this fully cover what was asked")
                 })
                 .collect();
             assert!(
                 nudge_messages.is_empty(),
-                "Goal nudge should be hidden from user, but found {} in events",
+                "Completeness nudge should be hidden from user, but found {} in events",
                 nudge_messages.len()
             );
 
@@ -2293,6 +2298,100 @@ mod tests {
                 agent.get_goal().await,
                 None,
                 "Goal should be cleared after the agent finishes with it met"
+            );
+
+            Ok(())
+        }
+
+        /// Hiding the nudge is not enough — the model's ANSWER to it was visible.
+        ///
+        /// The nudge is injected with `with_visibility(false, true)`, so the
+        /// question never reaches the user. The reply to it is an ordinary
+        /// assistant message, and it was being streamed and then concatenated
+        /// onto the real answer.
+        ///
+        /// Observed on gemma-4-E4B for "Check the weather": a correct
+        /// one-sentence answer followed, with no separating space, by "I used
+        /// the current system context ... I cannot keep working on it as I have
+        /// already provided a direct answer." The second half is the model
+        /// answering the completeness check out loud.
+        ///
+        /// This cannot be fixed by wording. The first version of the nudge leaked
+        /// "goal"; the reworded one leaked "keep working on it". Any phrasing
+        /// leaks something, because the model is being asked a question and
+        /// answering it. What has to change is whether the answer is shown.
+        ///
+        /// `GoalTextProvider` never calls a tool, so call 0 is the real answer and
+        /// call 1 is purely the check's own reply — exactly the shape observed.
+        #[tokio::test]
+        async fn test_the_completeness_checks_own_answer_is_not_shown_to_the_user() -> Result<()> {
+            let temp_dir = TempDir::new()?;
+            let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+            let agent = create_agent_with_session_naming_disabled(session_manager.clone());
+            let provider = Arc::new(GoalTextProvider::new());
+
+            let session = session_manager
+                .create_session(
+                    PathBuf::default(),
+                    "goal-visibility".to_string(),
+                    SessionType::Hidden,
+                    GooseMode::default(),
+                )
+                .await?;
+
+            agent
+                .update_provider(
+                    provider.clone(),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
+                .await?;
+            agent
+                .set_goal(Some("Ensure the sky is blue".to_string()))
+                .await;
+
+            let reply_stream = agent
+                .reply(
+                    Message::user().with_text("Hello"),
+                    SessionConfig {
+                        id: session.id.clone(),
+                        schedule_id: None,
+                        max_turns: Some(10),
+                        retry_config: None,
+                    },
+                    None,
+                )
+                .await?;
+            tokio::pin!(reply_stream);
+
+            let mut shown = Vec::new();
+            while let Some(event) = reply_stream.next().await {
+                if let Ok(AgentEvent::Message(msg)) = event {
+                    shown.push(msg.as_concat_text());
+                }
+            }
+
+            // Vacuity control: the check must actually have fired, or this test
+            // asserts the absence of something that was never produced.
+            let calls = provider.call_count.load(Ordering::SeqCst);
+            assert!(
+                calls > 1,
+                "the completeness check did not fire ({calls} provider call), so \
+                 there was no second response to suppress and this proves nothing"
+            );
+
+            let all = shown.join("\n");
+            assert!(
+                all.contains("Response number 0"),
+                "the real answer was suppressed too — the rule must only reach the \
+                 round that answers the check. Shown:\n{all}"
+            );
+            assert!(
+                !all.contains("Response number 1"),
+                "the completeness check's own reply reached the user. It has no tool \
+                 calls, so it cannot contain anything the first answer could not \
+                 have — it is commentary about whether the answer was complete, and \
+                 it was being glued onto the answer. Shown:\n{all}"
             );
 
             Ok(())

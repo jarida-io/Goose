@@ -2184,18 +2184,55 @@ impl Agent {
                                     },
                                 );
 
-                                if !filtered_response.content.is_empty() {
+                                let num_tool_requests = frontend_requests.len() + remaining_requests.len();
+
+                                // The completeness check is loop control, not conversation.
+                                //
+                                // It is injected as an INVISIBLE user message, but the model's
+                                // reply to it is an ordinary assistant message — indistinguishable
+                                // at this layer from a reply to the person. So when the check is
+                                // pending and the round adds no tool calls, what the model just
+                                // wrote is an answer to the harness, and it was being concatenated
+                                // onto the real answer.
+                                //
+                                // Observed on gemma-4-E4B, "Check the weather": a correct
+                                // one-sentence answer followed immediately, with no separating
+                                // space, by "I used the current system context ... I cannot keep
+                                // working on it as I have already provided a direct answer."
+                                // Rewording the nudge cannot fix this — the previous wording
+                                // leaked "goal", this one leaks "keep working on it", and any
+                                // wording leaks something, because the model is being asked a
+                                // question and answering it.
+                                //
+                                // A round WITH tool calls stays visible: that is the check doing
+                                // the job it was added for (measured: 4 calls -> 7 and the actual
+                                // answer). The cost of this rule is that the check can only ever
+                                // improve an answer by doing more work, never by adding prose —
+                                // which is the right trade, because prose it could have written
+                                // without new tool results it could have written the first time.
+                                let answers_the_completeness_check =
+                                    goal_check_pending && num_tool_requests == 0;
+
+                                if !filtered_response.content.is_empty()
+                                    && !answers_the_completeness_check
+                                {
                                     yield AgentEvent::Message(filtered_response.clone());
                                     tokio::task::yield_now().await;
                                 }
 
-                                let num_tool_requests = frontend_requests.len() + remaining_requests.len();
                                 if num_tool_requests == 0 {
                                     let text = filtered_response.as_concat_text();
-                                    if !text.is_empty() {
+                                    if !text.is_empty() && !answers_the_completeness_check {
                                         last_assistant_text.push_str(&text);
                                     }
-                                    messages_to_add.push(response);
+                                    // Kept in the agent's own history so the conversation stays
+                                    // well-formed for strict providers, but marked not-user-visible
+                                    // so no consumer can render it.
+                                    messages_to_add.push(if answers_the_completeness_check {
+                                        response.with_visibility(false, true)
+                                    } else {
+                                        response
+                                    });
                                     continue;
                                 }
 
