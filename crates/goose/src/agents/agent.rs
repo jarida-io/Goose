@@ -1706,10 +1706,9 @@ impl Agent {
                 let goal_text = crate::agents::execute_commands::parse_slash_command(&message_text)
                     .map(|parsed| parsed.params_str.to_string())
                     .unwrap_or_default();
+                // Unquotable, as with the completeness and grind nudges below.
                 let kickoff = Message::user()
-                    .with_text(format!(
-                        "Start working toward this goal now:\n\n**Goal:** {goal_text}"
-                    ))
+                    .with_text(format!("Start on this now:\n\n{goal_text}"))
                     .with_visibility(false, true);
                 session_manager
                     .add_message(&session_config.id, &kickoff)
@@ -2761,10 +2760,16 @@ impl Agent {
                                 Some(goal) => goal,
                                 None => self.goal.lock().await.clone().unwrap(),
                             };
+                            // Unquotable by construction. This is appended as an
+                            // invisible user message, so it is the last text the
+                            // model sees before generating; a labelled one gets
+                            // read back. Measured on gemma-4-E2B and E4B, the old
+                            // "**Goal:**" wording produced "I could not fully meet
+                            // your goal" in household-facing answers.
                             let nudge = format!(
-                                "Before finishing, check whether the following goal has been fully met:\n\n\
-                                 **Goal:** {goal}\n\n\
-                                 If not, continue working toward it."
+                                "Before you answer: does this fully cover what was asked?\n\n\
+                                 {goal}\n\n\
+                                 If anything is missing, keep working on it."
                             );
                             let message = Message::user().with_text(&nudge)
                                 .with_visibility(false, true);
@@ -2779,10 +2784,10 @@ impl Agent {
 
                         None if self.grind.lock().await.is_some() => {
                             let grind = self.grind.lock().await.clone().unwrap();
+                            // Unquotable, as above.
                             let nudge = format!(
-                                "Keep working. The grind goal is not yet complete:\n\n\
-                                 **Goal:** {grind}\n\n\
-                                 Continue until it is fully done."
+                                "This is not finished yet. Keep working on it until it is:\n\n\
+                                 {grind}"
                             );
                             let message = Message::user().with_text(&nudge)
                                 .with_visibility(false, true);
