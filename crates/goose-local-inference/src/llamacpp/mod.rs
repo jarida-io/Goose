@@ -1,6 +1,7 @@
 mod inference_emulated_tools;
 mod inference_engine;
 mod inference_native_tools;
+mod prompt_snapshot;
 
 use std::any::Any;
 use std::ffi::CStr;
@@ -460,6 +461,8 @@ impl LocalInferenceBackend for LlamaCppBackend {
             templates,
             mtmd_ctx,
             session: None,
+            snapshot: None,
+            model_path: model_path.clone(),
         }))
     }
 
@@ -584,6 +587,8 @@ impl LocalInferenceBackend for LlamaCppBackend {
             model: &loaded.model,
             mtmd_ctx: loaded.mtmd_ctx.as_ref(),
             session: &mut loaded.session,
+            snapshot: &mut loaded.snapshot,
+            model_path: &loaded.model_path,
             backend: self,
             template,
             settings: request.settings,

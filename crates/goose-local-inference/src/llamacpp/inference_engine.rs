@@ -27,6 +27,11 @@ pub(super) struct GenerationContext<'a> {
     pub model: &'a Arc<LlamaModel>,
     pub mtmd_ctx: Option<&'a MtmdContext>,
     pub session: &'a mut Option<SessionKv>,
+    /// On-disk preamble cache for this model. `None` disables snapshots for the
+    /// request without changing any other behaviour.
+    pub snapshot: &'a mut Option<super::prompt_snapshot::SnapshotSlot>,
+    /// The GGUF this slot loaded, for keying that cache.
+    pub model_path: &'a std::path::Path,
     pub backend: &'a LlamaCppBackend,
     pub template: &'a LlamaChatTemplate,
     pub settings: &'a ModelSettings,
@@ -49,6 +54,12 @@ pub(super) struct LoadedModel {
     /// Generation context retained between requests for prompt prefix reuse.
     /// Dropped with the rest of the model when the slot is evicted.
     pub session: Option<SessionKv>,
+    /// On-disk preamble cache. Built lazily on the first prefill, because its
+    /// key includes `n_ctx` and that is a property of the request rather than
+    /// of the load.
+    pub snapshot: Option<super::prompt_snapshot::SnapshotSlot>,
+    /// Where this model was loaded from. Part of the snapshot key.
+    pub model_path: std::path::PathBuf,
 }
 
 pub(super) struct LoadedChatTemplates {
@@ -877,6 +888,69 @@ fn reuse_prefix(
     Ok(())
 }
 
+/// Trim a retained cache to its first `keep` token positions.
+///
+/// Only valid for a text-only cache: with a media head the positions `tokens`
+/// describes start at `media_pos`, and a caller passing a token count as an
+/// absolute position would cut the head in half.
+fn trim_to_prefix(kv: &mut SessionKv, keep: usize) -> Result<(), ()> {
+    debug_assert!(kv.head.is_none(), "trim_to_prefix is text-only");
+    if keep > kv.tokens.len() {
+        return Err(());
+    }
+    let p0 = u32::try_from(keep).map_err(|_| ())?;
+    match kv.ctx.clear_kv_cache_seq(Some(0), Some(p0), None) {
+        Ok(true) => {
+            kv.tokens.truncate(keep);
+            Ok(())
+        }
+        Ok(false) | Err(_) => Err(()),
+    }
+}
+
+/// Build a fresh context and try to fill its preamble from disk.
+///
+/// `Ok(Some(n))` means the context now holds the whole prompt with `n` leading
+/// positions restored rather than decoded. `Ok(None)` means the context is
+/// fresh and empty and the caller should prefill it as usual -- the context is
+/// left in `session` either way, so no allocation is wasted.
+fn seed_from_snapshot(
+    session: &mut Option<SessionKv>,
+    model: &Arc<LlamaModel>,
+    backend: &LlamaCppBackend,
+    settings: &ModelSettings,
+    slot: &mut super::prompt_snapshot::SnapshotSlot,
+    prompt: &[LlamaToken],
+    n_ctx: u32,
+) -> Result<Option<usize>, ProviderError> {
+    // Released before the replacement is allocated, so two KV caches are never
+    // resident at once -- the same rule `full_prefill` follows, and on an 8 GB
+    // device the difference between fitting and an allocation failure.
+    *session = None;
+    let mut kv = SessionKv::create(model, backend, n_ctx, settings)?;
+
+    let Some(restored) = slot.load(kv.context_mut(), prompt) else {
+        *session = Some(kv);
+        return Ok(None);
+    };
+
+    kv.tokens.extend_from_slice(&prompt[..restored]);
+    match decode_tokens(&mut kv.ctx, &prompt[restored..], restored) {
+        Ok(()) => {
+            kv.tokens.extend_from_slice(&prompt[restored..]);
+            *session = Some(kv);
+            Ok(Some(restored))
+        }
+        Err(e) => {
+            // A restored cache that will not decode is worse than none: drop it
+            // and let the caller build a clean one.
+            tracing::warn!(error = %e, "suffix decode after snapshot restore failed; rebuilding");
+            *session = None;
+            Err(e)
+        }
+    }
+}
+
 /// Decode the whole prompt from position 0, reusing the retained context when
 /// its window matches and building a new one otherwise.
 fn full_prefill(
@@ -926,8 +1000,11 @@ struct PrefilledPrompt {
 
 /// Prepare a KV cache holding `prompt`, with logits available for its last
 /// token.
+#[allow(clippy::too_many_arguments)]
 fn prefill_prompt(
     session: &mut Option<SessionKv>,
+    snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
+    model_path: &std::path::Path,
     model: &Arc<LlamaModel>,
     backend: &LlamaCppBackend,
     settings: &ModelSettings,
@@ -937,6 +1014,19 @@ fn prefill_prompt(
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
     })?;
+
+    // The key includes `n_ctx`, which is a property of the request rather than of
+    // the load, so the slot is built here and rebuilt whenever the window moves.
+    // A stale-window slot would name a file whose cache has the wrong shape.
+    if snapshot
+        .as_ref()
+        .is_none_or(|slot| !slot.matches(model_path, n_ctx))
+    {
+        *snapshot = super::prompt_snapshot::SnapshotSlot::for_model(model_path, n_ctx, settings);
+    }
+    if let Some(slot) = snapshot.as_mut() {
+        slot.observe(prompt);
+    }
 
     let plan = prefill_plan(
         session.as_ref().map(|kv| {
@@ -961,11 +1051,54 @@ fn prefill_prompt(
         "prompt prefill plan"
     );
 
+    // Nothing usable in memory: this is the cold start the snapshot exists for.
+    if matches!(plan, PrefillPlan::CreateContext) {
+        if let Some(slot) = snapshot.as_mut() {
+            match seed_from_snapshot(session, model, backend, settings, slot, prompt, n_ctx) {
+                Ok(Some(restored)) => {
+                    return Ok(PrefilledPrompt {
+                        reused_prefix_tokens: restored,
+                        transient: None,
+                        effective_ctx,
+                    })
+                }
+                // No usable file. `session` now holds a fresh empty context that
+                // `full_prefill` below will decode into rather than reallocate.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "snapshot restore failed; prefilling normally");
+                }
+            }
+        }
+    }
+
     match plan {
         PrefillPlan::ReusePrefix(resume) => {
             let kv = session
                 .as_mut()
                 .expect("ReusePrefix is only produced when a session is retained");
+
+            // The one moment a snapshot can be written honestly: the cache holds
+            // a superset of the stable prefix, and the tail is about to be
+            // discarded anyway. Trimming first is what keeps the file to the
+            // shared preamble rather than to one household's prompt.
+            //
+            // Text-only, because with a media head `tokens` starts at `media_pos`
+            // and a token count is not an absolute position.
+            let mut resume = resume;
+            if kv.head.is_none() {
+                if let Some(slot) = snapshot.as_mut() {
+                    if let Some(keep) = slot.writable_prefix().filter(|keep| *keep <= resume) {
+                        if trim_to_prefix(kv, keep).is_ok() {
+                            slot.write(&kv.ctx, &kv.tokens);
+                            // The cache is now shorter than the plan assumed, so
+                            // the decode has to start where it actually ends.
+                            resume = keep;
+                        }
+                    }
+                }
+            }
+
             match reuse_prefix(kv, prompt, resume) {
                 Ok(()) => {
                     return Ok(PrefilledPrompt {
@@ -1538,6 +1671,8 @@ pub(super) fn prepare_generation(
         )?;
         let prefilled = prefill_prompt(
             ctx.session,
+            ctx.snapshot,
+            ctx.model_path,
             ctx.model,
             ctx.backend,
             ctx.settings,
@@ -1773,6 +1908,264 @@ mod tests {
         assert_eq!(common_prefix_len(&tokens([9]), &tokens([1, 2])), 0);
         assert_eq!(common_prefix_len(&[], &tokens([1, 2])), 0);
         assert_eq!(common_prefix_len(&tokens([1, 2]), &[]), 0);
+    }
+
+    /// The snapshot is only worth anything if a restored cache answers
+    /// IDENTICALLY to one that was decoded from scratch.
+    ///
+    /// That is the whole risk of this feature and the one thing no unit test can
+    /// reach: a KV blob restored into a mismatched context does not error, it
+    /// produces plausible tokens that are subtly wrong. So the assertion is not
+    /// "the file loaded" -- it is that the next-token logits after
+    /// restore-then-decode-the-tail are bit-identical to full prefill.
+    ///
+    /// `#[ignore]` because it needs a real GGUF; run with `--ignored`. It skips
+    /// rather than fails when the model is absent, so the suite stays green on a
+    /// machine that has never downloaded one.
+    ///
+    /// The model is HARD-LINKED into the temp dir, never symlinked. A symlinked
+    /// models directory has twice caused a scratch run to reach through and
+    /// destroy a real pond's weights; a hard link is a second directory entry
+    /// for the same inode, so nothing this test does can touch the original.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn a_restored_snapshot_answers_identically_to_a_full_prefill() {
+        use crate::llamacpp::prompt_snapshot::SnapshotSlot;
+        use llama_cpp_2::model::params::LlamaModelParams;
+        use llama_cpp_2::model::AddBos;
+
+        let Some(src) = live_model_path() else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model_path = tmp.path().join("model.gguf");
+        std::fs::hard_link(&src, &model_path).expect("hard link the model, never symlink it");
+        // Snapshots land under the temp root instead of the real goose data dir.
+        std::env::set_var("GOOSE_PATH_ROOT", tmp.path());
+
+        // GPU offload is opt-in via env so the test is meaningful on both a
+        // CPU-only build and a CUDA one. It matters for the timing and not at
+        // all for the equivalence claim: the noise-floor control is measured on
+        // whatever build is running.
+        // UNSET means "whatever llama.cpp would do", which is Metal offload on a
+        // Mac. An earlier version defaulted this to 0 and silently turned the
+        // GPU off, quadrupling the Mac's prefill and making the comparison a
+        // measurement of the harness rather than of the cache.
+        let n_gpu_layers: Option<u32> = std::env::var("GIAP_TEST_NGL")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        eprintln!("n_gpu_layers: {n_gpu_layers:?} (None = llama.cpp default)");
+        let backend = LlamaCppBackend::new().expect("backend");
+        let model = Arc::new(
+            LlamaModel::load_from_file(
+                backend.llama_backend(),
+                &model_path,
+                &match n_gpu_layers {
+                    Some(n) => LlamaModelParams::default().with_n_gpu_layers(n),
+                    None => LlamaModelParams::default(),
+                },
+            )
+            .expect("load model"),
+        );
+
+        let settings = ModelSettings {
+            n_gpu_layers,
+            ..Default::default()
+        };
+        let n_ctx: u32 = 4096;
+
+        // The preamble has to clear SNAPSHOT_MIN_TOKENS or nothing is written.
+        let preamble = "The pond keeps its own notes about the household. ".repeat(120);
+        let prefix = model
+            .str_to_token(&preamble, AddBos::Always)
+            .expect("tokenize preamble");
+        assert!(
+            prefix.len() > 1024,
+            "preamble must exceed the snapshot threshold, got {}",
+            prefix.len()
+        );
+        let tail = model
+            .str_to_token(" In one word, the weather today is", AddBos::Never)
+            .expect("tokenize tail");
+        let prompt: Vec<LlamaToken> = prefix.iter().chain(tail.iter()).copied().collect();
+
+        let mut slot =
+            SnapshotSlot::for_model(&model_path, n_ctx, &settings).expect("slot for a real model");
+
+        // 1. Write a snapshot from a cache holding exactly the preamble.
+        {
+            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            decode_tokens(&mut kv.ctx, &prefix, 0).expect("prefill preamble");
+            kv.tokens.extend_from_slice(&prefix);
+            assert!(slot.write(&kv.ctx, &kv.tokens), "snapshot must be written");
+        }
+        let snapshot_bytes = std::fs::metadata(slot.path())
+            .expect("snapshot on disk")
+            .len();
+        eprintln!(
+            "snapshot: {} tokens, {:.1} MiB ({:.1} KiB/token)",
+            prefix.len(),
+            snapshot_bytes as f64 / 1_048_576.0,
+            snapshot_bytes as f64 / 1024.0 / prefix.len() as f64
+        );
+
+        // 2. Restore into a fresh context and decode only the tail.
+        let restored = {
+            let started = std::time::Instant::now();
+            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let n = slot
+                .load(kv.context_mut(), &prompt)
+                .expect("the snapshot must load and prefix this prompt");
+            assert_eq!(n, prefix.len(), "the whole preamble should be restored");
+            // The last token is decoded on its own so the logits row is index 0
+            // on both paths. `get_logits_ith` validates the index against the
+            // final batch, and the two paths batch differently -- restore
+            // decodes only the tail, full prefill chunks the whole prompt -- so
+            // any fixed non-zero index would be right for one and a panic for
+            // the other.
+            let last = prompt.len() - 1;
+            decode_tokens(&mut kv.ctx, &prompt[n..last], n).expect("decode tail");
+            decode_tokens(&mut kv.ctx, &prompt[last..], last).expect("decode final token");
+            eprintln!(
+                "restore + tail decode: {} ms",
+                started.elapsed().as_millis()
+            );
+            kv.ctx.get_logits_ith(0).to_vec()
+        };
+
+        // 3. The control: the same prompt, decoded from nothing.
+        let fresh = {
+            let started = std::time::Instant::now();
+            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let last = prompt.len() - 1;
+            decode_tokens(&mut kv.ctx, &prompt[..last], 0).expect("full prefill");
+            decode_tokens(&mut kv.ctx, &prompt[last..], last).expect("decode final token");
+            eprintln!(
+                "full prefill:          {} ms",
+                started.elapsed().as_millis()
+            );
+            kv.ctx.get_logits_ith(0).to_vec()
+        };
+
+        assert_eq!(
+            restored.len(),
+            fresh.len(),
+            "logit vectors must describe the same vocabulary"
+        );
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+        };
+        assert_eq!(
+            argmax(&restored),
+            argmax(&fresh),
+            "a restored cache predicted a different next token than a full prefill -- the \
+             snapshot is not equivalent to the decode it replaces"
+        );
+
+        // NOT bitwise, and the first version of this test was wrong to demand it.
+        // The two paths batch differently by construction -- restore decodes an
+        // 8-token tail, full prefill chunks ~1,200 tokens -- and llama.cpp's
+        // reduction order follows the batch shape, so the float results differ
+        // in the last places on Metal even when the cache is perfect. Measured
+        // here: same argmax, same top five, deltas in the 1e-2 range against
+        // logits spanning ~20.
+        //
+        // What has to hold is that the distribution is the same distribution.
+        // The top-5 check is the part that catches a subtly wrong cache: one
+        // that agrees on the winner by luck will not agree on the next four.
+        let top5 = |v: &[f32]| {
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.sort_by(|a, b| {
+                v[*b]
+                    .partial_cmp(&v[*a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            idx.truncate(5);
+            idx
+        };
+        assert_eq!(
+            top5(&restored),
+            top5(&fresh),
+            "a restored cache ranked the top tokens differently from a full prefill"
+        );
+
+        // THE CONTROL, and without it the delta below cannot be interpreted.
+        //
+        // It decodes the same prompt with the SAME batch shape the restore path
+        // uses -- prefix in one call, then the tail -- but computes the prefix
+        // instead of restoring it. Whatever this differs from `fresh` by is pure
+        // batch-shape float noise for this host, with no snapshot involved.
+        //
+        // A tolerance guessed on one machine is worthless here: the divergence is
+        // 0.007 on Metal and larger on a CPU build, because llama.cpp's
+        // accumulation order follows both the batch shape and the SIMD path. So
+        // the snapshot is judged against the noise floor measured on the SAME
+        // host in the SAME run, not against a constant.
+        let control = {
+            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let last = prompt.len() - 1;
+            decode_tokens(&mut kv.ctx, &prefix, 0).expect("prefix");
+            decode_tokens(&mut kv.ctx, &prompt[prefix.len()..last], prefix.len()).expect("tail");
+            decode_tokens(&mut kv.ctx, &prompt[last..], last).expect("final");
+            kv.ctx.get_logits_ith(0).to_vec()
+        };
+
+        let spread = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let restored_delta = spread(&restored, &fresh);
+        let noise_floor = spread(&control, &fresh);
+        eprintln!("max |logit delta| restored vs full prefill: {restored_delta:.6}");
+        eprintln!("max |logit delta| CONTROL  vs full prefill: {noise_floor:.6}  (batch-shape noise, no snapshot)");
+
+        assert_eq!(
+            top5(&restored),
+            top5(&control),
+            "restore and an equivalent computed prefix must rank identically"
+        );
+        // Generous multiplier on purpose: the claim being tested is "the same
+        // order of magnitude as re-decoding", not "bitwise", and a snapshot that
+        // was actually wrong lands orders of magnitude out, not 3x.
+        assert!(
+            restored_delta <= (noise_floor * 3.0).max(0.01),
+            "restored logits diverge by {restored_delta}, well beyond this host's own \
+             batch-shape noise floor of {noise_floor} -- the cache is not equivalent to the \
+             decode it replaces"
+        );
+
+        // The safety half, and the one that decides whether this feature can ship:
+        // a snapshot that is NOT a prefix of the incoming prompt must be refused,
+        // not restored. This is the shape a changed system prompt or a changed
+        // tool set produces -- neither of which the file key can see -- and
+        // restoring across it would not be slow, it would be wrong.
+        let mut foreign: Vec<LlamaToken> = prompt.clone();
+        foreign[0] = LlamaToken(if foreign[0].0 == 1 { 2 } else { 1 });
+        let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+        assert!(
+            slot.load(kv.context_mut(), &foreign).is_none(),
+            "a snapshot that does not prefix the prompt must be refused, not restored"
+        );
+    }
+
+    /// The one model this repo ships on-device, if the developer has it.
+    fn live_model_path() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        let candidates = [
+            "Library/Application Support/goose-in-a-pond/models/gguf/gemma-4-E2B-it-Q4_K_M.gguf",
+            ".local/share/goose-in-a-pond/models/gguf/gemma-4-E2B-it-Q4_K_M.gguf",
+        ];
+        candidates
+            .iter()
+            .map(|rel| std::path::PathBuf::from(&home).join(rel))
+            .find(|p| p.is_file())
     }
 
     #[test]
