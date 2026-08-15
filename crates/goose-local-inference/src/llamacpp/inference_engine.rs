@@ -2155,6 +2155,130 @@ mod tests {
         );
     }
 
+    /// DIAGNOSTIC: does turning thinking off change what the model is told about
+    /// tools?
+    ///
+    /// Observed on a live pond: turns that reason call a tool 81% of the time,
+    /// turns that do not call one 27% of the time. That is a 3x gap and the
+    /// question is whether the prompt is the cause. `enable_thinking` reaches
+    /// llama.cpp twice -- as the flag itself and as `reasoning_format` -- and
+    /// both feed the chat template, so the template is where a difference would
+    /// live.
+    ///
+    /// Renders the SAME messages and the SAME tools both ways and compares.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn thinking_off_does_not_change_what_the_model_is_told_about_tools() {
+        use llama_cpp_2::model::params::LlamaModelParams;
+
+        let Some(src) = live_model_path() else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let backend = LlamaCppBackend::new().expect("backend");
+        let model =
+            LlamaModel::load_from_file(backend.llama_backend(), &src, &LlamaModelParams::default())
+                .expect("load model");
+
+        let settings = ModelSettings::default();
+        let templates = crate::llamacpp::load_chat_templates(&model, &settings).expect("templates");
+        let template = templates
+            .tool_use
+            .as_ref()
+            .or(templates.default.as_ref())
+            .expect("a template");
+
+        let messages = r#"[{"role":"system","content":"You are a helpful assistant."},
+                           {"role":"user","content":"What is the weather in Nairobi?"}]"#;
+        let tools = r#"[{"type":"function","function":{"name":"get_current_weather",
+                          "description":"Current weather for a place.",
+                          "parameters":{"type":"object","properties":{"location":{"type":"string"}},
+                          "required":["location"]}}}]"#;
+
+        let render = |thinking: bool| {
+            let params = OpenAIChatTemplateParams {
+                messages_json: messages,
+                tools_json: Some(tools),
+                tool_choice: None,
+                json_schema: None,
+                grammar: None,
+                reasoning_format: if thinking { Some("auto") } else { None },
+                chat_template_kwargs: None,
+                add_generation_prompt: true,
+                use_jinja: true,
+                parallel_tool_calls: false,
+                enable_thinking: thinking,
+                add_bos: false,
+                add_eos: false,
+                parse_tool_calls: true,
+            };
+            model
+                .apply_chat_template_oaicompat(template, &params)
+                .expect("apply template")
+        };
+
+        let on = render(true);
+        let off = render(false);
+
+        // The prompt is only half the question. The template also decides how a
+        // RESPONSE is parsed -- chat_format, the tool-call PEG parser, the
+        // grammar and its triggers. If those differ, a model emitting a
+        // perfectly good tool call with thinking off could have it dropped on
+        // the way back, which is a bug rather than a model floor.
+        let describe = |label: &str, r: &llama_cpp_2::model::ChatTemplateResult| {
+            eprintln!(
+                "{label}: chat_format={} grammar={} lazy={} triggers={} parser={} stops={} preserved={} gen_prompt={:?}",
+                r.chat_format,
+                r.grammar.as_deref().map_or(0, str::len),
+                r.grammar_lazy,
+                r.grammar_triggers.len(),
+                r.parser.as_deref().map_or(0, str::len),
+                r.additional_stops.len(),
+                r.preserved_tokens.len(),
+                r.generation_prompt,
+            );
+        };
+        describe("ON ", &on);
+        describe("OFF", &off);
+        assert_eq!(
+            on.chat_format, off.chat_format,
+            "the response PARSER differs between thinking modes; a tool call emitted with \
+             thinking off would be parsed by a different format than the one that produced it"
+        );
+
+        eprintln!("--- thinking ON  : {} chars", on.prompt.len());
+        eprintln!("--- thinking OFF : {} chars", off.prompt.len());
+        let needle = "get_current_weather";
+        eprintln!(
+            "tool name present -> on: {}  off: {}",
+            on.prompt.matches(needle).count(),
+            off.prompt.matches(needle).count()
+        );
+        if on.prompt != off.prompt {
+            // Show the first divergence with a little context, which is the
+            // whole point of the diagnostic.
+            // Counted and sliced in CHARS, not bytes: a prompt is model-authored
+            // text and a byte range can land inside a UTF-8 sequence.
+            let at = on
+                .prompt
+                .chars()
+                .zip(off.prompt.chars())
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            let window =
+                |s: &str| -> String { s.chars().skip(at.saturating_sub(160)).take(400).collect() };
+            eprintln!("--- first divergence at char {at} ---");
+            eprintln!("ON : ...{}", window(&on.prompt));
+            eprintln!("OFF: ...{}", window(&off.prompt));
+        }
+
+        assert!(
+            off.prompt.contains(needle),
+            "the tool schema vanished from the prompt when thinking was turned off -- that \
+             would explain tool calls only working with thinking on"
+        );
+    }
+
     /// The one model this repo ships on-device, if the developer has it.
     fn live_model_path() -> Option<std::path::PathBuf> {
         let home = std::env::var_os("HOME")?;
