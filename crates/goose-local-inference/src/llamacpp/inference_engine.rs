@@ -939,12 +939,30 @@ fn seed_from_snapshot(
         Ok(()) => {
             kv.tokens.extend_from_slice(&prompt[restored..]);
             *session = Some(kv);
+            // Distinct from "loaded": that says bytes came off disk, this says a
+            // turn is actually generating on them. A restore that loads and then
+            // fails its suffix decode is a load without a use, and the two need
+            // telling apart when reading back why a turn was slow.
+            tracing::info!(
+                target: "giap::kv",
+                event = "in_use",
+                restored_tokens = restored,
+                decoded_tokens = prompt.len() - restored,
+                prompt_tokens = prompt.len(),
+                "kv snapshot in use; only the suffix was decoded"
+            );
             Ok(Some(restored))
         }
         Err(e) => {
             // A restored cache that will not decode is worse than none: drop it
             // and let the caller build a clean one.
-            tracing::warn!(error = %e, "suffix decode after snapshot restore failed; rebuilding");
+            tracing::warn!(
+                target: "giap::kv",
+                event = "discarded",
+                reason = "suffix decode failed after restore",
+                error = %e,
+                "kv snapshot discarded; rebuilding the context"
+            );
             *session = None;
             Err(e)
         }

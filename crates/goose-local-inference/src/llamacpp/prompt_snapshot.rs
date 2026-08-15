@@ -170,6 +170,18 @@ impl Fnv {
 /// deleted by a cleanup script.
 const SNAPSHOT_DIR: &str = "prompt-cache";
 
+/// Where the snapshot's lifecycle is narrated.
+///
+/// An explicit target, and that is load-bearing rather than tidy. GIAP's
+/// `tracing_setup.rs` carves this whole crate to ERROR
+/// (`goose_local_inference=error`) because goose narrates every turn, so an
+/// `info!` raised from here under the default target is invisible on exactly the
+/// pond it was written for. `EnvFilter` matches the TARGET, not the module, so
+/// naming one escapes the carve — the same trick GIAP's own `giap::trace` events
+/// use. Kept distinct from `giap::trace` so the whole life of a cache greps out
+/// on its own.
+const KV_TARGET: &str = "giap::kv";
+
 /// Settings that could change what a stored cache means.
 ///
 /// Conservative on purpose: `n_batch` almost certainly does not alter the stored
@@ -238,12 +250,23 @@ impl SnapshotSlot {
     }
 
     pub(super) fn new(dir: PathBuf, key: SnapshotKey) -> Self {
-        Self {
+        let slot = Self {
             dir,
             key,
             stable: None,
             settled: false,
-        }
+        };
+        let path = slot.path();
+        tracing::info!(
+            target: KV_TARGET,
+            event = "created",
+            model = %slot.key.model_path.display(),
+            n_ctx = slot.key.n_ctx,
+            file_exists = path.exists(),
+            path = %path.display(),
+            "kv snapshot slot created"
+        );
+        slot
     }
 
     pub(super) fn path(&self) -> PathBuf {
@@ -294,8 +317,16 @@ impl SnapshotSlot {
             tokens.len() >= SNAPSHOT_MIN_TOKENS,
             "writable_prefix is the only gate that should reach here"
         );
+        let started = std::time::Instant::now();
         if let Err(e) = std::fs::create_dir_all(&self.dir) {
-            tracing::debug!(error = %e, "prompt snapshot: cannot create cache directory");
+            tracing::warn!(
+                target: KV_TARGET,
+                event = "discarded",
+                reason = "cache directory could not be created",
+                error = %e,
+                dir = %self.dir.display(),
+                "kv snapshot discarded"
+            );
             self.settled = true;
             return false;
         }
@@ -311,22 +342,40 @@ impl SnapshotSlot {
         match ctx.state_seq_save_file(&tmp_path, SNAPSHOT_SEQ_ID, tokens) {
             Ok(bytes) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
-                    tracing::debug!(error = %e, "prompt snapshot: rename failed");
+                    tracing::warn!(
+                        target: KV_TARGET,
+                        event = "discarded",
+                        reason = "rename into place failed",
+                        error = %e,
+                        "kv snapshot discarded"
+                    );
                     let _ = std::fs::remove_file(&tmp_path);
                     self.settled = true;
                     return false;
                 }
                 tracing::info!(
+                    target: KV_TARGET,
+                    event = "saved",
                     tokens = tokens.len(),
                     bytes,
+                    kib_per_token = bytes as f64 / 1024.0 / tokens.len().max(1) as f64,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    model = %self.key.model_path.display(),
+                    n_ctx = self.key.n_ctx,
                     path = %final_path.display(),
-                    "prompt snapshot written; cold starts for this model will resume from disk"
+                    "kv snapshot saved; cold starts for this model now resume from disk"
                 );
                 self.settled = true;
                 true
             }
             Err(e) => {
-                tracing::debug!(error = %e, "prompt snapshot: save failed");
+                tracing::warn!(
+                    target: KV_TARGET,
+                    event = "discarded",
+                    reason = "llama.cpp refused to write the sequence state",
+                    error = %e,
+                    "kv snapshot discarded"
+                );
                 let _ = std::fs::remove_file(&tmp_path);
                 // Settled even on failure: a slot that cannot write once will
                 // not write on the tenth attempt either, and retrying would put
@@ -355,6 +404,7 @@ impl SnapshotSlot {
         if !path.exists() {
             return None;
         }
+        let started = std::time::Instant::now();
         // An existing file settles the slot whatever happens next: if it loads,
         // there is nothing to write; if it does not, writing over it is the job
         // of a later process that can observe a stable prefix again.
@@ -363,7 +413,14 @@ impl SnapshotSlot {
         let (tokens, bytes) = match ctx.state_seq_load_file(&path, SNAPSHOT_SEQ_ID, prompt.len()) {
             Ok(loaded) => loaded,
             Err(e) => {
-                tracing::debug!(error = %e, "prompt snapshot: load failed; prefilling normally");
+                tracing::warn!(
+                    target: KV_TARGET,
+                    event = "discarded",
+                    reason = "file present but llama.cpp could not read it",
+                    error = %e,
+                    path = %path.display(),
+                    "kv snapshot discarded; prefilling normally"
+                );
                 clear_seq(ctx);
                 return None;
             }
@@ -374,23 +431,55 @@ impl SnapshotSlot {
         // does not contain, which is not a slow answer -- it is a wrong one.
         let shared = common_prefix_len(&tokens, prompt);
         if shared < tokens.len() || shared < SNAPSHOT_MIN_TOKENS || shared >= prompt.len() {
-            tracing::debug!(
-                loaded = tokens.len(),
+            tracing::info!(
+                target: KV_TARGET,
+                event = "rejected",
+                reason = if shared < tokens.len() {
+                    "the stored prefix is not a prefix of this prompt"
+                } else if shared < SNAPSHOT_MIN_TOKENS {
+                    "the shared run is too short to be worth reusing"
+                } else {
+                    "the stored prefix covers the whole prompt, leaving nothing to decode"
+                },
+                loaded_tokens = tokens.len(),
                 shared,
-                prompt = prompt.len(),
-                "prompt snapshot does not prefix this prompt; prefilling normally"
+                prompt_tokens = prompt.len(),
+                "kv snapshot rejected; prefilling normally"
             );
             clear_seq(ctx);
             return None;
         }
 
         tracing::info!(
-            reused = shared,
-            prompt = prompt.len(),
+            target: KV_TARGET,
+            event = "loaded",
+            reused_tokens = shared,
+            prompt_tokens = prompt.len(),
             bytes,
-            "prompt snapshot restored; skipping the preamble prefill"
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            model = %self.key.model_path.display(),
+            "kv snapshot loaded; the preamble prefill is skipped"
         );
         Some(shared)
+    }
+}
+
+impl Drop for SnapshotSlot {
+    /// The slot lives on the loaded model, so this fires when the model slot is
+    /// evicted — the moment the in-memory half of the cache goes away and the
+    /// next turn for this model becomes a cold start again. The FILE survives;
+    /// that is the whole point, and saying which of the two was discarded is the
+    /// difference between reading this log and guessing at it.
+    fn drop(&mut self) {
+        tracing::info!(
+            target: KV_TARGET,
+            event = "discarded",
+            reason = "model slot evicted",
+            scope = "in-memory slot only; the snapshot file is kept",
+            model = %self.key.model_path.display(),
+            n_ctx = self.key.n_ctx,
+            "kv snapshot slot discarded"
+        );
     }
 }
 
