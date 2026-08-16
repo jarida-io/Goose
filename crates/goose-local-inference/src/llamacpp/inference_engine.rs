@@ -1034,7 +1034,18 @@ fn write_snapshot_if_due(
     session: &mut Option<SessionKv>,
     snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
     prompt: &[LlamaToken],
+    turn_was_cold: bool,
 ) {
+    // Writing is not free: measured 21.2 MiB in 314 ms, about 67 MiB/s, which is
+    // ~1.6 s for a 6,000-token preamble on an 18 KiB/token model and ~5 s on a
+    // 56 KiB/token one. On a warm turn that finishes in two seconds, paying it
+    // would make the cache the slowest thing about the turn it exists to speed
+    // up. A cold turn is already spending tens of seconds on prefill and can
+    // absorb it -- and a cold turn is exactly when a shape is being established,
+    // so nothing is lost by waiting for one.
+    if !turn_was_cold {
+        return;
+    }
     let (Some(slot), Some(kv)) = (snapshot.as_mut(), session.as_mut()) else {
         return;
     };
@@ -1154,7 +1165,8 @@ fn prefill_prompt(
 
             match reuse_prefix(kv, prompt, resume) {
                 Ok(()) => {
-                    write_snapshot_if_due(session, snapshot, prompt);
+                    // Warm by definition: this turn reused a prefix.
+                    write_snapshot_if_due(session, snapshot, prompt, false);
                     return Ok(PrefilledPrompt {
                         reused_prefix_tokens: resume,
                         transient: None,
@@ -1205,7 +1217,8 @@ fn prefill_prompt(
         }
         Err(e) => return Err(e),
     }
-    write_snapshot_if_due(session, snapshot, prompt);
+    // Cold: this path decoded the whole prompt.
+    write_snapshot_if_due(session, snapshot, prompt, true);
     Ok(PrefilledPrompt {
         reused_prefix_tokens: 0,
         transient: None,
@@ -2057,7 +2070,13 @@ mod tests {
             let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             decode_tokens(&mut kv.ctx, &prefix, 0).expect("prefill preamble");
             kv.tokens.extend_from_slice(&prefix);
+            let t = std::time::Instant::now();
             assert!(slot.write(&kv.ctx, &kv.tokens), "snapshot must be written");
+            eprintln!(
+                "SAVE  {} tokens in {} ms",
+                kv.tokens.len(),
+                t.elapsed().as_millis()
+            );
         }
         let snapshot_path = slot
             .snapshot_paths()

@@ -77,6 +77,16 @@ const SNAPSHOT_SEQ_ID: i32 = 0;
 /// several-hundred-token preamble is not.
 const SNAPSHOT_MIN_TOKENS: usize = 1024;
 
+/// The most one snapshot may hold.
+///
+/// Writing measured 67 MiB/s, so the file size IS the write latency: at
+/// 56 KiB/token a 16,384-token prefix would be 900 MiB and take a quarter of a
+/// minute to save, on a turn. Past a few thousand tokens the prefill being saved
+/// is already amortised across every future cold start, and the marginal token
+/// buys less than it costs to store. The cap is on tokens rather than bytes
+/// because the byte cost is only known after the write.
+const SNAPSHOT_MAX_TOKENS: usize = 6144;
+
 /// Token depths the prefix ladder hashes at.
 ///
 /// # Why a ladder and not one hash
@@ -109,6 +119,9 @@ const LADDER_DEPTHS: &[usize] = &[256, 512, 1024, 2048, 4096, 8192, 16384];
 /// without letting a runaway fill the disk — at 18 KiB/token a 4,000-token
 /// snapshot is ~70 MiB, so six is the difference between a cache and a problem.
 const MAX_SNAPSHOTS: usize = 6;
+
+/// How stale a `last_used` stamp may get before the index is rewritten.
+const TOUCH_WRITE_INTERVAL_SECS: u64 = 3600;
 
 /// Hash of `tokens[..depth]` for every depth the tokens actually reach.
 ///
@@ -172,15 +185,28 @@ impl SnapshotIndex {
     /// rung are equally right about the part that was compared, and the longer
     /// one saves more of the decode. The prefix check at load time is still what
     /// makes the choice safe — the ladder narrows, it does not prove.
-    fn best_match(&self, want: &[(usize, u64)]) -> Option<&IndexEntry> {
+    fn best_match(&self, want: &[(usize, u64)], prompt_tokens: usize) -> Option<&IndexEntry> {
         self.entries
             .iter()
-            .filter_map(|e| {
-                let agree = ladder_agreement(&e.ladder, want);
-                (agree > 0).then_some((agree, e.tokens, e))
+            .filter(|e| {
+                // Cheap refusals, in the order that rejects most for least. Each
+                // one saves a full read of a file that CANNOT serve this prompt,
+                // and a read is tens to hundreds of megabytes -- the single
+                // largest waste this type can commit.
+                //
+                // 1. A snapshot at least as long as the prompt leaves nothing to
+                //    decode, which `load` rejects anyway.
+                if e.tokens >= prompt_tokens {
+                    return false;
+                }
+                // 2. The ladder has to agree at least as deep as the snapshot's
+                //    own deepest rung. Agreeing less means the stored prefix
+                //    diverges from this prompt BEFORE it ends, so it is not a
+                //    prefix of it and no amount of reading will change that.
+                let own_depth = e.ladder.last().map_or(0, |(d, _)| *d);
+                ladder_agreement(&e.ladder, want) >= own_depth && own_depth > 0
             })
-            .max_by_key(|(agree, tokens, _)| (*agree, *tokens))
-            .map(|(_, _, e)| e)
+            .max_by_key(|e| e.tokens)
     }
 }
 
@@ -463,7 +489,11 @@ impl SnapshotSlot {
         if entry.settled || !entry.intersected {
             return None;
         }
-        let len = entry.stable.as_ref().map_or(0, Vec::len);
+        let len = entry
+            .stable
+            .as_ref()
+            .map_or(0, Vec::len)
+            .min(SNAPSHOT_MAX_TOKENS);
         (len >= SNAPSHOT_MIN_TOKENS).then_some(len)
     }
 
@@ -559,7 +589,7 @@ impl SnapshotSlot {
         prompt: &[LlamaToken],
     ) -> Option<usize> {
         let rungs = ladder(prompt);
-        let chosen = self.index.best_match(&rungs)?.clone();
+        let chosen = self.index.best_match(&rungs, prompt.len())?.clone();
         let path = self.dir.join(&chosen.file);
         if !path.exists() {
             self.forget(&chosen.file, "index named a file that is gone");
@@ -632,11 +662,24 @@ impl SnapshotSlot {
         Some(shared)
     }
 
+    /// Record a use, and only pay a write when it would change the eviction
+    /// order. `last_used` exists to pick a victim; rewriting the file on every
+    /// successful load is a synchronous write per turn to move a timestamp
+    /// nothing will read until the cap is exceeded.
     fn touch(&mut self, file: &str) {
+        let now = now_secs();
+        let stale = self
+            .index
+            .entries
+            .iter()
+            .find(|e| e.file == file)
+            .is_some_and(|e| now.saturating_sub(e.last_used) > TOUCH_WRITE_INTERVAL_SECS);
         if let Some(e) = self.index.entries.iter_mut().find(|e| e.file == file) {
-            e.last_used = now_secs();
+            e.last_used = now;
         }
-        self.save_index();
+        if stale {
+            self.save_index();
+        }
     }
 
     /// Forget an index entry without touching disk (the file is already gone).
@@ -839,14 +882,41 @@ mod tests {
                 },
             ],
         };
+        // A longer prompt of the same shape: the deeper snapshot serves it.
+        let incoming = ladder(&shaped(1, 5000));
         assert_eq!(
-            index.best_match(&deep).map(|e| e.file.as_str()),
+            index.best_match(&incoming, 5000).map(|e| e.file.as_str()),
             Some("deep.kv")
         );
         assert_eq!(
-            index.best_match(&other_shape).map(|e| e.file.as_str()),
+            index
+                .best_match(&other_shape, 5000)
+                .map(|e| e.file.as_str()),
             None,
             "a prompt shape with no stored cache must get nothing rather than the wrong one"
+        );
+
+        // The refusals that save a read. Each would otherwise cost tens to
+        // hundreds of megabytes to discover.
+        assert_eq!(
+            index.best_match(&incoming, 600).map(|e| e.file.as_str()),
+            None,
+            "a snapshot at least as long as the prompt leaves nothing to decode"
+        );
+        let diverges_early = {
+            let mut p = shaped(1, 5000);
+            p[700] = LlamaToken(-7);
+            ladder(&p)
+        };
+        assert_eq!(
+            index
+                .best_match(&diverges_early, 5000)
+                .map(|e| e.file.as_str()),
+            Some("shallow.kv"),
+            "the 4,000-token snapshot diverges from this prompt at token 700, so it cannot be \
+             a prefix of it and must be refused FROM THE LADDER rather than by reading 4,000 \
+             tokens of KV to find out -- while the 600-token one still genuinely is a prefix \
+             and should be served"
         );
     }
 
