@@ -2159,6 +2159,40 @@ mod tests {
              decode it replaces"
         );
 
+        // The production failure, pinned. `max_tokens` on `state_seq_load_file`
+        // sizes the OUTPUT BUFFER; it is not a filter on what may be read. I read
+        // it as a filter and passed the prompt length, so on a live pond a
+        // 5,341-token snapshot met a 5,033-token prompt and llama.cpp refused the
+        // whole file with "token count in sequence state file exceeded capacity"
+        // — on every cold start, forever, because nothing retired the file.
+        //
+        // A snapshot LONGER than the current prompt is an ordinary thing to find
+        // (a later session carries less history), and it belongs in the prefix
+        // test where it can be rejected for a stated reason. So the capacity has
+        // to be the context's, and this asserts the semantics both ways round.
+        {
+            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let too_small = prefix.len() - 1;
+            assert!(
+                kv.context_mut()
+                    .state_seq_load_file(slot.path(), 0, too_small)
+                    .is_err(),
+                "a capacity below the stored token count must fail -- if this starts passing, \
+                 max_tokens has stopped being a buffer size and the reasoning above is stale"
+            );
+
+            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let (tokens, _) = kv
+                .context_mut()
+                .state_seq_load_file(slot.path(), 0, n_ctx as usize)
+                .expect("the context's own capacity must always be enough");
+            assert_eq!(
+                tokens.len(),
+                prefix.len(),
+                "the whole stored prefix must come back when the buffer can hold it"
+            );
+        }
+
         // The safety half, and the one that decides whether this feature can ship:
         // a snapshot that is NOT a prefix of the incoming prompt must be refused,
         // not restored. This is the shape a changed system prompt or a changed

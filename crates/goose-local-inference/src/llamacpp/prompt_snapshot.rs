@@ -215,6 +215,20 @@ pub(super) struct SnapshotSlot {
     /// Set once a file has been written or found this process, so the expensive
     /// write happens at most once per slot.
     settled: bool,
+    /// How many prompts have been folded in.
+    ///
+    /// A prefix derived from ONE prompt is that prompt, not a prefix. Writing it
+    /// produced a 5,341-token snapshot on a live pond that every later session
+    /// rejected, because consecutive prompts inside a single conversation share
+    /// their whole history and the intersection had never actually intersected
+    /// anything.
+    observations: usize,
+    /// Whether folding a prompt in has ever SHORTENED the prefix.
+    ///
+    /// The count alone is not evidence: three prompts from one session agree
+    /// completely and still say nothing about what a different session shares.
+    /// A shrink is proof that two genuinely different prompts have been seen.
+    intersected: bool,
 }
 
 impl SnapshotSlot {
@@ -255,6 +269,8 @@ impl SnapshotSlot {
             key,
             stable: None,
             settled: false,
+            observations: 0,
+            intersected: false,
         };
         let path = slot.path();
         tracing::info!(
@@ -280,10 +296,14 @@ impl SnapshotSlot {
     /// common, and a prompt that was expensive to serve is exactly as
     /// informative as one that was cheap.
     pub(super) fn observe(&mut self, prompt: &[LlamaToken]) {
+        self.observations += 1;
         match &mut self.stable {
             None => self.stable = Some(prompt.to_vec()),
             Some(stable) => {
                 let shared = common_prefix_len(stable, prompt);
+                if shared < stable.len() {
+                    self.intersected = true;
+                }
                 stable.truncate(shared);
             }
         }
@@ -296,7 +316,7 @@ impl SnapshotSlot {
     /// have been seen to know what is stable, or the shared run is too short to
     /// pay for itself.
     pub(super) fn writable_prefix(&self) -> Option<usize> {
-        if self.settled {
+        if self.settled || !self.intersected {
             return None;
         }
         let len = self.stable.as_ref().map_or(0, Vec::len);
@@ -410,7 +430,15 @@ impl SnapshotSlot {
         // of a later process that can observe a stable prefix again.
         self.settled = true;
 
-        let (tokens, bytes) = match ctx.state_seq_load_file(&path, SNAPSHOT_SEQ_ID, prompt.len()) {
+        // The context's capacity, NOT the prompt length. `max_tokens` sizes the
+        // output buffer llama.cpp writes the token list into, so passing the
+        // prompt length makes any snapshot LONGER than the current prompt fail
+        // outright with "token count in sequence state file exceeded capacity".
+        // That is not the check it looks like: a longer snapshot is a perfectly
+        // ordinary thing to find and belongs in the prefix test below, where it
+        // can be rejected in a way that says why.
+        let capacity = ctx.n_ctx() as usize;
+        let (tokens, bytes) = match ctx.state_seq_load_file(&path, SNAPSHOT_SEQ_ID, capacity) {
             Ok(loaded) => loaded,
             Err(e) => {
                 tracing::warn!(
@@ -421,6 +449,7 @@ impl SnapshotSlot {
                     path = %path.display(),
                     "kv snapshot discarded; prefilling normally"
                 );
+                self.retire(&path, "unreadable");
                 clear_seq(ctx);
                 return None;
             }
@@ -446,6 +475,14 @@ impl SnapshotSlot {
                 prompt_tokens = prompt.len(),
                 "kv snapshot rejected; prefilling normally"
             );
+            // A snapshot this pond's prompts do not begin with is not going to
+            // start matching, and leaving it costs a failed read on EVERY cold
+            // start for the life of the install. Retiring it lets a shorter,
+            // genuinely shared prefix take its place once one is known -- which
+            // is how a first write that over-fitted one session corrects itself.
+            if shared < tokens.len() {
+                self.retire(&path, "this pond's prompts do not begin with it");
+            }
             clear_seq(ctx);
             return None;
         }
@@ -480,6 +517,34 @@ impl Drop for SnapshotSlot {
             n_ctx = self.key.n_ctx,
             "kv snapshot slot discarded"
         );
+    }
+}
+
+impl SnapshotSlot {
+    /// Delete a snapshot that cannot serve this pond, and allow a replacement.
+    ///
+    /// Clearing `settled` is the half that matters: without it the slot has
+    /// already decided not to write this process, so a bad file would be deleted
+    /// and never replaced, and the pond would go back to paying a full cold
+    /// prefill with nothing on disk and nothing trying to put anything there.
+    fn retire(&mut self, path: &Path, reason: &str) {
+        match std::fs::remove_file(path) {
+            Ok(()) => tracing::info!(
+                target: KV_TARGET,
+                event = "discarded",
+                reason = %reason,
+                scope = "file deleted; a replacement may be written once a shared prefix is known",
+                path = %path.display(),
+                "kv snapshot retired"
+            ),
+            Err(e) => tracing::debug!(
+                target: KV_TARGET,
+                error = %e,
+                path = %path.display(),
+                "kv snapshot could not be retired"
+            ),
+        }
+        self.settled = false;
     }
 }
 
@@ -544,15 +609,89 @@ mod tests {
     /// in-memory resume; this threshold governs hundreds of megabytes of IO.
     #[test]
     fn a_prefix_below_the_threshold_is_not_written() {
+        // Both cases intersect first, so the threshold is what is under test
+        // rather than the intersection requirement beside it.
         let mut s = slot();
         let short: Vec<i32> = (0..(SNAPSHOT_MIN_TOKENS as i32 - 1)).collect();
         s.observe(&tok(&short));
+        s.observe(&tok(&short[..short.len() - 1]));
         assert_eq!(s.writable_prefix(), None);
 
         let mut s = slot();
-        let long: Vec<i32> = (0..(SNAPSHOT_MIN_TOKENS as i32)).collect();
+        let long: Vec<i32> = (0..(SNAPSHOT_MIN_TOKENS as i32 + 50)).collect();
         s.observe(&tok(&long));
+        s.observe(&tok(&long[..SNAPSHOT_MIN_TOKENS]));
         assert_eq!(s.writable_prefix(), Some(SNAPSHOT_MIN_TOKENS));
+    }
+
+    /// `load` must size the read buffer from the CONTEXT, never from the prompt.
+    ///
+    /// Asserted against the source because the two spellings are otherwise
+    /// indistinguishable from outside: both end in `None` and both retire the
+    /// file, so a test driving `load` cannot tell a capacity error from an
+    /// honest "this is not a prefix". The difference is only visible in the log
+    /// and in what the pond does next — and on a live pond the wrong one meant
+    /// every cold start read a file, failed, and deleted nothing, forever.
+    ///
+    /// The companion assertion is in the live test, which pins llama.cpp's own
+    /// semantics: a capacity below the stored token count really does fail.
+    #[test]
+    fn the_read_buffer_is_sized_from_the_context_not_the_prompt() {
+        const SRC: &str = include_str!("prompt_snapshot.rs");
+        // Split rather than slice: a byte range into source text can land
+        // inside a UTF-8 sequence, and this file has plenty of prose that is
+        // not ASCII.
+        let body = SRC
+            .split("fn load(")
+            .nth(1)
+            .expect("load is defined in this file")
+            .split("\n    }")
+            .next()
+            .expect("split always yields one");
+
+        assert!(
+            body.contains("ctx.n_ctx() as usize"),
+            "load no longer sizes its read buffer from the context"
+        );
+        assert!(
+            !body.contains("SNAPSHOT_SEQ_ID, prompt.len()"),
+            "load is passing the prompt length as the read capacity again -- that is not a \
+             filter, it is a buffer size, and any snapshot longer than the prompt will fail \
+             to read at all"
+        );
+    }
+
+    /// A prefix derived from a single prompt IS that prompt, and writing it
+    /// produced the defect this guard exists for: on a live pond the first write
+    /// stored 5,341 tokens because every prompt in that process came from one
+    /// conversation and shared its whole history. Every later session then
+    /// rejected it, and the log filled with a failed load on each cold start.
+    #[test]
+    fn a_prefix_that_has_never_intersected_anything_is_not_written() {
+        let long: Vec<i32> = (0..(SNAPSHOT_MIN_TOKENS as i32 + 200)).collect();
+
+        // Three prompts, all identical: the count is met and nothing has been
+        // learned. This is a whole conversation's worth of turns.
+        let mut s = slot();
+        for _ in 0..3 {
+            s.observe(&tok(&long));
+        }
+        assert_eq!(
+            s.writable_prefix(),
+            None,
+            "agreeing prompts prove nothing about what a DIFFERENT session shares"
+        );
+
+        // One genuinely different prompt, and now the prefix is an intersection.
+        let mut diverged = long.clone();
+        let cut = SNAPSHOT_MIN_TOKENS + 100;
+        diverged[cut] = -1;
+        s.observe(&tok(&diverged));
+        assert_eq!(
+            s.writable_prefix(),
+            Some(cut),
+            "a shrink is the evidence, and the shared run is what gets written"
+        );
     }
 
     /// Writing is once per slot. Repeating it would put a multi-hundred-megabyte
@@ -560,8 +699,9 @@ mod tests {
     #[test]
     fn a_settled_slot_never_offers_another_write() {
         let mut s = slot();
-        let long: Vec<i32> = (0..(SNAPSHOT_MIN_TOKENS as i32)).collect();
+        let long: Vec<i32> = (0..(SNAPSHOT_MIN_TOKENS as i32 + 50)).collect();
         s.observe(&tok(&long));
+        s.observe(&tok(&long[..SNAPSHOT_MIN_TOKENS]));
         assert!(s.writable_prefix().is_some());
         // Set directly: this is the state `load` and `write` both leave behind,
         // and the assertion is about what `writable_prefix` does with it.
