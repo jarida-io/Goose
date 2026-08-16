@@ -1016,6 +1016,62 @@ struct PrefilledPrompt {
     effective_ctx: usize,
 }
 
+/// Persist this prompt's shape once its stable prefix is known.
+///
+/// Called after the cache holds the whole prompt, whichever plan put it there.
+/// That placement is the point, and two earlier ones were wrong: hanging it off
+/// `ReusePrefix` meant only a shape that already owned the retained cache could
+/// write, and requiring the cache to ALREADY hold the prefix failed the moment
+/// two callers alternated — which is every real pond, where chat, extraction,
+/// titling and the reviewer take turns against one model and share nothing at
+/// the start. Both produced an empty cache directory.
+///
+/// The cache is trimmed to the prefix, saved, and the tail decoded back. That
+/// re-decode is the whole cost, it is bounded by the divergent tail rather than
+/// the prompt, and it happens once per shape per process — against a saved cold
+/// start measured in seconds.
+fn write_snapshot_if_due(
+    session: &mut Option<SessionKv>,
+    snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
+    prompt: &[LlamaToken],
+) {
+    let (Some(slot), Some(kv)) = (snapshot.as_mut(), session.as_mut()) else {
+        return;
+    };
+    // Text-only: with a media head `tokens` starts at `media_pos`, so a token
+    // count is not an absolute position.
+    if kv.head.is_some() {
+        return;
+    }
+    let Some(keep) = slot.writable_prefix(prompt) else {
+        return;
+    };
+    // The cache has to hold what is about to be written, and there has to be a
+    // tail worth keeping the rest of.
+    if keep >= kv.tokens.len() || common_prefix_len(&kv.tokens, prompt) < keep {
+        return;
+    }
+    if trim_to_prefix(kv, keep).is_err() {
+        return;
+    }
+    slot.write(&kv.ctx, &kv.tokens);
+
+    // Put the tail back: the turn still has to generate from the whole prompt.
+    match decode_tokens(&mut kv.ctx, &prompt[keep..], keep) {
+        Ok(()) => kv.tokens.extend_from_slice(&prompt[keep..]),
+        Err(e) => {
+            tracing::warn!(
+                target: "giap::kv",
+                event = "discarded",
+                reason = "re-decoding the tail after a write failed",
+                error = %e,
+                "kv snapshot written but the context could not be restored; rebuilding"
+            );
+            *session = None;
+        }
+    }
+}
+
 /// Prepare a KV cache holding `prompt`, with logits available for its last
 /// token.
 #[allow(clippy::too_many_arguments)]
@@ -1096,34 +1152,14 @@ fn prefill_prompt(
                 .as_mut()
                 .expect("ReusePrefix is only produced when a session is retained");
 
-            // The one moment a snapshot can be written honestly: the cache holds
-            // a superset of the stable prefix, and the tail is about to be
-            // discarded anyway. Trimming first is what keeps the file to the
-            // shared preamble rather than to one household's prompt.
-            //
-            // Text-only, because with a media head `tokens` starts at `media_pos`
-            // and a token count is not an absolute position.
-            let mut resume = resume;
-            if kv.head.is_none() {
-                if let Some(slot) = snapshot.as_mut() {
-                    if let Some(keep) = slot.writable_prefix().filter(|keep| *keep <= resume) {
-                        if trim_to_prefix(kv, keep).is_ok() {
-                            slot.write(&kv.ctx, &kv.tokens);
-                            // The cache is now shorter than the plan assumed, so
-                            // the decode has to start where it actually ends.
-                            resume = keep;
-                        }
-                    }
-                }
-            }
-
             match reuse_prefix(kv, prompt, resume) {
                 Ok(()) => {
+                    write_snapshot_if_due(session, snapshot, prompt);
                     return Ok(PrefilledPrompt {
                         reused_prefix_tokens: resume,
                         transient: None,
                         effective_ctx,
-                    })
+                    });
                 }
                 Err(PrefixReuseError::Refused) => {
                     tracing::debug!(
@@ -1169,6 +1205,7 @@ fn prefill_prompt(
         }
         Err(e) => return Err(e),
     }
+    write_snapshot_if_due(session, snapshot, prompt);
     Ok(PrefilledPrompt {
         reused_prefix_tokens: 0,
         transient: None,
@@ -1961,7 +1998,10 @@ mod tests {
         let model_path = tmp.path().join("model.gguf");
         std::fs::hard_link(&src, &model_path).expect("hard link the model, never symlink it");
         // Snapshots land under the temp root instead of the real goose data dir.
-        std::env::set_var("GOOSE_PATH_ROOT", tmp.path());
+        // Process-wide, so it is taken under the same lock the registry tests
+        // use rather than set directly — two live tests otherwise race and each
+        // reads the other's cache directory.
+        let _env = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(tmp.path().to_str().unwrap()))]);
 
         // GPU offload is opt-in via env so the test is meaningful on both a
         // CPU-only build and a CUDA one. It matters for the timing and not at
@@ -1975,7 +2015,7 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok());
         eprintln!("n_gpu_layers: {n_gpu_layers:?} (None = llama.cpp default)");
-        let backend = LlamaCppBackend::new().expect("backend");
+        let backend = shared_backend();
         let model = Arc::new(
             LlamaModel::load_from_file(
                 backend.llama_backend(),
@@ -2014,12 +2054,17 @@ mod tests {
 
         // 1. Write a snapshot from a cache holding exactly the preamble.
         {
-            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             decode_tokens(&mut kv.ctx, &prefix, 0).expect("prefill preamble");
             kv.tokens.extend_from_slice(&prefix);
             assert!(slot.write(&kv.ctx, &kv.tokens), "snapshot must be written");
         }
-        let snapshot_bytes = std::fs::metadata(slot.path())
+        let snapshot_path = slot
+            .snapshot_paths()
+            .into_iter()
+            .next()
+            .expect("exactly one snapshot was written");
+        let snapshot_bytes = std::fs::metadata(&snapshot_path)
             .expect("snapshot on disk")
             .len();
         eprintln!(
@@ -2032,7 +2077,7 @@ mod tests {
         // 2. Restore into a fresh context and decode only the tail.
         let restored = {
             let started = std::time::Instant::now();
-            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let n = slot
                 .load(kv.context_mut(), &prompt)
                 .expect("the snapshot must load and prefix this prompt");
@@ -2056,7 +2101,7 @@ mod tests {
         // 3. The control: the same prompt, decoded from nothing.
         let fresh = {
             let started = std::time::Instant::now();
-            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let last = prompt.len() - 1;
             decode_tokens(&mut kv.ctx, &prompt[..last], 0).expect("full prefill");
             decode_tokens(&mut kv.ctx, &prompt[last..], last).expect("decode final token");
@@ -2125,7 +2170,7 @@ mod tests {
         // the snapshot is judged against the noise floor measured on the SAME
         // host in the SAME run, not against a constant.
         let control = {
-            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let last = prompt.len() - 1;
             decode_tokens(&mut kv.ctx, &prefix, 0).expect("prefix");
             decode_tokens(&mut kv.ctx, &prompt[prefix.len()..last], prefix.len()).expect("tail");
@@ -2171,20 +2216,20 @@ mod tests {
         // test where it can be rejected for a stated reason. So the capacity has
         // to be the context's, and this asserts the semantics both ways round.
         {
-            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let too_small = prefix.len() - 1;
             assert!(
                 kv.context_mut()
-                    .state_seq_load_file(slot.path(), 0, too_small)
+                    .state_seq_load_file(&snapshot_path, 0, too_small)
                     .is_err(),
                 "a capacity below the stored token count must fail -- if this starts passing, \
                  max_tokens has stopped being a buffer size and the reasoning above is stale"
             );
 
-            let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let (tokens, _) = kv
                 .context_mut()
-                .state_seq_load_file(slot.path(), 0, n_ctx as usize)
+                .state_seq_load_file(&snapshot_path, 0, n_ctx as usize)
                 .expect("the context's own capacity must always be enough");
             assert_eq!(
                 tokens.len(),
@@ -2200,7 +2245,7 @@ mod tests {
         // restoring across it would not be slow, it would be wrong.
         let mut foreign: Vec<LlamaToken> = prompt.clone();
         foreign[0] = LlamaToken(if foreign[0].0 == 1 { 2 } else { 1 });
-        let mut kv = SessionKv::create(&model, &backend, n_ctx, &settings).expect("ctx");
+        let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
         assert!(
             slot.load(kv.context_mut(), &foreign).is_none(),
             "a snapshot that does not prefix the prompt must be refused, not restored"
@@ -2227,7 +2272,7 @@ mod tests {
             eprintln!("skipping: no local GGUF found");
             return;
         };
-        let backend = LlamaCppBackend::new().expect("backend");
+        let backend = shared_backend();
         let model =
             LlamaModel::load_from_file(backend.llama_backend(), &src, &LlamaModelParams::default())
                 .expect("load model");
@@ -2329,6 +2374,139 @@ mod tests {
             "the tool schema vanished from the prompt when thinking was turned off -- that \
              would explain tool calls only working with thinking on"
         );
+    }
+
+    /// A REAL turn must actually write a file. This is the defect Jerry reported:
+    /// everything above passed and the cache directory stayed empty.
+    ///
+    /// Drives `prefill_prompt` — the production entry point — rather than
+    /// `slot.write` directly, because the bug was never in writing. It was in
+    /// WHEN writing was attempted: the hook hung off the `ReusePrefix` arm, which
+    /// only fires when a retained cache already shares the prompt's opening.
+    /// Chat reaches it on its second turn; memory extraction takes a sacrificial
+    /// context and never does; a quarter-hourly reviewer finds chat's cache in
+    /// the slot instead of its own. So one shape could write and the rest never
+    /// could, and a test that called `write` itself could not see that.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn two_turns_of_one_shape_leave_a_snapshot_on_disk() {
+        use crate::llamacpp::prompt_snapshot::SnapshotSlot;
+        use llama_cpp_2::model::params::LlamaModelParams;
+        use llama_cpp_2::model::AddBos;
+
+        let Some(src) = live_model_path() else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model_path = tmp.path().join("model.gguf");
+        std::fs::hard_link(&src, &model_path).expect("hard link the model, never symlink it");
+        // Process-wide, so it is taken under the same lock the registry tests
+        // use rather than set directly — two live tests otherwise race and each
+        // reads the other's cache directory.
+        let _env = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(tmp.path().to_str().unwrap()))]);
+
+        let backend = shared_backend();
+        let model = Arc::new(
+            LlamaModel::load_from_file(
+                backend.llama_backend(),
+                &model_path,
+                &LlamaModelParams::default(),
+            )
+            .expect("load model"),
+        );
+        let settings = ModelSettings::default();
+        let n_ctx: usize = 4096;
+
+        // Two prompts of ONE shape: same long preamble, different tails. That is
+        // what a second turn of the same caller looks like, and it is the least
+        // a snapshot needs in order to know what is stable.
+        let preamble = "The pond keeps its own notes about the household. ".repeat(120);
+        let tok = |t: &str, bos| model.str_to_token(t, bos).expect("tokenize");
+        let base = tok(&preamble, AddBos::Always);
+        assert!(base.len() > 1024, "preamble must clear the threshold");
+
+        let first: Vec<LlamaToken> = base
+            .iter()
+            .chain(tok(" What is the weather?", AddBos::Never).iter())
+            .copied()
+            .collect();
+        let second: Vec<LlamaToken> = base
+            .iter()
+            .chain(tok(" Remind me about the shed roof.", AddBos::Never).iter())
+            .copied()
+            .collect();
+
+        // A SECOND shape, sharing nothing with the first — this is the scheduler
+        // or the memory extractor beside chat, and it is the case the old hook
+        // could never serve.
+        let other_preamble =
+            "Review the household's recent events and decide whether to speak. ".repeat(90);
+        let other_base = tok(&other_preamble, AddBos::Always);
+        assert!(
+            other_base.len() > 1024,
+            "second preamble must clear the threshold"
+        );
+        let other_first: Vec<LlamaToken> = other_base
+            .iter()
+            .chain(tok(" Anything worth raising?", AddBos::Never).iter())
+            .copied()
+            .collect();
+        let other_second: Vec<LlamaToken> = other_base
+            .iter()
+            .chain(tok(" Summarise instead.", AddBos::Never).iter())
+            .copied()
+            .collect();
+
+        let mut session: Option<SessionKv> = None;
+        let mut snapshot: Option<SnapshotSlot> = None;
+
+        // Interleaved, the way a pond actually runs them.
+        for prompt in [
+            &first,
+            &other_first,
+            &second,
+            &other_second,
+            &first,
+            &other_first,
+        ] {
+            prefill_prompt(
+                &mut session,
+                &mut snapshot,
+                &model_path,
+                &model,
+                backend,
+                &settings,
+                prompt,
+                n_ctx,
+            )
+            .expect("prefill");
+        }
+
+        let slot = snapshot.expect("a slot is built on the first prefill");
+        let files = slot.snapshot_paths();
+        for f in &files {
+            assert!(f.exists(), "the index names {f:?} but it is not there");
+        }
+        eprintln!("snapshots after six interleaved turns: {}", files.len());
+        assert_eq!(
+            files.len(),
+            2,
+            "each prompt shape must get its OWN snapshot. One means only the shape that \
+             happened to hold the retained cache could write, which is the defect: a pond \
+             runs chat, extraction, titling and the reviewer against one model and they \
+             share nothing at the start"
+        );
+    }
+
+    /// The process's one llama.cpp backend.
+    ///
+    /// `LlamaCppBackend::new()` treats a second initialisation as `unreachable!`
+    /// — correctly, since the runtime holds the only one for the life of the
+    /// process — so two live tests each building their own panics the second.
+    fn shared_backend() -> &'static LlamaCppBackend {
+        static BACKEND: std::sync::OnceLock<LlamaCppBackend> = std::sync::OnceLock::new();
+        BACKEND.get_or_init(|| LlamaCppBackend::new().expect("backend"))
     }
 
     /// The one model this repo ships on-device, if the developer has it.
