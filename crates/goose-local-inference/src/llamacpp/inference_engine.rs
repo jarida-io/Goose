@@ -2499,6 +2499,138 @@ mod tests {
         );
     }
 
+    /// HOW MUCH common ground do two chats actually share?
+    ///
+    /// The snapshot can only ever cache the run of tokens every chat begins
+    /// with, so this measures it against the real template rather than assuming.
+    /// The answer decides whether the feature helps chat at all: GIAP's
+    /// `tool_selection_mode = "relevant"` picks a different tool set per
+    /// conversation — 30 distinct sets across 84 sessions on my own pond — and
+    /// the template renders the system text FIRST and the tool declarations
+    /// AFTER it. Everything from the first differing tool onward diverges.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn how_much_two_chats_share_depends_on_whether_their_tools_match() {
+        use llama_cpp_2::model::params::LlamaModelParams;
+
+        let Some(src) = live_model_path() else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let backend = shared_backend();
+        let model =
+            LlamaModel::load_from_file(backend.llama_backend(), &src, &LlamaModelParams::default())
+                .expect("load model");
+        let settings = ModelSettings::default();
+        let templates = crate::llamacpp::load_chat_templates(&model, &settings).expect("templates");
+        let template = templates
+            .tool_use
+            .as_ref()
+            .or(templates.default.as_ref())
+            .expect("a template");
+
+        // A GIAP-sized system prompt: the compact static prefix is capped near
+        // 600 tokens, so this is the right order of magnitude.
+        let system = "You are the assistant for this household. ".repeat(60);
+        let tool = |n: usize| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": format!("giap_tool_{n}"),
+                    "description": format!(
+                        "Tool number {n} for the household, with enough description to be a \
+                         realistic schema rather than a token or two."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "target": {"type": "string", "description": "what to act on"},
+                            "value": {"type": "string", "description": "the value to use"}
+                        },
+                        "required": ["target"]
+                    }
+                }
+            })
+        };
+        let toolset = |ids: &[usize]| {
+            serde_json::Value::Array(ids.iter().map(|n| tool(*n)).collect()).to_string()
+        };
+
+        let render = |tools: &str| {
+            let messages = format!(
+                r#"[{{"role":"system","content":{}}},{{"role":"user","content":"hello"}}]"#,
+                serde_json::to_string(&system).unwrap()
+            );
+            let params = OpenAIChatTemplateParams {
+                messages_json: &messages,
+                tools_json: Some(tools),
+                tool_choice: None,
+                json_schema: None,
+                grammar: None,
+                reasoning_format: None,
+                chat_template_kwargs: None,
+                add_generation_prompt: true,
+                use_jinja: true,
+                parallel_tool_calls: false,
+                enable_thinking: false,
+                add_bos: false,
+                add_eos: false,
+                parse_tool_calls: true,
+            };
+            let r = model
+                .apply_chat_template_oaicompat(template, &params)
+                .expect("apply template");
+            model
+                .str_to_token(&r.prompt, llama_cpp_2::model::AddBos::Always)
+                .expect("tokenize")
+        };
+
+        let a = render(&toolset(&[1, 2, 3, 4, 5, 6, 7, 8]));
+        let same = render(&toolset(&[1, 2, 3, 4, 5, 6, 7, 8]));
+        let differs = render(&toolset(&[1, 2, 3, 4, 9, 10, 11, 12]));
+        // Same eight-vs-eight difference, but the shared tools are listed FIRST.
+        // Order is GIAP's to choose: it builds the tools JSON the template
+        // renders, and the always-on extensions are known.
+        let differs_late = render(&toolset(&[1, 2, 3, 4, 5, 6, 9, 10]));
+
+        let identical = common_prefix_len(&a, &same);
+        let overlapping = common_prefix_len(&a, &differs);
+        eprintln!("prompt tokens                : {}", a.len());
+        eprintln!(
+            "shared, SAME tool set        : {identical} ({:.0}%)",
+            100.0 * identical as f64 / a.len() as f64
+        );
+        eprintln!(
+            "shared, DIFFERENT tool set   : {overlapping} ({:.0}%)",
+            100.0 * overlapping as f64 / a.len() as f64
+        );
+        let late = common_prefix_len(&a, &differs_late);
+        eprintln!(
+            "shared, DIFFERING TOOLS LAST : {late} ({:.0}%)",
+            100.0 * late as f64 / a.len() as f64
+        );
+        eprintln!("snapshot threshold           : {}", 1024);
+
+        assert_eq!(
+            identical,
+            a.len(),
+            "two chats with the same tools must share everything -- if not, something in the \
+             preamble varies that the cache can never capture"
+        );
+        assert!(
+            overlapping < identical,
+            "a differing tool set has to diverge somewhere, or this measurement is not \
+             measuring what it claims"
+        );
+        assert!(
+            late > overlapping,
+            "putting the tools two chats SHARE before the ones they do not must lengthen the \
+             cacheable run -- this is the lever that makes a disk cache work under \
+             tool_selection_mode = relevant, where 30 distinct tool sets across 84 sessions \
+             otherwise leave almost nothing in common"
+        );
+    }
+
     /// The process's one llama.cpp backend.
     ///
     /// `LlamaCppBackend::new()` treats a second initialisation as `unreachable!`
