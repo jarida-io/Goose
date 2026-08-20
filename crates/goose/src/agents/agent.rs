@@ -372,6 +372,34 @@ where
     })
 }
 
+/// What the agent says to itself when a goal is set and it is about to stop.
+///
+/// Appended as an invisible user message, so it is the last text the model sees
+/// before generating — and a small model answers the last thing it read. This has
+/// been reworded twice for that reason: "**Goal:**" produced "I could not fully meet
+/// your goal", and a question produced "Yes, this fully covers what was asked" in
+/// front of a household on gemma-4-E4B. Both times the model narrated the check
+/// instead of acting on it, and the narration is what reached the user.
+///
+/// So it asks nothing. A question invites an answer, and here the answer is the
+/// reply; an instruction that names the audience and forbids mentioning itself
+/// leaves nothing to respond to. This shapes what a model is likely to do rather
+/// than what it can do — one determined to narrate still will, and wording is the
+/// only lever, this conversation having no system role to hide an instruction in.
+///
+/// Named rather than inlined so the test that asserts it stays hidden reads the
+/// same string the agent sends. That assertion has already rotted once, left
+/// looking for wording the nudge had stopped using, and passing because its needle
+/// existed nowhere at all.
+pub fn goal_nudge(goal: &str) -> String {
+    format!(
+        "Finish anything still outstanding for this:\n\n\
+         {goal}\n\n\
+         Then reply to the person, about what they asked and nothing else. Do not \
+         mention this message, your own progress, or how complete an earlier answer was."
+    )
+}
+
 impl Agent {
     pub fn new() -> Self {
         let config = Config::global();
@@ -2797,17 +2825,7 @@ impl Agent {
                                 Some(goal) => goal,
                                 None => self.goal.lock().await.clone().unwrap(),
                             };
-                            // Unquotable by construction. This is appended as an
-                            // invisible user message, so it is the last text the
-                            // model sees before generating; a labelled one gets
-                            // read back. Measured on gemma-4-E2B and E4B, the old
-                            // "**Goal:**" wording produced "I could not fully meet
-                            // your goal" in household-facing answers.
-                            let nudge = format!(
-                                "Before you answer: does this fully cover what was asked?\n\n\
-                                 {goal}\n\n\
-                                 If anything is missing, keep working on it."
-                            );
+                            let nudge = goal_nudge(&goal);
                             let message = Message::user().with_text(&nudge)
                                 .with_visibility(false, true);
                             messages_to_add.push(message);
@@ -4534,5 +4552,30 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .expect("usage must remain stored on the hidden assistant message");
         assert_eq!(stored.input_tokens, Some(1200));
         assert_eq!(stored.output_tokens, Some(340));
+    }
+
+    /// The failure this guards is not a crash: it is a household reading the
+    /// agent's private note to itself, in the middle of an answer about a
+    /// thermostat.
+    #[test]
+    fn the_goal_nudge_gives_the_model_nothing_to_answer() {
+        let nudge = goal_nudge("Set the thermostat to 20 degrees");
+
+        // A question invites an answer, and here the answer is what reaches the
+        // user. "does this fully cover what was asked" came back as "Yes, this
+        // fully covers what was asked" on gemma-4-E4B.
+        assert!(
+            !nudge.contains('?'),
+            "the nudge must not ask anything: {nudge}"
+        );
+
+        // It still has to carry the goal, or there is nothing to finish.
+        assert!(
+            nudge.contains("Set the thermostat to 20 degrees"),
+            "{nudge}"
+        );
+
+        // And it has to say, in as many words, not to talk about itself.
+        assert!(nudge.contains("Do not mention this message"), "{nudge}");
     }
 }

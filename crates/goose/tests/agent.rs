@@ -2276,16 +2276,15 @@ mod tests {
 
             // The nudge should NOT appear in yielded events (it's internal).
             //
-            // Anchored on the CURRENT wording. It used to look for "check whether
-            // the following goal", which the nudge stopped saying when it was
-            // reworded to be unquotable — leaving an assertion that passed
-            // because its needle had ceased to exist anywhere.
+            // Anchored on the string the agent actually sends rather than a copy of
+            // its wording. The copy rotted once already: it looked for "check
+            // whether the following goal" long after the nudge stopped saying it,
+            // so the assertion passed because its needle existed nowhere at all.
+            let nudge = goose::agents::goal_nudge("");
+            let opening = nudge.lines().next().expect("the nudge opens with a line");
             let nudge_messages: Vec<_> = messages
                 .iter()
-                .filter(|m| {
-                    m.as_concat_text()
-                        .contains("does this fully cover what was asked")
-                })
+                .filter(|m| m.as_concat_text().contains(opening))
                 .collect();
             assert!(
                 nudge_messages.is_empty(),
