@@ -78,6 +78,21 @@ pub struct ModelSettings {
     #[serde(default)]
     pub presence_penalty: f32,
     pub n_batch: Option<u32>,
+    /// Physical batch size (llama.cpp `n_ubatch`). Distinct from `n_batch`: it
+    /// sizes the compute buffer, which at ctx 16384 is the second-largest
+    /// allocation after the weights. Measured on Orin Nano sm_87 with gemma-4
+    /// E4B: 522 MiB at the 512 default, 129 MiB at 128, with no loss in decode
+    /// throughput. `None` leaves llama.cpp's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ubatch: Option<u32>,
+    /// KV cache element type for K, as a ggml type name (e.g. `"q8_0"`).
+    /// `None` leaves f16. Quantising V additionally REQUIRES flash attention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_k: Option<String>,
+    /// KV cache element type for V. See [`ModelSettings::type_k`]. Setting this
+    /// without `flash_attention` is rejected by llama.cpp at context creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_v: Option<String>,
     pub n_gpu_layers: Option<u32>,
     #[serde(default)]
     pub use_mlock: bool,
@@ -131,6 +146,9 @@ impl Default for ModelSettings {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             n_batch: None,
+            n_ubatch: None,
+            type_k: None,
+            type_v: None,
             n_gpu_layers: None,
             use_mlock: false,
             flash_attention: None,

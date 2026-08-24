@@ -3,7 +3,7 @@ use crate::local_model_registry::ModelSettings;
 use crate::multimodal::ExtractedImage;
 use goose_provider_types::errors::ProviderError;
 use goose_provider_types::request_log::{LoggerHandleExt, RequestLogHandle};
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, ChatTemplateResult, LlamaChatTemplate, LlamaModel};
@@ -684,8 +684,54 @@ pub(super) fn build_context_params(
         let policy = if flash_attn { 1 } else { 0 };
         params = params.with_flash_attention_policy(policy);
     }
+    if let Some(n_ubatch) = settings.n_ubatch {
+        params = params.with_n_ubatch(n_ubatch);
+    }
+    if let Some(name) = settings.type_k.as_deref() {
+        match parse_kv_cache_type(name) {
+            Some(t) => params = params.with_type_k(t),
+            None => tracing::warn!("Unknown type_k '{}'; leaving KV K at f16", name),
+        }
+    }
+    if let Some(name) = settings.type_v.as_deref() {
+        // llama.cpp rejects a quantised V cache without flash attention. Refuse
+        // here with a reason rather than letting context creation fail opaquely.
+        if settings.flash_attention != Some(true) {
+            tracing::warn!(
+                "type_v '{}' ignored: quantising the V cache requires flash_attention = true",
+                name
+            );
+        } else {
+            match parse_kv_cache_type(name) {
+                Some(t) => params = params.with_type_v(t),
+                None => tracing::warn!("Unknown type_v '{}'; leaving KV V at f16", name),
+            }
+        }
+    }
 
     params
+}
+
+/// Map a ggml type name onto [`KvCacheType`].
+///
+/// Only the types that are sane for a KV cache are accepted; `q8_0` is the one
+/// measured to be quality-neutral on gemma-4 (paired per-chunk wikitext-2,
+/// n = 100: dNLL -0.000987 +/- 0.000551, t = -1.79, i.e. indistinguishable from
+/// f16, and byte-identical greedy output). `q4_0` measured t = 0.35 on the mean
+/// but with 6.4x the per-chunk variance, so it is available and not recommended.
+fn parse_kv_cache_type(name: &str) -> Option<KvCacheType> {
+    match name.to_ascii_lowercase().as_str() {
+        "f32" => Some(KvCacheType::F32),
+        "f16" => Some(KvCacheType::F16),
+        "bf16" => Some(KvCacheType::BF16),
+        "q8_0" => Some(KvCacheType::Q8_0),
+        "q5_1" => Some(KvCacheType::Q5_1),
+        "q5_0" => Some(KvCacheType::Q5_0),
+        "q4_1" => Some(KvCacheType::Q4_1),
+        "q4_0" => Some(KvCacheType::Q4_0),
+        "iq4_nl" => Some(KvCacheType::IQ4_NL),
+        _ => None,
+    }
 }
 
 pub(super) fn build_sampler(settings: &crate::local_model_registry::ModelSettings) -> LlamaSampler {

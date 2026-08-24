@@ -1858,6 +1858,12 @@ pub struct LocalInferenceModelSettingsDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_batch: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ubatch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_k: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_v: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_gpu_layers: Option<u32>,
     pub use_mlock: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
