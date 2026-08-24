@@ -925,13 +925,26 @@ impl Agent {
             }
         }
 
+        // Reached only when the session row carries no model_config. Both messages
+        // name the session and the keys that were consulted: the bare
+        // "missing provider" said neither, so an embedder whose own provider wiring
+        // had silently not run got an engine-internal string about model config and
+        // no way to tell which session, or which knob, was at fault.
         let config = Config::global();
-        let provider_name = config
-            .get_goose_provider()
-            .map_err(|_| anyhow!("Could not resolve model config: missing provider"))?;
-        let model_name = config
-            .get_goose_model()
-            .map_err(|_| anyhow!("Could not resolve model config: missing model"))?;
+        let provider_name = config.get_goose_provider().map_err(|_| {
+            anyhow!(
+                "Could not resolve model config for session '{session_id}': it has no \
+                 stored provider, and no global one is set either (GOOSE_PROVIDER, or \
+                 `active_provider` in the goose config)"
+            )
+        })?;
+        let model_name = config.get_goose_model().map_err(|_| {
+            anyhow!(
+                "Could not resolve model config for session '{session_id}': provider \
+                 '{provider_name}' resolved but no model is set (GOOSE_MODEL, or \
+                 `GOOSE_MODEL` in the goose config)"
+            )
+        })?;
         crate::model_config::model_config_from_user_config(&provider_name, &model_name)
             .map_err(|e| anyhow!("Could not resolve model config: {e}"))
     }
