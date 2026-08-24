@@ -38,6 +38,13 @@ const CODE_EXECUTION_TOOL: &str = "code_execution__execute_typescript";
 const HOLD_BACK_CODE_MODE: usize = " ```execute_typescript\n".len();
 const HOLD_BACK_SHELL_ONLY: usize = "\n$".len();
 
+/// A coding-agent preamble for a model with no system prompt of its own.
+///
+/// No longer used by the emulated-tools path, which now appends the tool
+/// protocol to the CALLER's system prompt instead of replacing it -- see the
+/// note at the `use_emulator` branch in `llamacpp/mod.rs`. Kept because it is
+/// the right starting point for a caller that has nothing better to send.
+#[allow(dead_code)]
 pub(super) fn load_tiny_model_prompt() -> String {
     use std::env;
 

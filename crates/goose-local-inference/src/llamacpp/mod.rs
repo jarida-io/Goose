@@ -16,7 +16,7 @@ use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::{list_llama_ggml_backend_devices, LlamaBackendDeviceType, LogOptions};
 
 use self::inference_emulated_tools::{
-    build_emulator_tool_description, generate_with_emulated_tools, load_tiny_model_prompt,
+    build_emulator_tool_description, generate_with_emulated_tools,
 };
 use self::inference_engine::{GenerationContext, LoadedChatTemplates, LoadedModel};
 use self::inference_native_tools::generate_with_native_tools;
@@ -543,7 +543,28 @@ impl LocalInferenceBackend for LlamaCppBackend {
         let use_emulator = !native_tool_calling && !request.tools.is_empty();
         let system_prompt = if use_emulator {
             let tool_desc = build_emulator_tool_description(request.tools, code_mode_enabled);
-            format!("{}{}", load_tiny_model_prompt(), tool_desc)
+            // APPEND the emulator protocol to the caller's system prompt rather
+            // than replacing it.
+            //
+            // This read `load_tiny_model_prompt()` in place of `request.system`,
+            // which threw the caller's entire system prompt away the moment a
+            // model needed emulated tools -- and substituted a coding-agent
+            // preamble describing the host OS, working directory and shell.
+            //
+            // For an embedder that is a silent identity swap it cannot see or
+            // prevent. GIAP builds its system prompt centrally and enforces it
+            // at `Provider::stream`, which is upstream of here, so persona,
+            // injected memories and the turn budget all survived the boundary
+            // that is supposed to guarantee them and were then discarded inside
+            // the engine. The effect is worst for exactly the models that reach
+            // this path: one whose chat template takes no `tools` variable has
+            // no other way to be given tools, so it is emulated or nothing.
+            //
+            // The emulator's own instructions are in `tool_desc`, so appending
+            // keeps the protocol while leaving authorship of the prompt with
+            // the caller. A caller that genuinely wants the tiny-model preamble
+            // can put it in `request.system` itself.
+            format!("{}{}", request.system, tool_desc)
         } else {
             request.system.to_string()
         };
