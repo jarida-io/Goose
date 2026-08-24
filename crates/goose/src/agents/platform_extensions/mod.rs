@@ -226,13 +226,24 @@ impl PlatformExtensionContext {
             }
         }
 
+        // Same wording as `Agent::model_config_for_session`, deliberately: this is the
+        // tool-call side of the identical fallback, and two spellings of one failure
+        // read as two different faults.
         let config = crate::config::Config::global();
-        let provider_name = config
-            .get_goose_provider()
-            .map_err(|_| "Could not resolve model config: missing provider".to_string())?;
-        let model_name = config
-            .get_goose_model()
-            .map_err(|_| "Could not resolve model config: missing model".to_string())?;
+        let provider_name = config.get_goose_provider().map_err(|_| {
+            format!(
+                "Could not resolve model config for session '{session_id}': it has no \
+                 stored provider, and no global one is set either (GOOSE_PROVIDER, or \
+                 `active_provider` in the goose config)"
+            )
+        })?;
+        let model_name = config.get_goose_model().map_err(|_| {
+            format!(
+                "Could not resolve model config for session '{session_id}': provider \
+                 '{provider_name}' resolved but no model is set (GOOSE_MODEL, or \
+                 `GOOSE_MODEL` in the goose config)"
+            )
+        })?;
         crate::model_config::model_config_from_user_config(&provider_name, &model_name)
             .map_err(|e| format!("Could not resolve model config: {e}"))
     }
