@@ -1056,7 +1056,26 @@ impl ExtensionManager {
                     } else {
                         let (server_read, client_write) = tokio::io::duplex(65536);
                         let (client_read, server_write) = tokio::io::duplex(65536);
-                        extension_fn(server_read, server_write);
+                        // A spawn fn that panics must cost exactly its own
+                        // extension. Un-caught, the unwind tears down this
+                        // loading future while sibling builtins are mid
+                        // initialize — their duplex peers drop and every one
+                        // reports broken-pipe/Closed (observed 2026-08-27:
+                        // one uninitialised OnceLock in giap-context killed
+                        // all fourteen builtin servers for the process).
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            extension_fn(server_read, server_write);
+                        }))
+                        .map_err(|panic| {
+                            let msg = panic
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "non-string panic payload".to_string());
+                            ExtensionError::ConfigError(format!(
+                                "builtin extension '{name}' panicked during startup: {msg}"
+                            ))
+                        })?;
 
                         Box::new(
                             McpClient::connect(
