@@ -309,16 +309,6 @@ pub(crate) struct ResolvedModelPaths {
     pub draft_model_path: Option<PathBuf>,
 }
 
-fn resolve_model_local_path(model_id: &str) -> Option<PathBuf> {
-    use crate::local_model_registry::get_registry;
-
-    get_registry()
-        .lock()
-        .ok()?
-        .get_model(model_id)
-        .map(|entry| entry.local_path.clone())
-}
-
 /// Resolve model path, context limit, settings, and mmproj path for a model ID from the registry.
 fn resolve_model_path(model_id: &str) -> Option<ResolvedModelPaths> {
     use crate::local_model_registry::{default_settings_for_model, get_registry};
@@ -344,7 +334,19 @@ fn resolve_model_path(model_id: &str) -> Option<ResolvedModelPaths> {
                         .flatten()
                 })
                 .filter(|draft_model| draft_model != model_id);
-            let draft_model_path = draft_model.as_deref().and_then(resolve_model_local_path);
+            // Looked up through the guard we already hold. Going back through a
+            // helper that took `get_registry().lock()` itself deadlocked the
+            // process on the spot: std's Mutex is not reentrant, and this
+            // function is still holding `registry` for `entry` below. It only
+            // fired when a drafter was configured -- the `None` case never calls
+            // the closure -- so the plain path, every unit test that builds a
+            // context directly, and the whole llama-server bake-off all missed
+            // it, and the symptom was a server pinned at 0.1% CPU with no model
+            // loaded rather than anything resembling an error.
+            let draft_model_path = draft_model
+                .as_deref()
+                .and_then(|id| registry.get_model(id))
+                .map(|entry| entry.local_path.clone());
             return Some(ResolvedModelPaths {
                 model_path: entry.local_path.clone(),
                 context_limit: ctx,
