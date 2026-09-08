@@ -56,17 +56,18 @@ pub(super) fn generate_with_native_tools(
 
     let mut decoded_tokens: Vec<llama_cpp_2::token::LlamaToken> = Vec::new();
     let llama_ctx = match transient_session.as_mut() {
-        Some(kv) => kv.context_mut(),
+        Some(kv) => kv.session_ctx_mut(),
         None => ctx
             .session
             .as_mut()
             .expect("prepare_generation retains a generation context")
-            .context_mut(),
+            .session_ctx_mut(),
     };
     let output_token_count = generation_loop(
         ctx.model,
         llama_ctx,
         ctx.settings,
+        &prepared.prompt_tokens,
         prompt_token_count,
         effective_ctx,
         &mut decoded_tokens,

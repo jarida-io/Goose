@@ -1,6 +1,7 @@
 mod inference_emulated_tools;
 mod inference_engine;
 mod inference_native_tools;
+pub(super) mod mtp;
 mod prompt_snapshot;
 
 use std::any::Any;

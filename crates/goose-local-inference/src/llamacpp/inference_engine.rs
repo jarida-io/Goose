@@ -222,10 +222,48 @@ impl MediaHead {
 /// the cache. The cache may hold further positions beyond the recorded ones;
 /// every reuse path removes everything from its resume position onwards, so
 /// unrecorded trailing positions can never be attended to.
+/// Either a bare context, or a speculative wrapper that has TAKEN it.
+///
+/// `MtpSpeculative::new` consumes both the target and draft contexts by value, so
+/// a session that speculates cannot also hold its context directly. Everything
+/// that used `kv.ctx` reaches the same context through [`SessionCtx::ctx_mut`],
+/// which keeps `reuse_prefix`, the snapshot ladder and `clear_kv_cache_seq`
+/// working unchanged -- the prompt-session cache is worth more than speculation
+/// and must not be traded for it.
+pub(super) enum SessionCtx {
+    /// No drafter configured.
+    Plain(LlamaContext<'static>),
+    /// Drafter attached; the target context lives inside.
+    Mtp(Box<crate::llamacpp::mtp::MtpSession>),
+}
+
+impl SessionCtx {
+    pub(super) fn ctx(&self) -> &LlamaContext<'static> {
+        match self {
+            Self::Plain(c) => c,
+            Self::Mtp(m) => m.target(),
+        }
+    }
+
+    pub(super) fn ctx_mut(&mut self) -> &mut LlamaContext<'static> {
+        match self {
+            Self::Plain(c) => c,
+            Self::Mtp(m) => m.target_mut(),
+        }
+    }
+
+    pub(super) fn mtp_mut(&mut self) -> Option<&mut crate::llamacpp::mtp::MtpSession> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Mtp(m) => Some(m),
+        }
+    }
+}
+
 pub(super) struct SessionKv {
     /// Declared before `_model`: fields drop in declaration order, so the
     /// context is destroyed before the model allocation it points into.
-    ctx: LlamaContext<'static>,
+    ctx: SessionCtx,
     head: Option<MediaHead>,
     tokens: Vec<LlamaToken>,
     /// The `n_ctx` this context was *requested* with. Compared against the
@@ -269,7 +307,7 @@ impl SessionKv {
         let ctx = unsafe { std::mem::transmute::<LlamaContext<'_>, LlamaContext<'static>>(ctx) };
 
         Ok(Self {
-            ctx,
+            ctx: SessionCtx::Plain(ctx),
             head: None,
             tokens: Vec::new(),
             n_ctx,
@@ -278,7 +316,24 @@ impl SessionKv {
     }
 
     pub(super) fn context_mut(&mut self) -> &mut LlamaContext<'static> {
+        self.ctx.ctx_mut()
+    }
+
+    /// The context AND whatever drafter is attached to it.
+    pub(super) fn session_ctx_mut(&mut self) -> &mut SessionCtx {
         &mut self.ctx
+    }
+
+    /// Point the drafter at the prompt the target was just prefilled with.
+    ///
+    /// Called after every prefill path, `ReusePrefix` included: the drafter
+    /// keeps its own position, and a resume that skips this leaves it drafting
+    /// against a prompt the target has moved past.
+    pub(super) fn mtp_begin(&mut self, prompt: &[LlamaToken]) -> Result<(), ProviderError> {
+        match self.ctx.mtp_mut() {
+            Some(m) => m.begin(prompt),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn record_generated(&mut self, tokens: &[LlamaToken]) {
@@ -303,6 +358,9 @@ fn retained_kv_tokens(session: &Option<SessionKv>) -> usize {
 
 pub(super) struct PreparedGeneration {
     pub template_result: ChatTemplateResult,
+    /// The prompt as tokens. Carried because a speculative draft call is given
+    /// the whole sequence the target stands on, not just its length.
+    pub prompt_tokens: Vec<LlamaToken>,
     pub prompt_token_count: usize,
     pub effective_ctx: usize,
     /// Wall-clock time for template application + tokenization + prompt
@@ -928,13 +986,14 @@ fn reuse_prefix(
     let kept = kept_prefix_tokens(resume_pos, kv.media_pos(), prompt.len(), kv.tokens.len())
         .ok_or(PrefixReuseError::Refused)?;
     let p0 = u32::try_from(resume_pos).map_err(|_| PrefixReuseError::Refused)?;
-    match kv.ctx.clear_kv_cache_seq(Some(0), Some(p0), None) {
+    match kv.ctx.ctx_mut().clear_kv_cache_seq(Some(0), Some(p0), None) {
         Ok(true) => {}
         Ok(false) | Err(_) => return Err(PrefixReuseError::Refused),
     }
 
     kv.tokens.truncate(kept);
-    decode_tokens(&mut kv.ctx, &prompt[kept..], resume_pos).map_err(PrefixReuseError::Poisoned)?;
+    decode_tokens(kv.ctx.ctx_mut(), &prompt[kept..], resume_pos)
+        .map_err(PrefixReuseError::Poisoned)?;
     kv.tokens.extend_from_slice(&prompt[kept..]);
     Ok(())
 }
@@ -950,7 +1009,7 @@ fn trim_to_prefix(kv: &mut SessionKv, keep: usize) -> Result<(), ()> {
         return Err(());
     }
     let p0 = u32::try_from(keep).map_err(|_| ())?;
-    match kv.ctx.clear_kv_cache_seq(Some(0), Some(p0), None) {
+    match kv.ctx.ctx_mut().clear_kv_cache_seq(Some(0), Some(p0), None) {
         Ok(true) => {
             kv.tokens.truncate(keep);
             Ok(())
@@ -986,7 +1045,7 @@ fn seed_from_snapshot(
     };
 
     kv.tokens.extend_from_slice(&prompt[..restored]);
-    match decode_tokens(&mut kv.ctx, &prompt[restored..], restored) {
+    match decode_tokens(kv.ctx.ctx_mut(), &prompt[restored..], restored) {
         Ok(()) => {
             kv.tokens.extend_from_slice(&prompt[restored..]);
             *session = Some(kv);
@@ -1042,8 +1101,8 @@ fn full_prefill(
         .expect("session was just populated or already matched n_ctx");
     kv.head = None;
     kv.tokens.clear();
-    kv.ctx.clear_kv_cache();
-    match decode_tokens(&mut kv.ctx, prompt, 0) {
+    kv.ctx.ctx_mut().clear_kv_cache();
+    match decode_tokens(kv.ctx.ctx_mut(), prompt, 0) {
         Ok(()) => {
             kv.tokens.extend_from_slice(prompt);
             Ok(())
@@ -1116,10 +1175,10 @@ fn write_snapshot_if_due(
     if trim_to_prefix(kv, keep).is_err() {
         return;
     }
-    slot.write(&kv.ctx, &kv.tokens);
+    slot.write(&*kv.ctx.ctx(), &kv.tokens);
 
     // Put the tail back: the turn still has to generate from the whole prompt.
-    match decode_tokens(&mut kv.ctx, &prompt[keep..], keep) {
+    match decode_tokens(kv.ctx.ctx_mut(), &prompt[keep..], keep) {
         Ok(()) => kv.tokens.extend_from_slice(&prompt[keep..]),
         Err(e) => {
             tracing::warn!(
@@ -1287,7 +1346,7 @@ fn sacrificial_prefill(
     n_ctx: u32,
 ) -> Result<SessionKv, ProviderError> {
     let mut kv = SessionKv::create(model, backend, n_ctx, settings)?;
-    decode_tokens(&mut kv.ctx, prompt, 0)?;
+    decode_tokens(kv.ctx.ctx_mut(), prompt, 0)?;
     Ok(kv)
 }
 
@@ -1570,9 +1629,9 @@ fn prefill_multimodal(
     *session = None;
     let mut kv = SessionKv::create(model, backend, n_ctx, settings)?;
 
-    let n_batch = kv.ctx.n_batch() as i32;
+    let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
     let n_past = chunks
-        .eval_chunks(mtmd_ctx, &kv.ctx, 0, 0, n_batch, true)
+        .eval_chunks(mtmd_ctx, &*kv.ctx.ctx(), 0, 0, n_batch, true)
         .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
 
     // Retain the cache only when the chunk list was describable AND the position
@@ -1763,8 +1822,11 @@ pub(super) fn prepare_generation(
         None,
     );
 
-    let (prompt_token_count, prefilled) = if !ctx.images.is_empty() {
-        prefill_multimodal(
+    let (prompt_token_count, prefilled, prompt_tokens) = if !ctx.images.is_empty() {
+        // The multimodal path prefills through mtmd chunks and never produces a
+        // flat token vector, so a speculative draft has nothing to stand on --
+        // which is consistent with the vision request bypassing KV retention too.
+        let (ptc, prefilled) = prefill_multimodal(
             ctx.session,
             ctx.model,
             ctx.mtmd_ctx,
@@ -1773,7 +1835,8 @@ pub(super) fn prepare_generation(
             ctx.images,
             ctx.context_limit,
             ctx.settings,
-        )?
+        )?;
+        (ptc, prefilled, Vec::new())
     } else {
         let tokens = ctx
             .model
@@ -1798,11 +1861,12 @@ pub(super) fn prepare_generation(
             &tokens,
             ectx,
         )?;
-        (ptc, prefilled)
+        (ptc, prefilled, tokens)
     };
 
     Ok(PreparedGeneration {
         template_result,
+        prompt_tokens,
         prompt_token_count,
         effective_ctx: prefilled.effective_ctx,
         prefill_ms: prefill_started.elapsed().as_millis() as u64,
@@ -1828,8 +1892,9 @@ pub(super) enum TokenAction {
 /// therefore absent from `decoded`.
 pub(super) fn generation_loop(
     model: &LlamaModel,
-    ctx: &mut LlamaContext<'_>,
+    ctx: &mut SessionCtx,
     settings: &crate::local_model_registry::ModelSettings,
+    prompt_tokens: &[LlamaToken],
     prompt_token_count: usize,
     effective_ctx: usize,
     decoded: &mut Vec<LlamaToken>,
@@ -1849,8 +1914,12 @@ pub(super) fn generation_loop(
     let mut output_token_count: i32 = 0;
     let mut exhausted_loop = true;
 
-    for _ in 0..max_output {
-        let token = sampler.sample(ctx, -1);
+    // Whole token sequence the target stands on: the drafter is given this on
+    // every draft call, exactly as llama.cpp's server passes its slot's tokens.
+    let mut sequence: Vec<LlamaToken> = prompt_tokens.to_vec();
+
+    'outer: while (output_token_count as usize) < max_output {
+        let token = sampler.sample(ctx.ctx_mut(), -1);
         sampler.accept(token);
 
         if model.is_eog_token(token) {
@@ -1869,12 +1938,49 @@ pub(super) fn generation_loop(
             break;
         }
 
+        decoded.push(token);
+        sequence.push(token);
+
+        if ctx.mtp_mut().is_some() {
+            // Speculative step. `speculate` returns ONLY tokens the target
+            // endorsed and has already rolled any rejected draft back out of
+            // the KV cache, so `decoded` stays a faithful record of what the
+            // model actually produced.
+            let n_past = (sequence.len() - 1) as i32;
+            let step = {
+                let mtp = ctx.mtp_mut().expect("checked above");
+                super::mtp::speculate(mtp, model, &mut sampler, n_past, token, &sequence)?
+            };
+            for extra in step.tokens {
+                if (output_token_count as usize) >= max_output {
+                    break 'outer;
+                }
+                output_token_count += 1;
+                let piece = model
+                    .token_to_piece(extra, &mut decoder, true, None)
+                    .map_err(|e| {
+                        ProviderError::ExecutionError(format!("Failed to decode token: {}", e))
+                    })?;
+                if !piece.is_empty() && matches!(on_piece(&piece)?, TokenAction::Stop) {
+                    exhausted_loop = false;
+                    break 'outer;
+                }
+                decoded.push(extra);
+                sequence.push(extra);
+            }
+            if step.hit_eog {
+                exhausted_loop = false;
+                break;
+            }
+            continue;
+        }
+
         let next_tokens = [token];
         let mut next_batch = LlamaBatch::get_one(&next_tokens)
             .map_err(|e| ProviderError::ExecutionError(format!("Failed to create batch: {}", e)))?;
-        ctx.decode(&mut next_batch)
+        ctx.ctx_mut()
+            .decode(&mut next_batch)
             .map_err(|e| ProviderError::ExecutionError(format!("Decode failed: {}", e)))?;
-        decoded.push(token);
     }
 
     if exhausted_loop && hit_context_limit {
@@ -2119,10 +2225,13 @@ mod tests {
         // 1. Write a snapshot from a cache holding exactly the preamble.
         {
             let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
-            decode_tokens(&mut kv.ctx, &prefix, 0).expect("prefill preamble");
+            decode_tokens(kv.ctx.ctx_mut(), &prefix, 0).expect("prefill preamble");
             kv.tokens.extend_from_slice(&prefix);
             let t = std::time::Instant::now();
-            assert!(slot.write(&kv.ctx, &kv.tokens), "snapshot must be written");
+            assert!(
+                slot.write(&*kv.ctx.ctx(), &kv.tokens),
+                "snapshot must be written"
+            );
             eprintln!(
                 "SAVE  {} tokens in {} ms",
                 kv.tokens.len(),
@@ -2159,13 +2268,13 @@ mod tests {
             // any fixed non-zero index would be right for one and a panic for
             // the other.
             let last = prompt.len() - 1;
-            decode_tokens(&mut kv.ctx, &prompt[n..last], n).expect("decode tail");
-            decode_tokens(&mut kv.ctx, &prompt[last..], last).expect("decode final token");
+            decode_tokens(kv.ctx.ctx_mut(), &prompt[n..last], n).expect("decode tail");
+            decode_tokens(kv.ctx.ctx_mut(), &prompt[last..], last).expect("decode final token");
             eprintln!(
                 "restore + tail decode: {} ms",
                 started.elapsed().as_millis()
             );
-            kv.ctx.get_logits_ith(0).to_vec()
+            kv.ctx.ctx_mut().get_logits_ith(0).to_vec()
         };
 
         // 3. The control: the same prompt, decoded from nothing.
@@ -2173,13 +2282,13 @@ mod tests {
             let started = std::time::Instant::now();
             let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let last = prompt.len() - 1;
-            decode_tokens(&mut kv.ctx, &prompt[..last], 0).expect("full prefill");
-            decode_tokens(&mut kv.ctx, &prompt[last..], last).expect("decode final token");
+            decode_tokens(kv.ctx.ctx_mut(), &prompt[..last], 0).expect("full prefill");
+            decode_tokens(kv.ctx.ctx_mut(), &prompt[last..], last).expect("decode final token");
             eprintln!(
                 "full prefill:          {} ms",
                 started.elapsed().as_millis()
             );
-            kv.ctx.get_logits_ith(0).to_vec()
+            kv.ctx.ctx_mut().get_logits_ith(0).to_vec()
         };
 
         assert_eq!(
@@ -2242,10 +2351,11 @@ mod tests {
         let control = {
             let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let last = prompt.len() - 1;
-            decode_tokens(&mut kv.ctx, &prefix, 0).expect("prefix");
-            decode_tokens(&mut kv.ctx, &prompt[prefix.len()..last], prefix.len()).expect("tail");
-            decode_tokens(&mut kv.ctx, &prompt[last..], last).expect("final");
-            kv.ctx.get_logits_ith(0).to_vec()
+            decode_tokens(kv.ctx.ctx_mut(), &prefix, 0).expect("prefix");
+            decode_tokens(kv.ctx.ctx_mut(), &prompt[prefix.len()..last], prefix.len())
+                .expect("tail");
+            decode_tokens(kv.ctx.ctx_mut(), &prompt[last..], last).expect("final");
+            kv.ctx.ctx_mut().get_logits_ith(0).to_vec()
         };
 
         let spread = |a: &[f32], b: &[f32]| {
