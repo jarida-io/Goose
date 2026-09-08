@@ -292,7 +292,7 @@ pub(super) struct SessionKv {
 unsafe impl Send for SessionKv {}
 
 impl SessionKv {
-    fn create(
+    pub(super) fn create(
         model: &Arc<LlamaModel>,
         draft: Option<&Arc<LlamaModel>>,
         backend: &LlamaCppBackend,
@@ -322,10 +322,18 @@ impl SessionKv {
         let (ctx, draft_model) = match draft {
             Some(draft_model) => {
                 let draft_model = Arc::clone(draft_model);
+                // The draft context MUST reference the target's via llama.cpp's
+                // `ctx_other`. Gemma4Assistant refuses to build without it --
+                // "requires ctx_other to be set" -- and it is also how the KV is
+                // shared: `is_mem_shared = llama_get_ctx_other(ctx_dft) ==
+                // ctx_tgt`, which is why the whole configuration measured +48 MB
+                // on the Orin rather than a second full cache. Building it as a
+                // plain context returns a null and fails the load.
                 let dctx = draft_model
-                    .new_context(
+                    .new_context_with_ctx_other(
                         backend.llama_backend(),
                         build_context_params(n_ctx, settings),
+                        &ctx,
                     )
                     .map_err(|e| {
                         ProviderError::ExecutionError(format!(
@@ -337,6 +345,13 @@ impl SessionKv {
                 // same struct dropped after `ctx` by declaration order.
                 let dctx =
                     unsafe { std::mem::transmute::<LlamaContext<'_>, LlamaContext<'static>>(dctx) };
+                // Depth 4 because that is what the Orin bake-off measured:
+                // 2.8x at 87% acceptance. Do not raise it on the strength of a
+                // Mac run -- ggml-metal switches from mat-vec to GEMM only above
+                // a batch of 8, so on Metal depth 4 lands in the one place
+                // batching does not amortise and depth 8 looks better. That is a
+                // property of the backend, not of the drafter, and the device
+                // this ships on does not share it.
                 let session = super::mtp::MtpSession::new(
                     ctx,
                     dctx,
@@ -365,18 +380,6 @@ impl SessionKv {
     /// The context AND whatever drafter is attached to it.
     pub(super) fn session_ctx_mut(&mut self) -> &mut SessionCtx {
         &mut self.ctx
-    }
-
-    /// Point the drafter at the prompt the target was just prefilled with.
-    ///
-    /// Called after every prefill path, `ReusePrefix` included: the drafter
-    /// keeps its own position, and a resume that skips this leaves it drafting
-    /// against a prompt the target has moved past.
-    pub(super) fn mtp_begin(&mut self, prompt: &[LlamaToken]) -> Result<(), ProviderError> {
-        match self.ctx.mtp_mut() {
-            Some(m) => m.begin(prompt),
-            None => Ok(()),
-        }
     }
 
     pub(super) fn record_generated(&mut self, tokens: &[LlamaToken]) {
@@ -1067,6 +1070,9 @@ fn trim_to_prefix(kv: &mut SessionKv, keep: usize) -> Result<(), ()> {
 /// positions restored rather than decoded. `Ok(None)` means the context is
 /// fresh and empty and the caller should prefill it as usual -- the context is
 /// left in `session` either way, so no allocation is wasted.
+// Eight because a drafter has to be threaded through beside the model it
+// drafts for; bundling them would only move the same list behind a name.
+#[allow(clippy::too_many_arguments)]
 fn seed_from_snapshot(
     session: &mut Option<SessionKv>,
     draft: Option<&Arc<LlamaModel>>,
@@ -1220,7 +1226,7 @@ fn write_snapshot_if_due(
     if trim_to_prefix(kv, keep).is_err() {
         return;
     }
-    slot.write(&*kv.ctx.ctx(), &kv.tokens);
+    slot.write(kv.ctx.ctx(), &kv.tokens);
 
     // Put the tail back: the turn still has to generate from the whole prompt.
     match decode_tokens(kv.ctx.ctx_mut(), &prompt[keep..], keep) {
@@ -1681,7 +1687,7 @@ fn prefill_multimodal(
 
     let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
     let n_past = chunks
-        .eval_chunks(mtmd_ctx, &*kv.ctx.ctx(), 0, 0, n_batch, true)
+        .eval_chunks(mtmd_ctx, kv.ctx.ctx(), 0, 0, n_batch, true)
         .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
 
     // Retain the cache only when the chunk list was describable AND the position
@@ -1942,6 +1948,10 @@ pub(super) enum TokenAction {
 /// can extend a retained token sequence with exactly what the cache now holds.
 /// The token a stop condition fires on is sampled but never decoded, and is
 /// therefore absent from `decoded`.
+// `prompt_tokens` and `prompt_token_count` look redundant and are not: the
+// count includes media chunks, while the token vector is text only, which is
+// what the drafter has to be seeded with.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn generation_loop(
     model: &LlamaModel,
     ctx: &mut SessionCtx,
@@ -1981,60 +1991,65 @@ pub(super) fn generation_loop(
         mtp.begin(prompt_tokens)?;
     }
 
-    'outer: while (output_token_count as usize) < max_output {
-        let token = sampler.sample(ctx.ctx_mut(), -1);
-        sampler.accept(token);
+    // `pending` is always UNDECODED on entry to an iteration; whichever path
+    // runs is responsible for decoding it.
+    let mut pending = Some(sampler.sample(ctx.ctx_mut(), -1));
+    sampler.accept(pending.expect("just sampled"));
 
+    while (output_token_count as usize) < max_output {
+        let Some(token) = pending else {
+            exhausted_loop = false;
+            break;
+        };
         if model.is_eog_token(token) {
             exhausted_loop = false;
             break;
         }
 
-        output_token_count += 1;
+        let mut emit = |tok: LlamaToken,
+                        decoder: &mut encoding_rs::Decoder,
+                        count: &mut i32|
+         -> Result<bool, ProviderError> {
+            *count += 1;
+            let piece = model
+                .token_to_piece(tok, decoder, true, None)
+                .map_err(|e| {
+                    ProviderError::ExecutionError(format!("Failed to decode token: {}", e))
+                })?;
+            Ok(!piece.is_empty() && matches!(on_piece(&piece)?, TokenAction::Stop))
+        };
 
-        let piece = model
-            .token_to_piece(token, &mut decoder, true, None)
-            .map_err(|e| ProviderError::ExecutionError(format!("Failed to decode token: {}", e)))?;
-
-        if !piece.is_empty() && matches!(on_piece(&piece)?, TokenAction::Stop) {
+        if emit(token, &mut decoder, &mut output_token_count)? {
             exhausted_loop = false;
             break;
         }
-
         decoded.push(token);
         sequence.push(token);
 
         if ctx.mtp_mut().is_some() {
-            // Speculative step. `speculate` returns ONLY tokens the target
-            // endorsed and has already rolled any rejected draft back out of
-            // the KV cache, so `decoded` stays a faithful record of what the
-            // model actually produced.
             let n_past = (sequence.len() - 1) as i32;
             let step = {
                 let mtp = ctx.mtp_mut().expect("checked above");
                 super::mtp::speculate(mtp, model, &mut sampler, n_past, token, &sequence)?
             };
-            for extra in step.tokens {
+            let mut stopped = false;
+            for tok in step.tokens {
                 if (output_token_count as usize) >= max_output {
-                    break 'outer;
+                    stopped = true;
+                    break;
                 }
-                output_token_count += 1;
-                let piece = model
-                    .token_to_piece(extra, &mut decoder, true, None)
-                    .map_err(|e| {
-                        ProviderError::ExecutionError(format!("Failed to decode token: {}", e))
-                    })?;
-                if !piece.is_empty() && matches!(on_piece(&piece)?, TokenAction::Stop) {
+                if emit(tok, &mut decoder, &mut output_token_count)? {
                     exhausted_loop = false;
-                    break 'outer;
+                    stopped = true;
+                    break;
                 }
-                decoded.push(extra);
-                sequence.push(extra);
+                decoded.push(tok);
+                sequence.push(tok);
             }
-            if step.hit_eog {
-                exhausted_loop = false;
+            if stopped {
                 break;
             }
+            pending = step.next;
             continue;
         }
 
@@ -2044,6 +2059,9 @@ pub(super) fn generation_loop(
         ctx.ctx_mut()
             .decode(&mut next_batch)
             .map_err(|e| ProviderError::ExecutionError(format!("Decode failed: {}", e)))?;
+        let t = sampler.sample(ctx.ctx_mut(), -1);
+        sampler.accept(t);
+        pending = Some(t);
     }
 
     if exhausted_loop && hit_context_limit {
@@ -2059,8 +2077,21 @@ pub(super) fn generation_loop(
     Ok(output_token_count)
 }
 
+/// Prefill a session directly, for tests that need a context standing on a
+/// known prompt without the snapshot and plan machinery around it.
 #[cfg(test)]
-mod tests {
+pub(super) fn decode_tokens_for_test(
+    kv: &mut SessionKv,
+    prompt: &[LlamaToken],
+) -> Result<(), ProviderError> {
+    decode_tokens(kv.ctx.ctx_mut(), prompt, 0)?;
+    kv.tokens.clear();
+    kv.tokens.extend_from_slice(prompt);
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) mod tests {
     use super::*;
     use crate::local_model_registry::ModelSettings;
 
@@ -2292,7 +2323,7 @@ mod tests {
             kv.tokens.extend_from_slice(&prefix);
             let t = std::time::Instant::now();
             assert!(
-                slot.write(&*kv.ctx.ctx(), &kv.tokens),
+                slot.write(kv.ctx.ctx(), &kv.tokens),
                 "snapshot must be written"
             );
             eprintln!(
@@ -2880,7 +2911,7 @@ mod tests {
     /// `LlamaCppBackend::new()` treats a second initialisation as `unreachable!`
     /// — correctly, since the runtime holds the only one for the life of the
     /// process — so two live tests each building their own panics the second.
-    fn shared_backend() -> &'static LlamaCppBackend {
+    pub(crate) fn shared_backend() -> &'static LlamaCppBackend {
         static BACKEND: std::sync::OnceLock<LlamaCppBackend> = std::sync::OnceLock::new();
         BACKEND.get_or_init(|| LlamaCppBackend::new().expect("backend"))
     }
