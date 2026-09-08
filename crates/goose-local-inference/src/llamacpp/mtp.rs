@@ -478,6 +478,82 @@ mod tests {
         );
     }
 
+    /// What the drafter's context costs, on top of the target's.
+    ///
+    /// `jetson_context_size` sizes the window from
+    /// `LLM_BUDGET_MB - model_mb - COMPUTE_BUFFER_MB` and knows nothing about a
+    /// second model. This is the number it is missing. Measured as a delta in
+    /// `MemAvailable` because on a Jetson the GPU allocates out of the same
+    /// pool the OS reports, so it is the figure that decides whether the pond
+    /// fits -- `nvidia-smi` is a stub on this part and would report nothing.
+    ///
+    /// Linux only; it skips elsewhere rather than reporting a number that does
+    /// not mean the same thing.
+    #[test]
+    #[ignore = "requires a real target+drafter pair on a Linux host; run with --ignored"]
+    fn drafter_marginal_memory_cost() {
+        let _gpu = exclusive_gpu();
+        let Some(mem_kb) = mem_available_kb() else {
+            eprintln!("skipping: no /proc/meminfo");
+            return;
+        };
+        let _ = mem_kb;
+        let Some((target_src, draft_src)) = live_pair() else {
+            eprintln!("skipping: no target+drafter pair found");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tp = tmp.path().join("t.gguf");
+        let dp = tmp.path().join("d.gguf");
+        std::fs::hard_link(&target_src, &tp).expect("link target");
+        std::fs::hard_link(&draft_src, &dp).expect("link drafter");
+
+        let backend = shared_backend();
+        let params = LlamaModelParams::default().with_n_gpu_layers(99);
+        let load = |p: &std::path::Path| {
+            Arc::new(
+                llama_cpp_2::model::LlamaModel::load_from_file(backend.llama_backend(), p, &params)
+                    .expect("load"),
+            )
+        };
+        let model = load(&tp);
+        let drafter = load(&dp);
+        let settings = greedy(Some(4));
+
+        eprintln!("drafter cost on top of the target, MemAvailable delta:");
+        eprintln!("   n_ctx   target only   + drafter   drafter costs");
+        for n_ctx in [2048u32, 4096, 8192, 16384] {
+            let base = mem_available_kb().unwrap_or(0);
+            let solo = {
+                let kv = SessionKv::create(&model, None, backend, n_ctx, &settings);
+                let used = base.saturating_sub(mem_available_kb().unwrap_or(0));
+                drop(kv);
+                used
+            };
+            let base2 = mem_available_kb().unwrap_or(0);
+            let pair = {
+                let kv = SessionKv::create(&model, Some(&drafter), backend, n_ctx, &settings);
+                let used = base2.saturating_sub(mem_available_kb().unwrap_or(0));
+                drop(kv);
+                used
+            };
+            eprintln!(
+                "  {n_ctx:>6}   {:>9} MB   {:>7} MB   {:>10} MB",
+                solo / 1024,
+                pair / 1024,
+                (pair.saturating_sub(solo)) / 1024
+            );
+        }
+    }
+
+    /// `MemAvailable` in KB, or `None` off Linux.
+    fn mem_available_kb() -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        text.lines()
+            .find_map(|l| l.strip_prefix("MemAvailable:"))
+            .and_then(|v| v.split_whitespace().next()?.parse().ok())
+    }
+
     /// The token IDs must match, not the decoded text.
     ///
     /// Two different token sequences can decode to the same string, and that is
