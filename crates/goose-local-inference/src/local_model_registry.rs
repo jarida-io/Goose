@@ -67,6 +67,14 @@ pub struct ModelSettings {
     pub max_output_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_model: Option<String>,
+    /// Maximum tokens the MTP drafter may propose per step. llama.cpp's own
+    /// default is 3; unsloth documents 4 for the Gemma 4 drafter.
+    #[serde(default)]
+    pub draft_n_max: Option<i32>,
+    /// Minimum draft probability. 0.0 lets the drafter always propose and
+    /// leaves acceptance entirely to the target's verification.
+    #[serde(default)]
+    pub draft_p_min: Option<f32>,
     #[serde(default)]
     pub sampling: SamplingConfig,
     #[serde(default = "default_repeat_penalty")]
@@ -140,6 +148,8 @@ impl Default for ModelSettings {
             context_size: None,
             max_output_tokens: None,
             draft_model: None,
+            draft_n_max: None,
+            draft_p_min: None,
             sampling: SamplingConfig::default(),
             repeat_penalty: 1.0,
             repeat_last_n: 64,

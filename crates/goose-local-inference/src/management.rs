@@ -593,6 +593,8 @@ pub fn model_settings_from_dto(settings: LocalInferenceModelSettingsDto) -> Mode
         vision_capable: settings.vision_capable,
         image_token_estimate: settings.image_token_estimate,
         mmproj_size_bytes: settings.mmproj_size_bytes,
+        draft_n_max: None,
+        draft_p_min: None,
     }
 }
 

@@ -231,3 +231,45 @@ pub fn speculate(
         hit_eog,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! The only test that settles whether speculation is correct needs a real
+    //! model and a real drafter, so it is `#[ignore]`d and run explicitly:
+    //!
+    //! ```text
+    //! GIAP_TEST_GGUF=<target.gguf> GIAP_TEST_DRAFT=<drafter.gguf> \
+    //!   cargo test -p goose-local-inference --lib mtp -- --ignored --nocapture
+    //! ```
+    //!
+    //! Everything else about MTP can look right while being wrong: a drafter
+    //! pointed at a stale prompt still returns tokens, a rejected draft left in
+    //! the KV cache still decodes, an off-by-one accept still produces fluent
+    //! text. What none of those survive is this: at temperature 0, speculative
+    //! decoding is DEFINED to emit exactly what the target would have emitted
+    //! alone. Byte-identical, or the implementation is wrong.
+
+    /// Greedy equivalence: same prompt, same seed, speculation on and off.
+    ///
+    /// Deliberately compares the token IDs rather than the decoded string --
+    /// two different token sequences can decode to the same text, and that
+    /// would hide precisely the off-by-one this is guarding.
+    #[test]
+    #[ignore = "needs GIAP_TEST_GGUF and GIAP_TEST_DRAFT pointing at real models"]
+    fn greedy_output_is_identical_with_and_without_speculation() {
+        let (Ok(target), Ok(draft)) = (
+            std::env::var("GIAP_TEST_GGUF"),
+            std::env::var("GIAP_TEST_DRAFT"),
+        ) else {
+            eprintln!("set GIAP_TEST_GGUF and GIAP_TEST_DRAFT to run this");
+            return;
+        };
+        eprintln!("target={target} draft={draft}");
+        eprintln!(
+            "NOT YET IMPLEMENTED: needs a backend + model load harness. Until this \
+             body exists and passes on the device, in-process MTP is UNVERIFIED and \
+             must not be enabled by default."
+        );
+        panic!("greedy-equivalence harness not written");
+    }
+}
