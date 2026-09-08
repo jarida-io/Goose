@@ -734,7 +734,10 @@ fn parse_kv_cache_type(name: &str) -> Option<KvCacheType> {
     }
 }
 
-pub(super) fn build_sampler(settings: &crate::local_model_registry::ModelSettings) -> LlamaSampler {
+pub(super) fn build_sampler(
+    model: &LlamaModel,
+    settings: &crate::local_model_registry::ModelSettings,
+) -> LlamaSampler {
     use crate::local_model_registry::SamplingConfig;
 
     let has_penalties = settings.repeat_penalty != 1.0
@@ -744,7 +747,9 @@ pub(super) fn build_sampler(settings: &crate::local_model_registry::ModelSetting
     let mut samplers: Vec<LlamaSampler> = Vec::new();
 
     if has_penalties {
+        // 0.1.156 added `n_vocab` as the first parameter (it was implicit before).
         samplers.push(LlamaSampler::penalties(
+            model.n_vocab(),
             settings.repeat_last_n,
             settings.repeat_penalty,
             settings.frequency_penalty,
@@ -1483,7 +1488,7 @@ fn prefill_multimodal(
     let bitmaps: Vec<MtmdBitmap> = images
         .iter()
         .map(|img| {
-            MtmdBitmap::from_buffer(mtmd_ctx, &img.bytes)
+            MtmdBitmap::from_buffer(mtmd_ctx, &img.bytes, false)
                 .map_err(|e| ProviderError::ExecutionError(format!("Failed to decode image: {e}")))
         })
         .collect::<Result<_, _>>()?;
@@ -1830,7 +1835,7 @@ pub(super) fn generation_loop(
     decoded: &mut Vec<LlamaToken>,
     mut on_piece: impl FnMut(&str) -> Result<TokenAction, ProviderError>,
 ) -> Result<i32, ProviderError> {
-    let mut sampler = build_sampler(settings);
+    let mut sampler = build_sampler(model, settings);
     let context_headroom = effective_ctx.saturating_sub(prompt_token_count);
     let max_output = if let Some(max) = settings.max_output_tokens {
         context_headroom.min(max)
