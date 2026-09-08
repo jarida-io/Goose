@@ -13,7 +13,14 @@ workspace = true
 
 [features]
 default = []
-cuda = ["llama-cpp-2/cuda"]
+# `cuda-no-vmm`, not plain `cuda`. ggml-cuda's VMM pool reserves 32 GB of GPU
+# virtual address space per pool and holds up to 8 pools per backend context
+# (pools[MAX_DEVICES][MAX_STREAMS]). One context is survivable; MTP needs two,
+# and on an Orin Nano the second turn dies in cuMemAddressReserve with "out of
+# memory" while 5 GB of RAM sits free. The reservation is a fixed size, so no
+# amount of context-window arithmetic avoids it. The legacy pool has no such
+# reservation.
+cuda = ["llama-cpp-2/cuda-no-vmm"]
 vulkan = ["llama-cpp-2/vulkan"]
 mlx = ["dep:safemlx", "dep:safemlx-lm", "dep:safemlx-lm-utils"]
 

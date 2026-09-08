@@ -423,7 +423,10 @@ mod tests {
             .expect("load target"),
         );
 
-        let n_ctx: u32 = 2048;
+        let n_ctx: u32 = std::env::var("GIAP_TEST_NCTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
         let settings = greedy(None);
         let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("context");
         let filler = model.token_eos();
@@ -518,7 +521,10 @@ mod tests {
         let model = load(&target_path);
         let drafter = load(&draft_path);
 
-        let n_ctx: u32 = 2048;
+        let n_ctx: u32 = std::env::var("GIAP_TEST_NCTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
         let budget = 64;
         let prompt = model
             .str_to_token(
