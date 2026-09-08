@@ -327,11 +327,26 @@ mod tests {
 
     /// Greedy settings. Temperature 0 with a fixed seed, because the equivalence
     /// claim only holds for deterministic sampling.
+    /// Greedy, with the context configuration the Jetson actually ships.
+    ///
+    /// `ModelSettings::default()` leaves every one of these `None`, which means
+    /// no flash attention and an f16 KV cache -- and a quantised V cache is
+    /// refused outright without flash attention. The 2.8x this work is chasing
+    /// was measured on llama-server run with `-fa on -ctk q8_0 -ctv q8_0 -b 512
+    /// -ub 128`, so measuring against the defaults compares two different
+    /// configurations and blames the difference on the drafter. Flash attention
+    /// in particular changes what a batched verify costs, which is the one thing
+    /// speculation is buying.
     fn greedy(n_max: Option<i32>) -> ModelSettings {
         ModelSettings {
             sampling: SamplingConfig::Greedy,
             draft_n_max: n_max,
             draft_p_min: Some(0.0),
+            flash_attention: Some(true),
+            type_k: Some("q8_0".to_string()),
+            type_v: Some("q8_0".to_string()),
+            n_batch: Some(512),
+            n_ubatch: Some(128),
             ..Default::default()
         }
     }
