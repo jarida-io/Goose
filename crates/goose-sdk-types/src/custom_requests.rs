@@ -1849,6 +1849,20 @@ pub struct LocalInferenceModelSettingsDto {
     pub max_output_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_model: Option<String>,
+    /// Speculative-decoding draft depth. `None` leaves the engine default.
+    ///
+    /// Present for the same reason `type_k`/`type_v` are: without it a settings
+    /// round-trip through this DTO silently resets the value, so the knob
+    /// appears to exist and does nothing. `draft_model` survived that trip and
+    /// these two did not, which left speculation permanently on at the engine
+    /// defaults and untunable from outside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_n_max: Option<i32>,
+    /// Minimum draft-token probability before a proposal is abandoned. `None`
+    /// leaves the engine default, which is 0.0 — i.e. no confidence filter at
+    /// all, drafting the full depth every step regardless of proposal quality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_p_min: Option<f32>,
     #[serde(default)]
     pub sampling: LocalInferenceSamplingConfig,
     pub repeat_penalty: f32,

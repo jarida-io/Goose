@@ -332,6 +332,18 @@ const KV_TARGET: &str = "giap::kv";
 /// state, but including it costs one bit of key space and excluding it wrongly
 /// costs a corrupt restore. `n_threads` is excluded because it cannot affect
 /// anything but scheduling.
+///
+/// `type_k`, `type_v` and `n_ubatch` were added to `ModelSettings` after this
+/// function was written and were never added here, so an f16 cache and a `q8_0`
+/// cache shared a key — and GIAP sets `q8_0` on the Jetson, so that collision
+/// was live on the device. llama.cpp does reject the mismatch (`state_read_data`
+/// compares K and V type, row size, layer count and V transposition per layer),
+/// so this was never a corrupt restore; it was a guaranteed-failed load, and a
+/// `retire()` that deletes a perfectly good snapshot belonging to the other
+/// layout. A device that alternates KV types thrashed one bucket forever.
+///
+/// `n_ubatch` is included on the same reasoning as `n_batch`: cheap, and the
+/// cost of being wrong is asymmetric.
 fn layout_fingerprint(settings: &crate::local_model_registry::ModelSettings) -> u64 {
     let flash = match settings.flash_attention {
         Some(true) => 1u64,
@@ -339,7 +351,18 @@ fn layout_fingerprint(settings: &crate::local_model_registry::ModelSettings) -> 
         None => 0,
     };
     let batch = u64::from(settings.n_batch.unwrap_or(0));
-    flash | (batch << 8)
+    let ubatch = u64::from(settings.n_ubatch.unwrap_or(0));
+    // Hash the cache-type NAMES rather than mapping them to an enum: the set
+    // `parse_kv_cache_type` accepts grows, and an unmapped name silently
+    // colliding with f16 is the bug this is fixing.
+    let kv_types = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        settings.type_k.as_deref().unwrap_or("").hash(&mut h);
+        settings.type_v.as_deref().unwrap_or("").hash(&mut h);
+        h.finish()
+    };
+    flash | (batch << 8) | (ubatch << 24) | (kv_types << 40)
 }
 
 /// Per-loaded-model snapshot state.

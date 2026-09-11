@@ -692,8 +692,37 @@ pub(super) fn context_cap(
     memory_max_ctx: Option<usize>,
 ) -> usize {
     // 1. Explicit context_size in model settings (highest priority)
+    //
+    // Clamped to the trained window like every other branch below. It was the
+    // one branch that was not, which made it possible to pin a context larger
+    // than the model was trained for and get degraded output with no error and
+    // no log line. Latent for the models GIAP ships (both train past its
+    // MAX_CTX of 16384) but not for the MTP drafter, which is handed the
+    // target's window by construction and whose own trained window is never
+    // compared against it.
+    //
+    // A host that genuinely owns the memory budget still wins here — the clamp
+    // only refuses a window the weights cannot support, which is never the
+    // budget's decision to make.
     if let Some(ctx_size) = settings.context_size {
-        return ctx_size as usize;
+        let requested = ctx_size as usize;
+        // `n_ctx_train == 0` means the header did not say; clamping to it would
+        // return a zero-length context, which is worse than not clamping.
+        let granted = if n_ctx_train > 0 {
+            requested.min(n_ctx_train)
+        } else {
+            requested
+        };
+        if granted != requested {
+            tracing::warn!(
+                target: "giap::kv",
+                requested,
+                n_ctx_train,
+                granted,
+                "pinned context_size exceeds the model's trained window; clamping",
+            );
+        }
+        return granted;
     }
 
     // 2. context_limit from registry or caller

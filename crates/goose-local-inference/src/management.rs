@@ -546,6 +546,8 @@ pub fn model_settings_to_dto(settings: &ModelSettings) -> LocalInferenceModelSet
         context_size: settings.context_size,
         max_output_tokens: settings.max_output_tokens,
         draft_model: settings.draft_model.clone(),
+        draft_n_max: settings.draft_n_max,
+        draft_p_min: settings.draft_p_min,
         sampling: sampling_to_dto(&settings.sampling),
         repeat_penalty: settings.repeat_penalty,
         repeat_last_n: settings.repeat_last_n,
@@ -574,6 +576,8 @@ pub fn model_settings_from_dto(settings: LocalInferenceModelSettingsDto) -> Mode
         context_size: settings.context_size,
         max_output_tokens: settings.max_output_tokens,
         draft_model: settings.draft_model,
+        draft_n_max: settings.draft_n_max,
+        draft_p_min: settings.draft_p_min,
         sampling: sampling_from_dto(settings.sampling),
         repeat_penalty: settings.repeat_penalty,
         repeat_last_n: settings.repeat_last_n,
@@ -593,8 +597,6 @@ pub fn model_settings_from_dto(settings: LocalInferenceModelSettingsDto) -> Mode
         vision_capable: settings.vision_capable,
         image_token_estimate: settings.image_token_estimate,
         mmproj_size_bytes: settings.mmproj_size_bytes,
-        draft_n_max: None,
-        draft_p_min: None,
     }
 }
 
@@ -851,6 +853,50 @@ mod tests {
             round_trip.image_token_estimate,
             settings.image_token_estimate
         );
+    }
+
+    /// A non-default value has to survive the trip, which is the only thing a
+    /// round-trip test is for.
+    ///
+    /// `settings_round_trip_preserves_defaults` above cannot catch a dropped
+    /// field: a field reset to `None` still equals the default it was compared
+    /// against. `draft_n_max` and `draft_p_min` were hardcoded to `None` in
+    /// `model_settings_from_dto` and absent from the DTO entirely, so tuning
+    /// speculation was silently impossible from outside the crate — the knobs
+    /// existed, took a value, and lost it on the next read. `draft_model`
+    /// survived, so speculation stayed permanently ON at the engine defaults
+    /// (depth 4, p_min 0.0 — no confidence filter at all).
+    #[test]
+    fn drafter_tuning_survives_the_dto_round_trip() {
+        let settings = ModelSettings {
+            draft_model: Some("mtp-gemma-4-E2B-it".to_string()),
+            draft_n_max: Some(8),
+            draft_p_min: Some(0.4),
+            ..ModelSettings::default()
+        };
+
+        let round_trip = model_settings_from_dto(model_settings_to_dto(&settings));
+
+        assert_eq!(
+            round_trip.draft_model.as_deref(),
+            Some("mtp-gemma-4-E2B-it")
+        );
+        assert_eq!(
+            round_trip.draft_n_max,
+            Some(8),
+            "draft depth was dropped, so speculation runs at the engine default"
+        );
+        assert_eq!(
+            round_trip.draft_p_min,
+            Some(0.4),
+            "the confidence floor was dropped, so every step drafts the full depth"
+        );
+
+        // The defaults must still round-trip as absent rather than as zero:
+        // `Some(0)` and `None` mean different things to `attach_drafter`.
+        let bare = model_settings_from_dto(model_settings_to_dto(&ModelSettings::default()));
+        assert!(bare.draft_n_max.is_none());
+        assert!(bare.draft_p_min.is_none());
     }
 
     #[tokio::test]
