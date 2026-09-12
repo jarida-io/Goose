@@ -6,7 +6,37 @@ use crate::conversation::{
 };
 use std::path::{Path, PathBuf};
 
-const MIN_CONTEXT_FOR_MOIM: usize = 32_000;
+/// Below this context limit MOIM is skipped entirely — no `<turn-context>`, and
+/// so no `todo`/`tom` injection either.
+///
+/// Upstream sets 32,000, which silently disables the whole mechanism for any
+/// small-context host. The gate reads the MODEL's context limit -- the
+/// provider's `get_context_limit`, falling back to `ModelConfig::context_limit`
+/// (see `inject_moim` above) -- and NOT the host's prompt budget, which is the
+/// detail that decides whether this fires:
+///
+/// | host | context limit | upstream 32,000 | this 4,096 |
+/// |---|--:|---|---|
+/// | GIAP on an Orin Nano (gemma-4 E2B/E4B) | 16,384 | **skipped** | runs |
+/// | a Mac dev box on the same build | 32,768 | runs | runs |
+///
+/// So on the hardware GIAP ships to, MOIM was off: no turn budget, no current
+/// time, and no persistent instruction that survives compaction. On a developer
+/// Mac it was already on, which is precisely why that went unnoticed -- do not
+/// try to reproduce the difference locally without pinning the context limit.
+///
+/// 4,096 is the smallest window GIAP's budget curve has an anchor for
+/// (`context_budget::PROFILE_ANCHORS`), so this enables MOIM everywhere GIAP
+/// actually runs while keeping a floor below which the block's own ~60 tokens
+/// would be a meaningful fraction of the prompt.
+///
+/// The cost is real and worth stating: the block carries a minute-resolution
+/// timestamp and is injected into the LAST user message, so the tail of the
+/// prompt changes every turn. It does not move the static prefix — tools and
+/// system prompt sort before it — but `goose-providers::is_turn_context_text`
+/// exists upstream so Anthropic's cache can exclude the block, and the local
+/// llama.cpp path has no equivalent exclusion.
+const MIN_CONTEXT_FOR_MOIM: usize = 4_096;
 
 const SYSTEM_PROMPT_BLOCK_TEMPLATE: &str = r#"# Turn Context
 
