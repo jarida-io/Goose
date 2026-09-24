@@ -58,8 +58,21 @@ thread_local! {
     pub static SKIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// `GOOSE_DISABLE_MOIM=1` turns the whole mechanism off for this process.
+///
+/// For a host that already carries its own per-turn context in the user
+/// message (time, budget, memories), the block is duplicate information paid
+/// for on every provider call: it is injected on a clone, never stored, so a
+/// prefix-caching engine re-prefills it -- plus whatever follows it -- each
+/// time, about a hundred tokens per inference measured on a GIAP pond. The
+/// system-prompt paragraph that tells the model about the block goes with it,
+/// so the model is not told to expect something it will never see.
+pub fn disabled_by_host() -> bool {
+    std::env::var("GOOSE_DISABLE_MOIM").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 pub fn system_prompt_block() -> Option<String> {
-    if SKIP.with(|f| f.get()) {
+    if SKIP.with(|f| f.get()) || disabled_by_host() {
         None
     } else {
         Some(SYSTEM_PROMPT_BLOCK_TEMPLATE.replace("{turn_context_tag}", TURN_CONTEXT_TAG))
@@ -73,7 +86,7 @@ pub async fn inject_moim(
     turns_taken: u32,
     max_turns: u32,
 ) -> Conversation {
-    if SKIP.with(|f| f.get()) {
+    if SKIP.with(|f| f.get()) || disabled_by_host() {
         return conversation;
     }
 
@@ -303,6 +316,32 @@ mod tests {
         // prefix cache built from the previous call still matches up to here.
         assert_eq!(text_at(&msgs[2], 0), "Bye");
         assert!(is_moim(&msgs[2].content[1]));
+    }
+
+    #[tokio::test]
+    async fn the_host_switch_removes_the_block_and_its_system_paragraph() {
+        let _guard = env_lock::lock_env([("GOOSE_DISABLE_MOIM", Some("1"))]);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let em = ExtensionManager::new_without_provider(temp_dir.path().to_path_buf());
+        let session = em
+            .get_context()
+            .session_manager
+            .create_session(
+                PathBuf::from("/test/dir"),
+                "test".to_string(),
+                crate::session::SessionType::User,
+                crate::config::GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+
+        let conv = Conversation::new_unvalidated(vec![Message::user().with_text("Hello")]);
+        let result = inject_moim(&session.id, conv, &em, 0, 100).await;
+
+        assert_eq!(result.messages().len(), 1);
+        assert_eq!(result.messages()[0].content.len(), 1);
+        assert_eq!(text_at(&result.messages()[0], 0), "Hello");
+        assert!(system_prompt_block().is_none());
     }
 
     #[tokio::test]
