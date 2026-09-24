@@ -1907,7 +1907,7 @@ pub(super) fn prepare_generation(
         None,
     );
 
-    let (prompt_token_count, prefilled, prompt_tokens) = if !ctx.images.is_empty() {
+    let (prompt_token_count, mut prefilled, prompt_tokens) = if !ctx.images.is_empty() {
         // The multimodal path prefills through mtmd chunks and never produces a
         // flat token vector, so a speculative draft has nothing to stand on --
         // which is consistent with the vision request bypassing KV retention too.
@@ -1950,6 +1950,23 @@ pub(super) fn prepare_generation(
         )?;
         (ptc, prefilled, tokens)
     };
+
+    // Wait for the prefill to actually finish before timing it. The GPU
+    // backends return from `decode` once the graph is submitted and bill the
+    // remaining work to whoever reads the logits next -- the first `sample`,
+    // which lands in time-to-first-token instead of here. Measured on Metal
+    // (E2B, release): a 160-token warm prefill read 13-33 ms while 250-360 ms of
+    // its work showed up as a gap between prefill end and first token. TTFT is
+    // measured at the first emitted piece and was already honest; this makes
+    // `prefill_ms`, and every rate derived from it, honest too.
+    match prefilled.transient.as_mut() {
+        Some(kv) => kv.session_ctx_mut().ctx_mut().synchronize(),
+        None => {
+            if let Some(kv) = ctx.session.as_mut() {
+                kv.session_ctx_mut().ctx_mut().synchronize();
+            }
+        }
+    }
 
     Ok(PreparedGeneration {
         template_result,
