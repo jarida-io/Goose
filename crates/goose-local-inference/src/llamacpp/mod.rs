@@ -1,7 +1,6 @@
 mod inference_emulated_tools;
 mod inference_engine;
 mod inference_native_tools;
-pub(super) mod mtp;
 mod prompt_snapshot;
 
 use std::any::Any;
@@ -447,41 +446,6 @@ impl LocalInferenceBackend for LlamaCppBackend {
         let model = LlamaModel::load_from_file(&self.backend, model_path, &params)
             .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
 
-        // The MTP drafter, when the registry names one. A drafter that fails to
-        // load degrades to no speculation rather than failing the model load:
-        // the target is what serves requests, and losing speed is not losing
-        // service.
-        let draft_model = match resolved.draft_model_path.as_ref() {
-            Some(path) if path.exists() => {
-                match LlamaModel::load_from_file(&self.backend, path, &params) {
-                    Ok(d) => {
-                        tracing::info!(
-                            backend = self.id(),
-                            draft = %path.display(),
-                            "MTP drafter loaded"
-                        );
-                        Some(Arc::new(d))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            draft = %path.display(),
-                            error = %e,
-                            "MTP drafter failed to load; continuing without speculation"
-                        );
-                        None
-                    }
-                }
-            }
-            Some(path) => {
-                tracing::warn!(
-                    draft = %path.display(),
-                    "MTP drafter not on disk; continuing without speculation"
-                );
-                None
-            }
-            None => None,
-        };
-
         let templates = load_chat_templates(&model, settings)?;
 
         let mtmd_ctx = Self::init_mtmd_context(&model, &resolved.mmproj_path, settings);
@@ -494,7 +458,6 @@ impl LocalInferenceBackend for LlamaCppBackend {
 
         Ok(Box::new(LoadedModel {
             model: Arc::new(model),
-            draft: draft_model,
             templates,
             mtmd_ctx,
             session: None,
@@ -642,7 +605,6 @@ impl LocalInferenceBackend for LlamaCppBackend {
             "generate: model slot identity"
         );
         let mut gen_ctx = GenerationContext {
-            draft: loaded.draft.as_ref(),
             model: &loaded.model,
             mtmd_ctx: loaded.mtmd_ctx.as_ref(),
             session: &mut loaded.session,

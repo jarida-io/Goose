@@ -25,8 +25,6 @@ const REUSE_MIN_TOKENS: usize = 256;
 
 pub(super) struct GenerationContext<'a> {
     pub model: &'a Arc<LlamaModel>,
-    /// MTP drafter for this slot. `None` means no speculation.
-    pub draft: Option<&'a Arc<LlamaModel>>,
     pub mtmd_ctx: Option<&'a MtmdContext>,
     pub session: &'a mut Option<SessionKv>,
     /// On-disk preamble cache for this model. `None` disables snapshots for the
@@ -50,9 +48,6 @@ pub(super) struct GenerationContext<'a> {
 
 pub(super) struct LoadedModel {
     pub model: Arc<LlamaModel>,
-    /// MTP drafter, loaded beside the target when the registry names one.
-    /// `None` disables speculation entirely -- there is no partial mode.
-    pub draft: Option<Arc<LlamaModel>>,
     pub templates: LoadedChatTemplates,
     /// Multimodal context for vision models. None for text-only models.
     pub mtmd_ctx: Option<MtmdContext>,
@@ -229,38 +224,26 @@ impl MediaHead {
 /// unrecorded trailing positions can never be attended to.
 /// Either a bare context, or a speculative wrapper that has TAKEN it.
 ///
-/// `MtpSpeculative::new` consumes both the target and draft contexts by value, so
-/// a session that speculates cannot also hold its context directly. Everything
-/// that used `kv.ctx` reaches the same context through [`SessionCtx::ctx_mut`],
-/// which keeps `reuse_prefix`, the snapshot ladder and `clear_kv_cache_seq`
-/// working unchanged -- the prompt-session cache is worth more than speculation
-/// and must not be traded for it.
+/// The generation context of a retained session.
+///
+/// One variant on purpose. A speculative-decoding variant lived beside `Plain`
+/// until 2026-09-24 and was removed with the rest of that path; keeping the
+/// accessor shape (`ctx()` / `ctx_mut()`) meant `reuse_prefix`, the snapshot
+/// ladder and `clear_kv_cache_seq` did not have to change with it.
 pub(super) enum SessionCtx {
-    /// No drafter configured.
     Plain(LlamaContext<'static>),
-    /// Drafter attached; the target context lives inside.
-    Mtp(Box<crate::llamacpp::mtp::MtpSession>),
 }
 
 impl SessionCtx {
     pub(super) fn ctx(&self) -> &LlamaContext<'static> {
         match self {
             Self::Plain(c) => c,
-            Self::Mtp(m) => m.target(),
         }
     }
 
     pub(super) fn ctx_mut(&mut self) -> &mut LlamaContext<'static> {
         match self {
             Self::Plain(c) => c,
-            Self::Mtp(m) => m.target_mut(),
-        }
-    }
-
-    pub(super) fn mtp_mut(&mut self) -> Option<&mut crate::llamacpp::mtp::MtpSession> {
-        match self {
-            Self::Plain(_) => None,
-            Self::Mtp(m) => Some(m),
         }
     }
 }
@@ -276,9 +259,6 @@ pub(super) struct SessionKv {
     /// realised `n_ctx` up, so the requested value is the stable identity.
     n_ctx: u32,
     _model: Arc<LlamaModel>,
-    /// Same drop-order contract as `_model`: the speculative wrapper inside
-    /// `ctx` borrows this allocation, so it must outlive the context.
-    _draft_model: Option<Arc<LlamaModel>>,
 }
 
 // SAFETY: `LlamaContext` is `!Send` only because it holds a raw
@@ -294,7 +274,6 @@ unsafe impl Send for SessionKv {}
 impl SessionKv {
     pub(super) fn create(
         model: &Arc<LlamaModel>,
-        draft: Option<&Arc<LlamaModel>>,
         backend: &LlamaCppBackend,
         n_ctx: u32,
         settings: &ModelSettings,
@@ -315,53 +294,7 @@ impl SessionKv {
         // never outlive the model it points at.
         let ctx = unsafe { std::mem::transmute::<LlamaContext<'_>, LlamaContext<'static>>(ctx) };
 
-        // Attach the drafter, if the registry named one. The draft context gets
-        // the same window as the target: llama.cpp's MTP drafter shares the
-        // target's KV rather than duplicating it, which is why the whole
-        // configuration measured +48 MB on the Orin rather than a second cache.
-        let (ctx, draft_model) = match draft {
-            Some(draft_model) => {
-                let draft_model = Arc::clone(draft_model);
-                // The draft context MUST reference the target's via llama.cpp's
-                // `ctx_other`. Gemma4Assistant refuses to build without it --
-                // "requires ctx_other to be set" -- and it is also how the KV is
-                // shared: `is_mem_shared = llama_get_ctx_other(ctx_dft) ==
-                // ctx_tgt`, which is why the whole configuration measured +48 MB
-                // on the Orin rather than a second full cache. Building it as a
-                // plain context returns a null and fails the load.
-                let dctx = draft_model
-                    .new_context_with_ctx_other(
-                        backend.llama_backend(),
-                        build_context_params(n_ctx, settings),
-                        &ctx,
-                    )
-                    .map_err(|e| {
-                        ProviderError::ExecutionError(format!(
-                            "failed to create draft context: {e}"
-                        ))
-                    })?;
-                // SAFETY: as for the target context above -- the borrow is
-                // immediately re-tied to `_draft_model`, a strong handle in this
-                // same struct dropped after `ctx` by declaration order.
-                let dctx =
-                    unsafe { std::mem::transmute::<LlamaContext<'_>, LlamaContext<'static>>(dctx) };
-                // Depth 4 because that is what the Orin bake-off measured:
-                // 2.8x at 87% acceptance. Do not raise it on the strength of a
-                // Mac run -- ggml-metal switches from mat-vec to GEMM only above
-                // a batch of 8, so on Metal depth 4 lands in the one place
-                // batching does not amortise and depth 8 looks better. That is a
-                // property of the backend, not of the drafter, and the device
-                // this ships on does not share it.
-                let session = super::mtp::MtpSession::new(
-                    ctx,
-                    dctx,
-                    settings.draft_n_max.unwrap_or(4),
-                    settings.draft_p_min.unwrap_or(0.0),
-                )?;
-                (SessionCtx::Mtp(Box::new(session)), Some(draft_model))
-            }
-            None => (SessionCtx::Plain(ctx), None),
-        };
+        let ctx = SessionCtx::Plain(ctx);
 
         Ok(Self {
             ctx,
@@ -369,7 +302,6 @@ impl SessionKv {
             tokens: Vec::new(),
             n_ctx,
             _model: model,
-            _draft_model: draft_model,
         })
     }
 
@@ -377,7 +309,7 @@ impl SessionKv {
         self.ctx.ctx_mut()
     }
 
-    /// The context AND whatever drafter is attached to it.
+    /// The generation context of this session.
     pub(super) fn session_ctx_mut(&mut self) -> &mut SessionCtx {
         &mut self.ctx
     }
@@ -404,9 +336,6 @@ fn retained_kv_tokens(session: &Option<SessionKv>) -> usize {
 
 pub(super) struct PreparedGeneration {
     pub template_result: ChatTemplateResult,
-    /// The prompt as tokens. Carried because a speculative draft call is given
-    /// the whole sequence the target stands on, not just its length.
-    pub prompt_tokens: Vec<LlamaToken>,
     pub prompt_token_count: usize,
     pub effective_ctx: usize,
     /// Wall-clock time for template application + tokenization + prompt
@@ -697,9 +626,9 @@ pub(super) fn context_cap(
     // one branch that was not, which made it possible to pin a context larger
     // than the model was trained for and get degraded output with no error and
     // no log line. Latent for the models GIAP ships (both train past its
-    // MAX_CTX of 16384) but not for the MTP drafter, which is handed the
-    // target's window by construction and whose own trained window is never
-    // compared against it.
+    // MAX_CTX of 16384); it bit the speculative-decoding drafter this engine
+    // carried until 2026-09-24, which was handed the target's window by
+    // construction and whose own trained window was never compared against it.
     //
     // A host that genuinely owns the memory budget still wins here — the clamp
     // only refuses a window the weights cannot support, which is never the
@@ -1099,12 +1028,12 @@ fn trim_to_prefix(kv: &mut SessionKv, keep: usize) -> Result<(), ()> {
 /// positions restored rather than decoded. `Ok(None)` means the context is
 /// fresh and empty and the caller should prefill it as usual -- the context is
 /// left in `session` either way, so no allocation is wasted.
-// Eight because a drafter has to be threaded through beside the model it
-// drafts for; bundling them would only move the same list behind a name.
+// Seven arguments: the session, the model and backend that own it, the
+// settings, the snapshot slot, the prompt and the window. Bundling them would
+// only move the same list behind a name.
 #[allow(clippy::too_many_arguments)]
 fn seed_from_snapshot(
     session: &mut Option<SessionKv>,
-    draft: Option<&Arc<LlamaModel>>,
     model: &Arc<LlamaModel>,
     backend: &LlamaCppBackend,
     settings: &ModelSettings,
@@ -1116,7 +1045,7 @@ fn seed_from_snapshot(
     // resident at once -- the same rule `full_prefill` follows, and on an 8 GB
     // device the difference between fitting and an allocation failure.
     *session = None;
-    let mut kv = SessionKv::create(model, draft, backend, n_ctx, settings)?;
+    let mut kv = SessionKv::create(model, backend, n_ctx, settings)?;
 
     let Some(restored) = slot.load(kv.context_mut(), prompt) else {
         *session = Some(kv);
@@ -1162,7 +1091,6 @@ fn seed_from_snapshot(
 /// its window matches and building a new one otherwise.
 fn full_prefill(
     session: &mut Option<SessionKv>,
-    draft: Option<&Arc<LlamaModel>>,
     model: &Arc<LlamaModel>,
     backend: &LlamaCppBackend,
     settings: &ModelSettings,
@@ -1173,7 +1101,7 @@ fn full_prefill(
         // Release the old context before allocating its replacement so both
         // KV caches are never resident at once.
         *session = None;
-        *session = Some(SessionKv::create(model, draft, backend, n_ctx, settings)?);
+        *session = Some(SessionKv::create(model, backend, n_ctx, settings)?);
     }
 
     let kv = session
@@ -1278,7 +1206,6 @@ fn write_snapshot_if_due(
 #[allow(clippy::too_many_arguments)]
 fn prefill_prompt(
     session: &mut Option<SessionKv>,
-    draft: Option<&Arc<LlamaModel>>,
     snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
     model_path: &std::path::Path,
     model: &Arc<LlamaModel>,
@@ -1330,9 +1257,7 @@ fn prefill_prompt(
     // Nothing usable in memory: this is the cold start the snapshot exists for.
     if matches!(plan, PrefillPlan::CreateContext) {
         if let Some(slot) = snapshot.as_mut() {
-            match seed_from_snapshot(
-                session, draft, model, backend, settings, slot, prompt, n_ctx,
-            ) {
+            match seed_from_snapshot(session, model, backend, settings, slot, prompt, n_ctx) {
                 Ok(Some(restored)) => {
                     return Ok(PrefilledPrompt {
                         reused_prefix_tokens: restored,
@@ -1381,7 +1306,7 @@ fn prefill_prompt(
         PrefillPlan::SacrificialContext => {
             let transient_n_ctx =
                 sacrificial_context_size(prompt.len(), settings.max_output_tokens, n_ctx);
-            match sacrificial_prefill(model, draft, backend, settings, prompt, transient_n_ctx) {
+            match sacrificial_prefill(model, backend, settings, prompt, transient_n_ctx) {
                 Ok(kv) => {
                     return Ok(PrefilledPrompt {
                         reused_prefix_tokens: 0,
@@ -1400,13 +1325,13 @@ fn prefill_prompt(
     }
 
     let retained = session.is_some();
-    match full_prefill(session, draft, model, backend, settings, prompt, n_ctx) {
+    match full_prefill(session, model, backend, settings, prompt, n_ctx) {
         Ok(()) => {}
         Err(e) if retained => {
             // `full_prefill` dropped the poisoned context, so this attempt runs
             // against a freshly created one.
             tracing::warn!(error = %e, "prompt prefill failed; retrying with a new context");
-            full_prefill(session, draft, model, backend, settings, prompt, n_ctx)?;
+            full_prefill(session, model, backend, settings, prompt, n_ctx)?;
         }
         Err(e) => return Err(e),
     }
@@ -1423,13 +1348,12 @@ fn prefill_prompt(
 /// prompt into it, leaving any retained cache untouched.
 fn sacrificial_prefill(
     model: &Arc<LlamaModel>,
-    draft: Option<&Arc<LlamaModel>>,
     backend: &LlamaCppBackend,
     settings: &ModelSettings,
     prompt: &[LlamaToken],
     n_ctx: u32,
 ) -> Result<SessionKv, ProviderError> {
-    let mut kv = SessionKv::create(model, draft, backend, n_ctx, settings)?;
+    let mut kv = SessionKv::create(model, backend, n_ctx, settings)?;
     decode_tokens(kv.ctx.ctx_mut(), prompt, 0)?;
     Ok(kv)
 }
@@ -1612,7 +1536,6 @@ fn reuse_media_head(
 #[allow(clippy::too_many_arguments)]
 fn prefill_multimodal(
     session: &mut Option<SessionKv>,
-    draft: Option<&Arc<LlamaModel>>,
     model: &Arc<LlamaModel>,
     mtmd_ctx: Option<&MtmdContext>,
     backend: &LlamaCppBackend,
@@ -1712,7 +1635,7 @@ fn prefill_multimodal(
     // Release the retained cache before allocating its replacement so the two
     // KV caches are never resident together.
     *session = None;
-    let mut kv = SessionKv::create(model, draft, backend, n_ctx, settings)?;
+    let mut kv = SessionKv::create(model, backend, n_ctx, settings)?;
 
     let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
     let n_past = chunks
@@ -1827,6 +1750,7 @@ pub(super) fn prepare_generation(
     );
     let cap = context_cap(ctx.settings, ctx.context_limit, n_ctx_train, memory_max_ctx);
     let token_budget = cap.saturating_sub(min_generation_headroom);
+    let t_ctx_done = std::time::Instant::now();
     let estimated_image_tokens = ctx.images.len() * ctx.settings.image_token_estimate;
 
     let template_result = match apply_template(full_tools_json) {
@@ -1902,18 +1826,21 @@ pub(super) fn prepare_generation(
         }
     };
 
+    let t_render_done = std::time::Instant::now();
     let _ = ctx.log.write(
         &serde_json::json!({"applied_prompt": &template_result.prompt}),
         None,
     );
+    let t_log_done = std::time::Instant::now();
+    // (tokenize, validate, plan+decode) for the text path; the multimodal path
+    // has no flat token vector to time the same way.
+    let mut text_breakdown: Option<(u128, u128, u128)> = None;
 
-    let (prompt_token_count, mut prefilled, prompt_tokens) = if !ctx.images.is_empty() {
+    let (prompt_token_count, mut prefilled) = if !ctx.images.is_empty() {
         // The multimodal path prefills through mtmd chunks and never produces a
-        // flat token vector, so a speculative draft has nothing to stand on --
-        // which is consistent with the vision request bypassing KV retention too.
+        // flat token vector; the vision request bypasses KV retention too.
         let (ptc, prefilled) = prefill_multimodal(
             ctx.session,
-            ctx.draft,
             ctx.model,
             ctx.mtmd_ctx,
             ctx.backend,
@@ -1922,12 +1849,13 @@ pub(super) fn prepare_generation(
             ctx.context_limit,
             ctx.settings,
         )?;
-        (ptc, prefilled, Vec::new())
+        (ptc, prefilled)
     } else {
         let tokens = ctx
             .model
             .str_to_token(&template_result.prompt, AddBos::Never)
             .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
+        let t_tok_done = std::time::Instant::now();
         let (ptc, ectx) = validate_and_compute_context(
             ctx.model,
             ctx.mtmd_ctx.is_some(),
@@ -1937,9 +1865,9 @@ pub(super) fn prepare_generation(
             ctx.settings,
             retained_kv_tokens,
         )?;
+        let t_validate_done = std::time::Instant::now();
         let prefilled = prefill_prompt(
             ctx.session,
-            ctx.draft,
             ctx.snapshot,
             ctx.model_path,
             ctx.model,
@@ -1948,7 +1876,12 @@ pub(super) fn prepare_generation(
             &tokens,
             ectx,
         )?;
-        (ptc, prefilled, tokens)
+        text_breakdown = Some((
+            t_tok_done.duration_since(t_log_done).as_millis(),
+            t_validate_done.duration_since(t_tok_done).as_millis(),
+            t_validate_done.elapsed().as_millis(),
+        ));
+        (ptc, prefilled)
     };
 
     // Wait for the prefill to actually finish before timing it. The GPU
@@ -1968,9 +1901,24 @@ pub(super) fn prepare_generation(
         }
     }
 
+    if let Some((tokenize_ms, validate_ms, plan_and_decode_ms)) = text_breakdown {
+        tracing::debug!(
+            target: "giap::kv",
+            memory_estimate_ms = t_ctx_done.duration_since(prefill_started).as_millis(),
+            render_ms = t_render_done.duration_since(t_ctx_done).as_millis(),
+            log_write_ms = t_log_done.duration_since(t_render_done).as_millis(),
+            tokenize_ms,
+            validate_ms,
+            plan_and_decode_ms,
+            total_ms = prefill_started.elapsed().as_millis(),
+            prompt_tokens = prompt_token_count,
+            reused_prefix_tokens = prefilled.reused_prefix_tokens,
+            "prefill breakdown"
+        );
+    }
+
     Ok(PreparedGeneration {
         template_result,
-        prompt_tokens,
         prompt_token_count,
         effective_ctx: prefilled.effective_ctx,
         prefill_ms: prefill_started.elapsed().as_millis() as u64,
@@ -1994,15 +1942,11 @@ pub(super) enum TokenAction {
 /// can extend a retained token sequence with exactly what the cache now holds.
 /// The token a stop condition fires on is sampled but never decoded, and is
 /// therefore absent from `decoded`.
-// `prompt_tokens` and `prompt_token_count` look redundant and are not: the
-// count includes media chunks, while the token vector is text only, which is
-// what the drafter has to be seeded with.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn generation_loop(
     model: &LlamaModel,
     ctx: &mut SessionCtx,
     settings: &crate::local_model_registry::ModelSettings,
-    prompt_tokens: &[LlamaToken],
     prompt_token_count: usize,
     effective_ctx: usize,
     decoded: &mut Vec<LlamaToken>,
@@ -2021,21 +1965,6 @@ pub(super) fn generation_loop(
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut output_token_count: i32 = 0;
     let mut exhausted_loop = true;
-
-    // Whole token sequence the target stands on: the drafter is given this on
-    // every draft call, exactly as llama.cpp's server passes its slot's tokens.
-    let mut sequence: Vec<LlamaToken> = prompt_tokens.to_vec();
-
-    // Point the drafter at the prompt HERE rather than in each prefill helper.
-    // The ledger is updated at six places across CreateContext, ReusePrefix,
-    // SacrificialContext and the snapshot restore, and a `begin` missing from
-    // any one of them does not error -- it leaves the drafter proposing against
-    // a prompt the target has moved past, so every draft is rejected and the
-    // speedup silently becomes a slowdown. This is the single point every path
-    // passes through with the prefill finished.
-    if let Some(mtp) = ctx.mtp_mut() {
-        mtp.begin(prompt_tokens)?;
-    }
 
     // `pending` is always UNDECODED on entry to an iteration; whichever path
     // runs is responsible for decoding it.
@@ -2070,34 +1999,6 @@ pub(super) fn generation_loop(
             break;
         }
         decoded.push(token);
-        sequence.push(token);
-
-        if ctx.mtp_mut().is_some() {
-            let n_past = (sequence.len() - 1) as i32;
-            let step = {
-                let mtp = ctx.mtp_mut().expect("checked above");
-                super::mtp::speculate(mtp, model, &mut sampler, n_past, token, &sequence)?
-            };
-            let mut stopped = false;
-            for tok in step.tokens {
-                if (output_token_count as usize) >= max_output {
-                    stopped = true;
-                    break;
-                }
-                if emit(tok, &mut decoder, &mut output_token_count)? {
-                    exhausted_loop = false;
-                    stopped = true;
-                    break;
-                }
-                decoded.push(tok);
-                sequence.push(tok);
-            }
-            if stopped {
-                break;
-            }
-            pending = step.next;
-            continue;
-        }
 
         let next_tokens = [token];
         let mut next_batch = LlamaBatch::get_one(&next_tokens)
@@ -2364,7 +2265,7 @@ pub(super) mod tests {
 
         // 1. Write a snapshot from a cache holding exactly the preamble.
         {
-            let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             decode_tokens(kv.ctx.ctx_mut(), &prefix, 0).expect("prefill preamble");
             kv.tokens.extend_from_slice(&prefix);
             let t = std::time::Instant::now();
@@ -2396,7 +2297,7 @@ pub(super) mod tests {
         // 2. Restore into a fresh context and decode only the tail.
         let restored = {
             let started = std::time::Instant::now();
-            let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let n = slot
                 .load(kv.context_mut(), &prompt)
                 .expect("the snapshot must load and prefix this prompt");
@@ -2420,7 +2321,7 @@ pub(super) mod tests {
         // 3. The control: the same prompt, decoded from nothing.
         let fresh = {
             let started = std::time::Instant::now();
-            let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let last = prompt.len() - 1;
             decode_tokens(kv.ctx.ctx_mut(), &prompt[..last], 0).expect("full prefill");
             decode_tokens(kv.ctx.ctx_mut(), &prompt[last..], last).expect("decode final token");
@@ -2489,7 +2390,7 @@ pub(super) mod tests {
         // the snapshot is judged against the noise floor measured on the SAME
         // host in the SAME run, not against a constant.
         let control = {
-            let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let last = prompt.len() - 1;
             decode_tokens(kv.ctx.ctx_mut(), &prefix, 0).expect("prefix");
             decode_tokens(kv.ctx.ctx_mut(), &prompt[prefix.len()..last], prefix.len())
@@ -2536,7 +2437,7 @@ pub(super) mod tests {
         // test where it can be rejected for a stated reason. So the capacity has
         // to be the context's, and this asserts the semantics both ways round.
         {
-            let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let too_small = prefix.len() - 1;
             assert!(
                 kv.context_mut()
@@ -2546,7 +2447,7 @@ pub(super) mod tests {
                  max_tokens has stopped being a buffer size and the reasoning above is stale"
             );
 
-            let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
             let (tokens, _) = kv
                 .context_mut()
                 .state_seq_load_file(&snapshot_path, 0, n_ctx as usize)
@@ -2565,7 +2466,7 @@ pub(super) mod tests {
         // restoring across it would not be slow, it would be wrong.
         let mut foreign: Vec<LlamaToken> = prompt.clone();
         foreign[0] = LlamaToken(if foreign[0].0 == 1 { 2 } else { 1 });
-        let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
+        let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
         assert!(
             slot.load(kv.context_mut(), &foreign).is_none(),
             "a snapshot that does not prefix the prompt must be refused, not restored"

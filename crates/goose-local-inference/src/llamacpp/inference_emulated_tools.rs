@@ -398,7 +398,6 @@ pub(super) fn generate_with_emulated_tools(
         ctx.model,
         llama_ctx,
         ctx.settings,
-        &prepared.prompt_tokens,
         prompt_token_count,
         effective_ctx,
         &mut decoded_tokens,
