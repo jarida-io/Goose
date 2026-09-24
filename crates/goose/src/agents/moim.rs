@@ -131,14 +131,21 @@ pub async fn inject_moim(
     else {
         return conversation;
     };
-    let insert_idx = messages[idx]
-        .content
-        .iter()
-        .take_while(|content| matches!(content, MessageContent::ToolResponse(_)))
-        .count();
-    messages[idx]
-        .content
-        .insert(insert_idx, MessageContent::text(moim));
+    // APPENDED as the last content item, never inserted at the front.
+    //
+    // The block is injected on a clone for this one provider call and is
+    // never stored, so the message that carries it is a message the engine
+    // has already cached from the previous call. A prefix-caching engine
+    // (llama.cpp's KV cache, a prompt cache in front of any provider) reuses
+    // tokens up to the first byte that differs: putting the block FIRST
+    // changes that message from its first byte, so everything from the
+    // user's own words onward is re-prefilled every call -- measured on a
+    // GIAP pond as ~400-500 tokens per call on an ordinary turn, and the
+    // entire conversation on a turn whose user messages had been merged.
+    // Appended, the message stays byte-identical up to where the block
+    // begins, and the re-prefill is only the block itself and whatever
+    // follows it. The model still sees the block in the same message.
+    messages[idx].content.push(MessageContent::text(moim));
 
     let (fixed, issues) = fix_conversation(Conversation::new_unvalidated(messages));
 
@@ -266,7 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_moim_prepended_to_latest_user_message() {
+    async fn test_moim_appended_to_latest_user_message() {
         let temp_dir = tempfile::tempdir().unwrap();
         let em = ExtensionManager::new_without_provider(temp_dir.path().to_path_buf());
         let session = em
@@ -292,8 +299,10 @@ mod tests {
         assert_eq!(msgs.len(), 3);
         assert_eq!(text_at(&msgs[0], 0), "Hello");
         assert_eq!(text_at(&msgs[1], 0), "Hi");
-        assert!(is_moim(&msgs[2].content[0]));
-        assert_eq!(text_at(&msgs[2], 1), "Bye");
+        // The user's own words keep their place; the block trails them, so a
+        // prefix cache built from the previous call still matches up to here.
+        assert_eq!(text_at(&msgs[2], 0), "Bye");
+        assert!(is_moim(&msgs[2].content[1]));
     }
 
     #[tokio::test]
@@ -316,8 +325,8 @@ mod tests {
         let result = inject_moim(&session.id, conv, &em, 0, 100).await;
 
         assert_eq!(result.messages().len(), 1);
-        assert!(is_moim(&result.messages()[0].content[0]));
-        assert_eq!(text_at(&result.messages()[0], 1), "Hello");
+        assert_eq!(text_at(&result.messages()[0], 0), "Hello");
+        assert!(is_moim(&result.messages()[0].content[1]));
     }
 
     #[tokio::test]
@@ -345,8 +354,8 @@ mod tests {
         let msgs = result.messages();
 
         assert_eq!(msgs.len(), 2);
-        assert!(is_moim(&msgs[0].content[0]));
-        assert_eq!(text_at(&msgs[0], 1), "agent visible");
+        assert_eq!(text_at(&msgs[0], 0), "agent visible");
+        assert!(is_moim(&msgs[0].content[1]));
         assert_eq!(text_at(&msgs[1], 0), "user only");
         assert!(!msgs[1].is_agent_visible());
     }
@@ -380,8 +389,8 @@ mod tests {
         let msgs = result.messages();
 
         assert_eq!(msgs.len(), 3);
-        assert!(is_moim(&msgs[0].content[0]));
-        assert_eq!(text_at(&msgs[0], 1), "Search for something");
+        assert_eq!(text_at(&msgs[0], 0), "Search for something");
+        assert!(is_moim(&msgs[0].content[1]));
         assert!(matches!(
             &msgs[2].content[0],
             MessageContent::ToolResponse(_)
