@@ -123,6 +123,21 @@ pub struct ModelSettings {
     /// Size of the mmproj file in bytes, used for memory accounting.
     #[serde(default)]
     pub mmproj_size_bytes: u64,
+    /// Options read only by the LiteRT-LM backend; other backends ignore them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub litert: Option<LiteRtSettings>,
+}
+
+/// LiteRT-LM engine options.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiteRtSettings {
+    /// Execution backend, `"gpu"` or `"cpu"` (case-insensitive). `None` means `"cpu"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Multi-token-prediction drafting. Applied only when the model file supports it;
+    /// `None` means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative_decoding: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -169,6 +184,7 @@ impl Default for ModelSettings {
             vision_capable: false,
             image_token_estimate: default_image_token_estimate(),
             mmproj_size_bytes: 0,
+            litert: None,
         }
     }
 }
@@ -847,6 +863,56 @@ mod tests {
             999,
             "non-zero size should not be overwritten"
         );
+    }
+
+    const REGISTRY_WITHOUT_LITERT: &str = r#"{"models":[{
+        "id":"gemma-4-E2B-it","repo_id":"local/gemma-4-E2B-it",
+        "filename":"gemma-4-E2B-it-Q4_K_M.gguf","quantization":"",
+        "local_path":"/models/gguf/gemma-4-E2B-it-Q4_K_M.gguf","source_url":"",
+        "storage":"manual_path","size_bytes":0,
+        "settings":{"context_size":16384,"max_output_tokens":null,
+            "sampling":{"type":"Temperature","temperature":0.8,"top_k":40,"top_p":0.95,"min_p":0.05,"seed":null},
+            "repeat_penalty":1.0,"repeat_last_n":64,"frequency_penalty":0.0,"presence_penalty":0.0,
+            "n_batch":512,"n_ubatch":128,"type_k":"q8_0","type_v":"q8_0","n_gpu_layers":99,
+            "use_mlock":false,"flash_attention":true,"n_threads":4,"tool_calling":"force_native",
+            "chat_template":{"type":"embedded"},"enable_thinking":true,"vision_capable":false,
+            "image_token_estimate":256,"mmproj_size_bytes":0}}]}"#;
+
+    #[test]
+    fn registry_written_before_litert_settings_still_loads() {
+        let registry: LocalModelRegistry = serde_json::from_str(REGISTRY_WITHOUT_LITERT).unwrap();
+        let settings = &registry.models[0].settings;
+        assert!(settings.litert.is_none());
+        assert_eq!(settings.context_size, Some(16384));
+
+        let written = serde_json::to_value(settings).unwrap();
+        assert!(
+            written.get("litert").is_none(),
+            "an absent block must not be written back as null"
+        );
+    }
+
+    #[test]
+    fn litert_settings_survive_a_registry_round_trip() {
+        let mut value: serde_json::Value = serde_json::from_str(REGISTRY_WITHOUT_LITERT).unwrap();
+        value["models"][0]["backend_id"] = serde_json::json!("litert");
+        value["models"][0]["settings"]["litert"] =
+            serde_json::json!({"backend": "gpu", "speculative_decoding": false});
+
+        let registry: LocalModelRegistry = serde_json::from_value(value).unwrap();
+        let entry = &registry.models[0];
+        assert_eq!(entry.backend_id.as_deref(), Some("litert"));
+        assert_eq!(
+            entry.settings.litert,
+            Some(LiteRtSettings {
+                backend: Some("gpu".to_string()),
+                speculative_decoding: Some(false),
+            })
+        );
+
+        let reread: LocalModelRegistry =
+            serde_json::from_str(&serde_json::to_string(&registry).unwrap()).unwrap();
+        assert_eq!(reread.models[0].settings.litert, entry.settings.litert);
     }
 
     #[test]

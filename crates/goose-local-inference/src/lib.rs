@@ -7,6 +7,7 @@ pub mod provider_utils;
 
 mod backend;
 pub mod hf_models;
+mod litert;
 mod llamacpp;
 pub mod local_model_registry;
 pub mod management;
@@ -32,6 +33,7 @@ use goose_provider_types::errors::ProviderError;
 use goose_provider_types::images::ImageFormat;
 use goose_provider_types::model::ModelConfig;
 use goose_provider_types::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
+use litert::{LiteRtBackend, LITERT_BACKEND_ID};
 use llamacpp::{LlamaCppBackend, LLAMACPP_BACKEND_ID};
 use local_model_registry::ChatTemplate;
 use mlx::{MlxBackend, MLX_BACKEND_ID};
@@ -160,9 +162,11 @@ impl InferenceRuntime {
         }
         let llamacpp_backend: Arc<dyn LocalInferenceBackend> = Arc::new(LlamaCppBackend::new()?);
         let mlx_backend: Arc<dyn LocalInferenceBackend> = Arc::new(MlxBackend::new());
+        let litert_backend: Arc<dyn LocalInferenceBackend> = Arc::new(LiteRtBackend::new());
         let mut backends = HashMap::new();
         backends.insert(LLAMACPP_BACKEND_ID, llamacpp_backend);
         backends.insert(MLX_BACKEND_ID, mlx_backend);
+        backends.insert(LITERT_BACKEND_ID, litert_backend);
         let runtime = Arc::new(Self {
             models: StdMutex::new(HashMap::new()),
             cold_load_lock: Mutex::new(()),

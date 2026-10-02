@@ -5137,6 +5137,7 @@ dependencies = [
  "goose-sdk-types",
  "hf-hub",
  "include_dir",
+ "libloading 0.9.0",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "minijinja",
