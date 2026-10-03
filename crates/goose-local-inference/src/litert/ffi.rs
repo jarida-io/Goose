@@ -1,5 +1,7 @@
 //! Runtime binding for the LiteRT-LM C API 1.0.0 (`c/engine.h`,
-//! `c/conversation.h`, `c/model_info.h`, `c/error_reporter.h`).
+//! `c/conversation.h`, `c/model_info.h`, `c/error_reporter.h`), plus, when the
+//! library has them, the KV snapshot and prompt-prefill functions of GIAP's
+//! fork, giap-main.
 //!
 //! The library carries its own Rust std, allocator, abseil and protobuf, so it
 //! is opened by absolute path with `RTLD_LOCAL` and only C types cross the
@@ -129,6 +131,8 @@ struct Api {
         *mut c_void,
     ) -> Status,
     conversation_cancel_process: unsafe extern "C" fn(*mut RawConversation) -> Status,
+    conversation_render_message_to_string:
+        unsafe extern "C" fn(*mut RawConversation, *const c_char, *mut *const c_char) -> Status,
     conversation_get_token_count: unsafe extern "C" fn(*mut RawConversation, *mut c_int) -> Status,
     conversation_get_benchmark_info:
         unsafe extern "C" fn(*mut RawConversation, *mut *mut RawBenchmarkInfo) -> Status,
@@ -148,14 +152,64 @@ struct Api {
         unsafe extern "C" fn(*const RawBenchmarkInfo, c_int, *mut c_int) -> Status,
     benchmark_info_get_prefill_tokens_per_sec_at:
         unsafe extern "C" fn(*const RawBenchmarkInfo, c_int, *mut f64) -> Status,
+    /// GIAP's additions, when the library is built from giap-main.
+    giap: Option<GiapApi>,
     /// Never unloaded: the function pointers above point into it.
     _library: Library,
+}
+
+/// GIAP's giap-main additions to the C API: KV snapshots, and a prompt
+/// prefilled as text after the KV cache is rewound, which reuses every token
+/// the cache already holds. Upstream LiteRT-LM has none of them; the backend
+/// then never parks or rematches a conversation.
+struct GiapApi {
+    conversation_save_kv_snapshot:
+        unsafe extern "C" fn(*mut RawConversation, *const c_char) -> Status,
+    conversation_load_kv_snapshot:
+        unsafe extern "C" fn(*mut RawConversation, *const c_char) -> Status,
+    conversation_send_prefill_text_stream: unsafe extern "C" fn(
+        *mut RawConversation,
+        c_int,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const c_void,
+        StreamCallback,
+        *mut c_void,
+    ) -> Status,
+}
+
+impl GiapApi {
+    /// All of them or none: a library with only some is not a giap-main build.
+    ///
+    /// # Safety
+    /// As for `symbol`.
+    unsafe fn resolve(library: &Library) -> Option<Self> {
+        Some(Self {
+            conversation_save_kv_snapshot: symbol(
+                library,
+                "litert_lm_conversation_save_kv_snapshot",
+            )
+            .ok()?,
+            conversation_load_kv_snapshot: symbol(
+                library,
+                "litert_lm_conversation_load_kv_snapshot",
+            )
+            .ok()?,
+            conversation_send_prefill_text_stream: symbol(
+                library,
+                "litert_lm_conversation_send_prefill_text_stream",
+            )
+            .ok()?,
+        })
+    }
 }
 
 macro_rules! resolve_api {
     ($library:ident; $($field:ident),* $(,)?) => {
         Api {
             $( $field: symbol(&$library, concat!("litert_lm_", stringify!($field)))?, )*
+            giap: GiapApi::resolve(&$library),
             _library: $library,
         }
     };
@@ -214,6 +268,7 @@ impl Api {
             conversation_delete,
             conversation_send_message_stream,
             conversation_cancel_process,
+            conversation_render_message_to_string,
             conversation_get_token_count,
             conversation_get_benchmark_info,
             stream_chunk_get_text,
@@ -560,6 +615,13 @@ impl Engine {
         Ok(Self { handle, api })
     }
 
+    /// Whether the library has giap-main's prompt prefill and KV snapshot
+    /// calls, which `Conversation::send_prompt`, `save_kv_snapshot` and
+    /// `load_kv_snapshot` need.
+    pub(super) fn supports_snapshots(&self) -> bool {
+        self.api.giap.is_some()
+    }
+
     pub(super) fn conversation(
         &self,
         config: &ConversationConfig<'_>,
@@ -723,15 +785,7 @@ impl Conversation {
         message_json: &str,
     ) -> Result<mpsc::Receiver<RawChunk>, ProviderError> {
         let message = c_string(message_json, "message")?;
-        let (sender, receiver) = mpsc::channel();
-        *self
-            .sink
-            .sender
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
-        let data = ptr::from_ref::<StreamSink>(&*self.sink)
-            .cast_mut()
-            .cast::<c_void>();
+        let (receiver, data) = self.stream();
         let status = unsafe {
             (self.api.conversation_send_message_stream)(
                 self.handle.as_ptr(),
@@ -744,6 +798,100 @@ impl Conversation {
         };
         self.api.check(status, "conversation_send_message_stream")?;
         Ok(receiver)
+    }
+
+    /// Starts a turn from `prompt`, the complete text the template renders for
+    /// `messages_json` (every message of the request), after rewinding the KV
+    /// cache to `rewind_to_step` tokens. Tokens the cache already holds are
+    /// reused rather than prefilled; the messages become the history. Chunks
+    /// arrive as for `send`. Needs a giap-main library.
+    pub(super) fn send_prompt(
+        &mut self,
+        rewind_to_step: usize,
+        prompt: &str,
+        messages_json: &str,
+    ) -> Result<mpsc::Receiver<RawChunk>, ProviderError> {
+        let giap = self.giap("conversation_send_prefill_text_stream")?;
+        let prompt = c_string(prompt, "prompt")?;
+        let messages = c_string(messages_json, "messages")?;
+        let (receiver, data) = self.stream();
+        let status = unsafe {
+            (giap.conversation_send_prefill_text_stream)(
+                self.handle.as_ptr(),
+                c_int_saturating(rewind_to_step),
+                prompt.as_ptr(),
+                messages.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                stream_callback,
+                data,
+            )
+        };
+        self.api
+            .check(status, "conversation_send_prefill_text_stream")?;
+        Ok(receiver)
+    }
+
+    /// Points the stream sink at a new channel for the next turn.
+    fn stream(&mut self) -> (mpsc::Receiver<RawChunk>, *mut c_void) {
+        let (sender, receiver) = mpsc::channel();
+        *self
+            .sink
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+        let data = ptr::from_ref::<StreamSink>(&*self.sink)
+            .cast_mut()
+            .cast::<c_void>();
+        (receiver, data)
+    }
+
+    /// The text the template renders for `message_json` as the next message of
+    /// this conversation, its preface included while nothing has been sent.
+    pub(super) fn render(&self, message_json: &str) -> Result<String, ProviderError> {
+        let message = c_string(message_json, "message")?;
+        let mut out: *const c_char = ptr::null();
+        let status = unsafe {
+            (self.api.conversation_render_message_to_string)(
+                self.handle.as_ptr(),
+                message.as_ptr(),
+                &mut out,
+            )
+        };
+        self.api
+            .check(status, "conversation_render_message_to_string")?;
+        // SAFETY: owned by the conversation until the next render; copied here.
+        unsafe { owned_string(out) }.ok_or_else(|| {
+            ProviderError::ExecutionError("LiteRT-LM rendered no prompt".to_string())
+        })
+    }
+
+    /// Writes the KV cache and the tokens it holds to `path` (beside it, then
+    /// renamed over it).
+    pub(super) fn save_kv_snapshot(&self, path: &Path) -> Result<(), ProviderError> {
+        let giap = self.giap("conversation_save_kv_snapshot")?;
+        let path = path_c_string(path)?;
+        let status =
+            unsafe { (giap.conversation_save_kv_snapshot)(self.handle.as_ptr(), path.as_ptr()) };
+        self.api.check(status, "conversation_save_kv_snapshot")
+    }
+
+    /// Replaces the KV cache with one `save_kv_snapshot` wrote. Follow it with
+    /// `send_prompt` from step 0, which reuses the tokens the snapshot holds.
+    pub(super) fn load_kv_snapshot(&mut self, path: &Path) -> Result<(), ProviderError> {
+        let giap = self.giap("conversation_load_kv_snapshot")?;
+        let path = path_c_string(path)?;
+        let status =
+            unsafe { (giap.conversation_load_kv_snapshot)(self.handle.as_ptr(), path.as_ptr()) };
+        self.api.check(status, "conversation_load_kv_snapshot")
+    }
+
+    fn giap(&self, call: &str) -> Result<&'static GiapApi, ProviderError> {
+        self.api.giap.as_ref().ok_or_else(|| {
+            ProviderError::ExecutionError(format!(
+                "this LiteRT-LM library has no {call}; build it from GIAP's giap-main"
+            ))
+        })
     }
 
     /// After a cancel the conversation must not be used again.

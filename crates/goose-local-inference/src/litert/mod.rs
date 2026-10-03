@@ -1,14 +1,24 @@
 //! LiteRT-LM backend: `.litertlm` models through the LiteRT-LM C API's
 //! stateful Conversation. Each loaded model keeps one conversation as its
 //! prompt cache; a request that extends it sends only the new messages.
+//!
+//! With GIAP's giap-main library the cache does more. A request that does not
+//! extend the retained conversation (a compacted, edited or repeated history)
+//! has its whole prompt prefilled into it from step 0, and LiteRT-LM skips
+//! every leading token its KV cache already holds. Before another conversation
+//! runs, such as a memory-extraction side call, the retained one is saved to
+//! disk as a KV snapshot and deleted, because two live conversations make
+//! LiteRT-LM copy the whole KV cache from one into the other; the next request
+//! of its family restores the snapshot into a new conversation.
 
 mod convert;
 mod ffi;
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::sync::mpsc::RecvTimeoutError;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use goose_provider_types::conversation::message::{Message, MessageContent};
 use goose_provider_types::conversation::token_usage::ProviderStats;
@@ -28,6 +38,16 @@ const DEFAULT_EXECUTION_BACKEND: &str = "cpu";
 const DEFAULT_MAX_NUM_TOKENS: usize = 4096;
 const DEFAULT_CPU_THREADS: i32 = 4;
 const CACHE_SUBDIR: &str = "litert-lm/cache";
+const SNAPSHOT_SUBDIR: &str = "litert-lm/kv-snapshots";
+/// A conversation holding fewer tokens is cheaper to prefill again than to save.
+const MIN_SNAPSHOT_TOKENS: usize = 512;
+/// Each snapshot is the whole KV cache, its full window whatever it holds
+/// (151 MB for gemma-4-E2B with 16384 tokens); the most recently used are kept.
+/// Three, so a background job that took the slot during a quiet spell, such as
+/// a proactive review, cannot push the chat's out.
+const SNAPSHOTS_KEPT: usize = 3;
+/// Age at which a snapshot left half-written by a process that died is removed.
+const STALE_PARTIAL_SNAPSHOT: Duration = Duration::from_secs(60 * 60);
 const STREAM_POLL: Duration = Duration::from_millis(100);
 
 pub(super) struct LiteRtBackend;
@@ -41,8 +61,22 @@ impl LiteRtBackend {
 struct LoadedModel {
     // Declared before `engine` so its conversation is deleted first.
     main: Option<MainConversation>,
+    /// The conversation last set aside, which stands in for the retained one
+    /// while there is none.
+    aside: Option<Aside>,
     engine: ffi::Engine,
     max_num_tokens: usize,
+    /// `None` when the library lacks giap-main's prompt and snapshot calls.
+    snapshots: Option<Snapshots>,
+}
+
+/// What a conversation set aside was. While nothing is retained, a request
+/// weighing less than half of it is still a side call, so a burst of them
+/// after a quiet spell (titling, a memory-extraction pass) neither takes the
+/// slot nor writes a snapshot of its own.
+struct Aside {
+    identity: Identity,
+    weight: usize,
 }
 
 impl BackendLoadedModel for LoadedModel {
@@ -67,6 +101,13 @@ impl MainConversation {
             options: self.options,
             consumed: &self.consumed,
         }
+    }
+
+    /// Appends a completed turn: the messages sent and the reply generated.
+    fn record(&mut self, sent: &[Value], done: &Completed) {
+        self.consumed.extend_from_slice(sent);
+        self.consumed
+            .extend(convert::generated_message(&done.text, &done.tool_calls));
     }
 }
 
@@ -94,9 +135,13 @@ struct Held<'a> {
 enum Plan {
     /// Send `messages[from..]` to the retained conversation.
     Extend { from: usize },
-    /// Replace the retained conversation, history as preface.
+    /// Prefill the whole prompt into the retained conversation from step 0,
+    /// reusing what its KV cache already holds.
+    Rematch,
+    /// Replace the retained conversation, restoring the request family's KV
+    /// snapshot when there is one.
     Recreate,
-    /// Answer in a conversation of its own and leave the retained one alone.
+    /// Answer in a conversation of its own; the retained one is set aside.
     Throwaway,
 }
 
@@ -106,15 +151,31 @@ enum Plan {
 /// weighs less than half of what is retained, the rule the llama.cpp backend
 /// uses for its sacrificial context: side calls such as memory extraction
 /// never cost the chat its prefix, while a chat whose tools changed takes the
-/// retained slot over instead of running beside it forever.
-fn plan(held: Option<Held<'_>>, identity: &Identity, options: Options, messages: &[Value]) -> Plan {
+/// retained slot over instead of running beside it forever. With nothing
+/// retained, the conversation last set aside is weighed in its place.
+/// `can_rematch` says the library can prefill a whole prompt into the
+/// retained conversation.
+fn plan(
+    held: Option<Held<'_>>,
+    aside: Option<&Aside>,
+    identity: &Identity,
+    options: Options,
+    messages: &[Value],
+    can_rematch: bool,
+) -> Plan {
     let Some(held) = held else {
-        return Plan::Recreate;
+        return match aside {
+            Some(aside)
+                if aside.identity != *identity
+                    && is_side_call(identity, messages, aside.weight) =>
+            {
+                Plan::Throwaway
+            }
+            _ => Plan::Recreate,
+        };
     };
     if held.identity != identity {
-        let request = weight(identity, messages);
-        let retained = weight(held.identity, held.consumed);
-        return if request.saturating_mul(2) < retained {
+        return if is_side_call(identity, messages, weight(held.identity, held.consumed)) {
             Plan::Throwaway
         } else {
             Plan::Recreate
@@ -126,9 +187,16 @@ fn plan(held: Option<Held<'_>>, identity: &Identity, options: Options, messages:
     let from = held.consumed.len();
     if messages.len() > from && messages[..from] == *held.consumed {
         Plan::Extend { from }
+    } else if can_rematch {
+        Plan::Rematch
     } else {
         Plan::Recreate
     }
+}
+
+/// A request weighing less than half of the conversation it would displace.
+fn is_side_call(identity: &Identity, messages: &[Value], displaced: usize) -> bool {
+    weight(identity, messages).saturating_mul(2) < displaced
 }
 
 fn weight(identity: &Identity, messages: &[Value]) -> usize {
@@ -138,6 +206,120 @@ fn weight(identity: &Identity, messages: &[Value]) -> usize {
             .iter()
             .map(|message| message.to_string().len())
             .sum::<usize>()
+}
+
+/// KV snapshots of conversations set aside, one file per model and family.
+struct Snapshots {
+    dir: PathBuf,
+    /// The model file and the engine settings its KV cache depends on.
+    model: String,
+}
+
+impl Snapshots {
+    fn new(
+        model_path: &Path,
+        backend: &str,
+        max_num_tokens: usize,
+        speculative_decoding: bool,
+    ) -> Self {
+        let (size, modified) = std::fs::metadata(model_path)
+            .map(|metadata| {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |since| since.as_secs());
+                (metadata.len(), modified)
+            })
+            .unwrap_or_default();
+        Self {
+            dir: Paths::in_data_dir(SNAPSHOT_SUBDIR),
+            model: format!(
+                "{}\n{size}\n{modified}\n{backend}\n{max_num_tokens}\n{speculative_decoding}",
+                model_path.display()
+            ),
+        }
+    }
+
+    /// The family's file: the model, the system message, the tools and whether
+    /// thinking is on, everything a conversation is fixed to at creation that
+    /// changes what it holds. Keyed on the whole identity, because jobs that
+    /// open with the same system prompt as the chat, such as the proactive
+    /// review, would otherwise write over the chat's snapshot.
+    fn path(&self, identity: &Identity, options: Options) -> PathBuf {
+        let hash = fnv1a(&[
+            self.model.as_bytes(),
+            identity.system.as_bytes(),
+            identity.tools.as_deref().unwrap_or_default().as_bytes(),
+            &[u8::from(options.enable_thinking)],
+        ]);
+        self.dir.join(format!("{hash:016x}.kv"))
+    }
+
+    fn save(&self, conversation: &ffi::Conversation, path: &Path) -> Result<(), ProviderError> {
+        std::fs::create_dir_all(&self.dir).map_err(|error| {
+            ProviderError::ExecutionError(format!(
+                "Failed to create the LiteRT-LM snapshot directory {}: {error}",
+                self.dir.display()
+            ))
+        })?;
+        conversation.save_kv_snapshot(path)?;
+        self.prune();
+        Ok(())
+    }
+
+    /// Keeps the most recently used snapshots and drops abandoned partial ones.
+    fn prune(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let mut snapshots = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+                continue;
+            };
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("kv") => snapshots.push((modified, path)),
+                Some("tmp")
+                    if modified
+                        .elapsed()
+                        .is_ok_and(|age| age > STALE_PARTIAL_SNAPSHOT) =>
+                {
+                    let _ = std::fs::remove_file(path);
+                }
+                _ => {}
+            }
+        }
+        snapshots.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in snapshots.into_iter().skip(SNAPSHOTS_KEPT) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Marks a snapshot as used, for pruning.
+fn touch(path: &Path) {
+    let _ = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+}
+
+/// FNV-1a over length-prefixed fields; unlike `std`'s hasher it is the same
+/// in every build, so snapshot names survive an upgrade.
+fn fnv1a(fields: &[&[u8]]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for field in fields {
+        let length = (field.len() as u64).to_le_bytes();
+        for byte in length.iter().chain(field.iter()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash
 }
 
 fn execution_backend(configured: Option<&str>) -> String {
@@ -267,10 +449,21 @@ impl LocalInferenceBackend for LiteRtBackend {
             num_threads,
             speculative_decoding,
         })?;
+        let snapshots = engine
+            .supports_snapshots()
+            .then(|| Snapshots::new(model_path, &backend, max_num_tokens, speculative_decoding));
+        tracing::info!(
+            backend = LITERT_BACKEND_ID,
+            model_id,
+            rematch_and_kv_snapshots = snapshots.is_some(),
+            "Loaded LiteRT-LM model"
+        );
         Ok(Box::new(LoadedModel {
             main: None,
+            aside: None,
             engine,
             max_num_tokens,
+            snapshots,
         }))
     }
 
@@ -287,9 +480,11 @@ impl LocalInferenceBackend for LiteRtBackend {
             })?;
         let started = Instant::now();
         let messages = convert::litert_messages(request.messages);
-        let history = messages.len().checked_sub(1).ok_or_else(|| {
-            ProviderError::ExecutionError("LiteRT-LM received no messages to answer".to_string())
-        })?;
+        if messages.is_empty() {
+            return Err(ProviderError::ExecutionError(
+                "LiteRT-LM received no messages to answer".to_string(),
+            ));
+        }
         let identity = Identity {
             system: request.system.to_string(),
             tools: convert::tools_json(request.tools)?,
@@ -300,9 +495,11 @@ impl LocalInferenceBackend for LiteRtBackend {
         };
         let decision = plan(
             loaded.main.as_ref().map(MainConversation::held),
+            loaded.aside.as_ref(),
             &identity,
             options,
             &messages,
+            loaded.snapshots.is_some(),
         );
         tracing::debug!(
             target: "giap::kv",
@@ -313,55 +510,13 @@ impl LocalInferenceBackend for LiteRtBackend {
         );
 
         let turn = match decision {
-            Plan::Extend { from } => {
-                let main = loaded
-                    .main
-                    .as_mut()
-                    .expect("an extend plan has a retained conversation");
-                let turn = run_turn(&mut main.conversation, &messages[from..], &request, false);
-                if let Ok(Turn::Completed(done)) = &turn {
-                    main.consumed.extend_from_slice(&messages[from..]);
-                    main.consumed
-                        .extend(convert::generated_message(&done.text, &done.tool_calls));
-                } else {
-                    loaded.main = None;
-                }
-                turn
-            }
+            Plan::Extend { from } => extend(loaded, &messages, from, &request),
+            Plan::Rematch => rematch(loaded, identity, options, &messages, &request),
             Plan::Recreate => {
-                loaded.main = None;
-                let conversation = open_conversation(
-                    &loaded.engine,
-                    &identity,
-                    options,
-                    request.settings,
-                    &messages[..history],
-                )?;
-                let mut main = MainConversation {
-                    conversation,
-                    identity,
-                    options,
-                    consumed: messages[..history].to_vec(),
-                };
-                let turn = run_turn(&mut main.conversation, &messages[history..], &request, true);
-                if let Ok(Turn::Completed(done)) = &turn {
-                    main.consumed.push(messages[history].clone());
-                    main.consumed
-                        .extend(convert::generated_message(&done.text, &done.tool_calls));
-                    loaded.main = Some(main);
-                }
-                turn
+                set_aside(loaded);
+                recreate(loaded, identity, options, &messages, &request, true)
             }
-            Plan::Throwaway => {
-                let mut conversation = open_conversation(
-                    &loaded.engine,
-                    &identity,
-                    options,
-                    request.settings,
-                    &messages[..history],
-                )?;
-                run_turn(&mut conversation, &messages[history..], &request, true)
-            }
+            Plan::Throwaway => throwaway(loaded, &identity, options, &messages, &request),
         };
 
         if let Turn::Completed(done) = turn? {
@@ -394,6 +549,322 @@ fn open_conversation(
     })
 }
 
+fn extend(
+    loaded: &mut LoadedModel,
+    messages: &[Value],
+    from: usize,
+    request: &LocalGenerationRequest<'_>,
+) -> Result<Turn, ProviderError> {
+    let main = loaded
+        .main
+        .as_mut()
+        .expect("an extend plan has a retained conversation");
+    let tail = &messages[from..];
+    let turn = run_turn(
+        &mut main.conversation,
+        &Input::Messages(tail),
+        request,
+        false,
+    );
+    match &turn {
+        Ok(Turn::Completed(done)) => main.record(tail, done),
+        _ => loaded.main = None,
+    }
+    turn
+}
+
+/// Prefills the request's whole prompt into the retained conversation from
+/// step 0: LiteRT-LM skips the leading tokens its KV cache already holds, so a
+/// compacted, edited or repeated history costs only what changed.
+fn rematch(
+    loaded: &mut LoadedModel,
+    identity: Identity,
+    options: Options,
+    messages: &[Value],
+    request: &LocalGenerationRequest<'_>,
+) -> Result<Turn, ProviderError> {
+    let input = match prompt_input(
+        &loaded.engine,
+        &identity,
+        options,
+        request.settings,
+        messages,
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            tracing::warn!(
+                backend = LITERT_BACKEND_ID,
+                %error,
+                "LiteRT-LM could not render the prompt; recreating the conversation"
+            );
+            loaded.main = None;
+            return recreate(loaded, identity, options, messages, request, false);
+        }
+    };
+    let main = loaded
+        .main
+        .as_mut()
+        .expect("a rematch plan has a retained conversation");
+    let started = match start_turn(&mut main.conversation, &input, false) {
+        Ok(started) => started,
+        Err(error) => {
+            tracing::warn!(
+                backend = LITERT_BACKEND_ID,
+                %error,
+                "LiteRT-LM could not rematch the retained conversation; recreating it"
+            );
+            loaded.main = None;
+            return recreate(loaded, identity, options, messages, request, false);
+        }
+    };
+    let turn = finish_turn(&mut main.conversation, started, request);
+    match &turn {
+        Ok(Turn::Completed(done)) => {
+            main.consumed.clear();
+            main.record(messages, done);
+        }
+        _ => loaded.main = None,
+    }
+    turn
+}
+
+/// Retains a new conversation for the request.
+///
+/// With giap-main (and `use_prompt`) the new conversation has no preface:
+/// the request's whole prompt is prefilled into it, after the family's KV
+/// snapshot, if there is one, is restored. A later rematch then finds the
+/// history only where LiteRT-LM keeps it, not repeated in a preface. Otherwise,
+/// or when that cannot start, the history is the preface and the last message
+/// is sent, as upstream LiteRT-LM expects.
+fn recreate(
+    loaded: &mut LoadedModel,
+    identity: Identity,
+    options: Options,
+    messages: &[Value],
+    request: &LocalGenerationRequest<'_>,
+    use_prompt: bool,
+) -> Result<Turn, ProviderError> {
+    loaded.main = None;
+    let history = messages.len() - 1;
+    let snapshot = loaded
+        .snapshots
+        .as_ref()
+        .map(|snapshots| snapshots.path(&identity, options))
+        .filter(|path| path.is_file());
+    if use_prompt && loaded.snapshots.is_some() && (history > 0 || snapshot.is_some()) {
+        match prompt_input(
+            &loaded.engine,
+            &identity,
+            options,
+            request.settings,
+            messages,
+        ) {
+            Ok(input) => {
+                let (mut conversation, restored) = restored_conversation(
+                    &loaded.engine,
+                    &identity,
+                    options,
+                    request.settings,
+                    snapshot.as_deref(),
+                )?;
+                match start_turn(&mut conversation, &input, !restored) {
+                    Ok(started) => {
+                        let turn = finish_turn(&mut conversation, started, request);
+                        retain(loaded, conversation, identity, options, messages, &turn);
+                        return turn;
+                    }
+                    Err(error) => tracing::warn!(
+                        backend = LITERT_BACKEND_ID,
+                        %error,
+                        "LiteRT-LM could not prefill the prompt; sending the history as a preface"
+                    ),
+                }
+            }
+            Err(error) => tracing::warn!(
+                backend = LITERT_BACKEND_ID,
+                %error,
+                "LiteRT-LM could not render the prompt; sending the history as a preface"
+            ),
+        }
+    }
+    let mut conversation = open_conversation(
+        &loaded.engine,
+        &identity,
+        options,
+        request.settings,
+        &messages[..history],
+    )?;
+    let turn = run_turn(
+        &mut conversation,
+        &Input::Messages(&messages[history..]),
+        request,
+        true,
+    );
+    retain(loaded, conversation, identity, options, messages, &turn);
+    turn
+}
+
+/// Keeps a new conversation whose turn completed as the retained one.
+fn retain(
+    loaded: &mut LoadedModel,
+    conversation: ffi::Conversation,
+    identity: Identity,
+    options: Options,
+    messages: &[Value],
+    turn: &Result<Turn, ProviderError>,
+) {
+    if let Ok(Turn::Completed(done)) = turn {
+        let mut main = MainConversation {
+            conversation,
+            identity,
+            options,
+            consumed: Vec::new(),
+        };
+        main.record(messages, done);
+        loaded.main = Some(main);
+    }
+}
+
+/// Answers a side call, such as memory extraction, in a conversation of its
+/// own. With giap-main the retained conversation is set aside first; without
+/// it, it stays, and LiteRT-LM copies its KV cache aside while the call runs.
+fn throwaway(
+    loaded: &mut LoadedModel,
+    identity: &Identity,
+    options: Options,
+    messages: &[Value],
+    request: &LocalGenerationRequest<'_>,
+) -> Result<Turn, ProviderError> {
+    if loaded.snapshots.is_some() {
+        set_aside(loaded);
+    }
+    let history = messages.len() - 1;
+    let mut conversation = open_conversation(
+        &loaded.engine,
+        identity,
+        options,
+        request.settings,
+        &messages[..history],
+    )?;
+    run_turn(
+        &mut conversation,
+        &Input::Messages(&messages[history..]),
+        request,
+        true,
+    )
+}
+
+/// Deletes the retained conversation, first saving its KV cache as its
+/// family's snapshot when the library can and it holds enough to be worth
+/// restoring.
+fn set_aside(loaded: &mut LoadedModel) {
+    let Some(main) = loaded.main.take() else {
+        return;
+    };
+    let Some(snapshots) = &loaded.snapshots else {
+        return;
+    };
+    loaded.aside = Some(Aside {
+        identity: main.identity.clone(),
+        weight: weight(&main.identity, &main.consumed),
+    });
+    let tokens = main.conversation.token_count().unwrap_or(0);
+    if tokens < MIN_SNAPSHOT_TOKENS {
+        return;
+    }
+    let path = snapshots.path(&main.identity, main.options);
+    let saving = Instant::now();
+    match snapshots.save(&main.conversation, &path) {
+        Ok(()) => tracing::info!(
+            target: "giap::kv",
+            backend = LITERT_BACKEND_ID,
+            tokens,
+            save_ms = millis(saving.elapsed()),
+            file = %path.display(),
+            "Saved the retained LiteRT-LM conversation as a KV snapshot"
+        ),
+        Err(error) => tracing::warn!(
+            backend = LITERT_BACKEND_ID,
+            %error,
+            "Could not save the retained LiteRT-LM conversation's KV snapshot"
+        ),
+    }
+}
+
+/// A new conversation without a preface, holding the snapshot at `snapshot`
+/// when that loads; says whether it does. A snapshot that does not load is
+/// deleted.
+fn restored_conversation(
+    engine: &ffi::Engine,
+    identity: &Identity,
+    options: Options,
+    settings: &ModelSettings,
+    snapshot: Option<&Path>,
+) -> Result<(ffi::Conversation, bool), ProviderError> {
+    let mut conversation = open_conversation(engine, identity, options, settings, &[])?;
+    let Some(path) = snapshot else {
+        return Ok((conversation, false));
+    };
+    let loading = Instant::now();
+    match conversation.load_kv_snapshot(path) {
+        Ok(()) => {
+            touch(path);
+            tracing::info!(
+                target: "giap::kv",
+                backend = LITERT_BACKEND_ID,
+                tokens = conversation.token_count().unwrap_or(0),
+                load_ms = millis(loading.elapsed()),
+                file = %path.display(),
+                "Restored a LiteRT-LM KV snapshot"
+            );
+            Ok((conversation, true))
+        }
+        Err(error) => {
+            tracing::warn!(
+                backend = LITERT_BACKEND_ID,
+                %error,
+                file = %path.display(),
+                "Deleting a LiteRT-LM KV snapshot that did not load"
+            );
+            let _ = std::fs::remove_file(path);
+            // What a failed load left in the KV cache is not trusted.
+            drop(conversation);
+            let conversation = open_conversation(engine, identity, options, settings, &[])?;
+            Ok((conversation, false))
+        }
+    }
+}
+
+/// The request's whole prompt as a new conversation would prefill it,
+/// rendered by a conversation that is never run, so no KV cache moves.
+fn prompt_input(
+    engine: &ffi::Engine,
+    identity: &Identity,
+    options: Options,
+    settings: &ModelSettings,
+    messages: &[Value],
+) -> Result<Input<'static>, ProviderError> {
+    let (last, preface) = messages.split_last().ok_or_else(|| {
+        ProviderError::ExecutionError("LiteRT-LM received no messages to answer".to_string())
+    })?;
+    let renderer = open_conversation(engine, identity, options, settings, preface)?;
+    let text = renderer.render(&last.to_string())?;
+    Ok(Input::Prompt {
+        text,
+        messages: convert::send_payload(messages),
+    })
+}
+
+/// What a turn sends.
+enum Input<'a> {
+    /// The messages after those the conversation holds.
+    Messages(&'a [Value]),
+    /// A request's whole prompt, prefilled from step 0 so LiteRT-LM reuses
+    /// the leading tokens its KV cache holds; `messages`, every message of the
+    /// request, become the conversation's history.
+    Prompt { text: String, messages: String },
+}
+
 enum Turn {
     Completed(Completed),
     /// goose dropped the stream; the conversation was cancelled.
@@ -414,6 +885,10 @@ struct TurnNumbers {
     tokens_before: usize,
     tokens_after: Option<usize>,
     new_turns: Option<ffi::NewTurns>,
+    /// The whole prompt was prefilled from step 0. LiteRT-LM's benchmark then
+    /// counts every prompt token as prefilled, the ones it skipped included,
+    /// so how many were reused is not known here (its log line says).
+    whole_prompt: bool,
 }
 
 impl TurnNumbers {
@@ -438,8 +913,11 @@ impl TurnNumbers {
     /// Tokens already in the KV cache that this turn did not prefill again.
     /// Lower than the count before the send when LiteRT-LM rewound to drop
     /// earlier thoughts and refilled from there.
-    fn reused_prefix_tokens(&self) -> usize {
-        match (self.tokens_after, &self.new_turns) {
+    fn reused_prefix_tokens(&self) -> Option<usize> {
+        if self.whole_prompt {
+            return None;
+        }
+        Some(match (self.tokens_after, &self.new_turns) {
             (Some(after), Some(turns)) => {
                 let prefilled: usize = turns.prefill.iter().map(|(tokens, _)| tokens).sum();
                 after
@@ -447,7 +925,7 @@ impl TurnNumbers {
                     .min(self.tokens_before)
             }
             _ => self.tokens_before,
-        }
+        })
     }
 
     /// Context the model attended to before generating.
@@ -460,12 +938,32 @@ impl TurnNumbers {
     }
 }
 
+/// A turn whose stream has started.
+struct Started {
+    chunks: Receiver<ffi::RawChunk>,
+    sent: Instant,
+    tokens_before: usize,
+    turns_before: Option<ffi::TurnCounts>,
+    whole_prompt: bool,
+}
+
 fn run_turn(
     conversation: &mut ffi::Conversation,
-    tail: &[Value],
+    input: &Input<'_>,
     request: &LocalGenerationRequest<'_>,
     fresh: bool,
 ) -> Result<Turn, ProviderError> {
+    let started = start_turn(conversation, input, fresh)?;
+    finish_turn(conversation, started, request)
+}
+
+/// Sends the input. An error here means nothing was generated, so the caller
+/// can still try another way.
+fn start_turn(
+    conversation: &mut ffi::Conversation,
+    input: &Input<'_>,
+    fresh: bool,
+) -> Result<Started, ProviderError> {
     let tokens_before = if fresh {
         0
     } else {
@@ -473,10 +971,27 @@ fn run_turn(
     };
     let turns_before = conversation.turn_counts();
     let sent = Instant::now();
-    let chunks = conversation.send(&convert::send_payload(tail))?;
-    let mut stream = TurnStream::new(request.message_id, request.tx, sent);
+    let chunks = match input {
+        Input::Messages(tail) => conversation.send(&convert::send_payload(tail))?,
+        Input::Prompt { text, messages } => conversation.send_prompt(0, text, messages)?,
+    };
+    Ok(Started {
+        chunks,
+        sent,
+        tokens_before,
+        turns_before,
+        whole_prompt: matches!(input, Input::Prompt { .. }),
+    })
+}
+
+fn finish_turn(
+    conversation: &mut ffi::Conversation,
+    started: Started,
+    request: &LocalGenerationRequest<'_>,
+) -> Result<Turn, ProviderError> {
+    let mut stream = TurnStream::new(request.message_id, request.tx, started.sent);
     loop {
-        let chunk = match chunks.recv_timeout(STREAM_POLL) {
+        let chunk = match started.chunks.recv_timeout(STREAM_POLL) {
             Ok(chunk) => chunk,
             Err(RecvTimeoutError::Timeout) => {
                 if request.tx.is_closed() {
@@ -509,9 +1024,12 @@ fn run_turn(
                 }
                 ChunkEvent::Final => {
                     let numbers = TurnNumbers {
-                        tokens_before,
+                        tokens_before: started.tokens_before,
                         tokens_after: conversation.token_count().ok(),
-                        new_turns: turns_before.and_then(|before| conversation.turns_since(before)),
+                        new_turns: started
+                            .turns_before
+                            .and_then(|before| conversation.turns_since(before)),
+                        whole_prompt: started.whole_prompt,
                     };
                     return Ok(Turn::Completed(stream.finish(numbers)));
                 }
@@ -614,7 +1132,7 @@ fn emit_completion(
         draft: None,
         prefill_ms: numbers.prefill_ms(),
         effective_context_tokens: Some(max_num_tokens),
-        reused_prefix_tokens: Some(numbers.reused_prefix_tokens()),
+        reused_prefix_tokens: numbers.reused_prefix_tokens(),
     };
     let usage = finalize_usage(
         &mut *request.log,
@@ -667,10 +1185,19 @@ mod tests {
 
     #[test]
     fn nothing_retained_creates_the_conversation() {
-        assert_eq!(
-            plan(None, &identity("chat"), OPTIONS, &[user("hi")]),
-            Plan::Recreate
-        );
+        for can_rematch in [false, true] {
+            assert_eq!(
+                plan(
+                    None,
+                    None,
+                    &identity("chat"),
+                    OPTIONS,
+                    &[user("hi")],
+                    can_rematch
+                ),
+                Plan::Recreate
+            );
+        }
     }
 
     #[test]
@@ -678,30 +1205,37 @@ mod tests {
         let chat = identity("chat");
         let consumed = vec![user("hi"), assistant("hello")];
         let request = vec![user("hi"), assistant("hello"), user("weather?")];
-        assert_eq!(
-            plan(held(&chat, &consumed), &chat, OPTIONS, &request),
-            Plan::Extend { from: 2 }
-        );
+        for can_rematch in [false, true] {
+            assert_eq!(
+                plan(
+                    held(&chat, &consumed),
+                    None,
+                    &chat,
+                    OPTIONS,
+                    &request,
+                    can_rematch
+                ),
+                Plan::Extend { from: 2 }
+            );
+        }
     }
 
     #[test]
-    fn a_diverged_or_repeated_history_recreates() {
+    fn a_diverged_or_repeated_history_rematches_when_the_library_can() {
         let chat = identity("chat");
         let consumed = vec![user("hi"), assistant("hello")];
         let edited = vec![user("hey"), assistant("hello"), user("weather?")];
-        assert_eq!(
-            plan(held(&chat, &consumed), &chat, OPTIONS, &edited),
-            Plan::Recreate
-        );
-        assert_eq!(
-            plan(held(&chat, &consumed), &chat, OPTIONS, &consumed),
-            Plan::Recreate
-        );
         let compacted = vec![user("summary"), user("weather?")];
-        assert_eq!(
-            plan(held(&chat, &consumed), &chat, OPTIONS, &compacted),
-            Plan::Recreate
-        );
+        for request in [&edited, &consumed, &compacted] {
+            assert_eq!(
+                plan(held(&chat, &consumed), None, &chat, OPTIONS, request, true),
+                Plan::Rematch
+            );
+            assert_eq!(
+                plan(held(&chat, &consumed), None, &chat, OPTIONS, request, false),
+                Plan::Recreate
+            );
+        }
     }
 
     #[test]
@@ -713,14 +1247,23 @@ mod tests {
             enable_thinking: false,
             ..OPTIONS
         };
-        assert_eq!(
-            plan(held(&chat, &consumed), &chat, no_thinking, &request),
-            Plan::Recreate
-        );
+        for can_rematch in [false, true] {
+            assert_eq!(
+                plan(
+                    held(&chat, &consumed),
+                    None,
+                    &chat,
+                    no_thinking,
+                    &request,
+                    can_rematch
+                ),
+                Plan::Recreate
+            );
+        }
     }
 
     #[test]
-    fn a_small_side_call_runs_beside_the_retained_conversation() {
+    fn a_small_side_call_gets_a_conversation_of_its_own() {
         let chat = Identity {
             system: "chat ".repeat(500),
             tools: Some("tool ".repeat(500)),
@@ -730,15 +1273,19 @@ mod tests {
             system: "Extract memories.".to_string(),
             tools: None,
         };
-        assert_eq!(
-            plan(
-                held(&chat, &consumed),
-                &extraction,
-                OPTIONS,
-                &[user("the user said hi")]
-            ),
-            Plan::Throwaway
-        );
+        for can_rematch in [false, true] {
+            assert_eq!(
+                plan(
+                    held(&chat, &consumed),
+                    None,
+                    &extraction,
+                    OPTIONS,
+                    &[user("the user said hi")],
+                    can_rematch
+                ),
+                Plan::Throwaway
+            );
+        }
     }
 
     #[test]
@@ -750,10 +1297,162 @@ mod tests {
             tools: Some(r#"[{"type":"function"},{"type":"function"}]"#.to_string()),
         };
         let request = vec![user("hi"), assistant("hello"), user("weather?")];
+        for can_rematch in [false, true] {
+            assert_eq!(
+                plan(
+                    held(&chat, &consumed),
+                    None,
+                    &retooled,
+                    OPTIONS,
+                    &request,
+                    can_rematch
+                ),
+                Plan::Recreate
+            );
+        }
+    }
+
+    #[test]
+    fn a_side_call_after_the_chat_was_set_aside_does_not_take_the_slot() {
+        let chat = Identity {
+            system: "chat ".repeat(500),
+            tools: Some("tool ".repeat(500)),
+        };
+        let aside = Aside {
+            weight: weight(&chat, &[user("hi"), assistant("hello")]),
+            identity: chat.clone(),
+        };
+        let titling = Identity {
+            system: "Title this conversation.".to_string(),
+            tools: None,
+        };
         assert_eq!(
-            plan(held(&chat, &consumed), &retooled, OPTIONS, &request),
+            plan(None, Some(&aside), &titling, OPTIONS, &[user("hi")], true),
+            Plan::Throwaway
+        );
+        // The chat comes back, and so does a request that weighs as much.
+        let request = vec![user("hi"), assistant("hello"), user("weather?")];
+        assert_eq!(
+            plan(None, Some(&aside), &chat, OPTIONS, &request, true),
             Plan::Recreate
         );
+        let review = Identity {
+            system: "review ".repeat(400),
+            tools: Some("tool ".repeat(400)),
+        };
+        assert_eq!(
+            plan(
+                None,
+                Some(&aside),
+                &review,
+                OPTIONS,
+                &[user("review the day")],
+                true
+            ),
+            Plan::Recreate
+        );
+    }
+
+    fn snapshot_store(dir: &Path) -> Snapshots {
+        Snapshots {
+            dir: dir.to_path_buf(),
+            model: "/models/gemma.litertlm\n100\n200\ngpu\n8192\nfalse".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_family_is_everything_a_conversation_is_fixed_to() {
+        let dir = PathBuf::from("/snapshots");
+        let store = snapshot_store(&dir);
+        let prompt = "You are the household assistant. ".repeat(20);
+        let chat = Identity {
+            system: prompt.clone(),
+            tools: Some("[1]".to_string()),
+        };
+        let path = store.path(&chat, OPTIONS);
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        assert_eq!(path.extension(), Some("kv".as_ref()));
+        // The output limit does not change what the KV cache holds.
+        let bounded = Options {
+            max_output_tokens: Some(64),
+            ..OPTIONS
+        };
+        assert_eq!(store.path(&chat, bounded), path);
+
+        // A job that opens like the chat, such as the proactive review, never
+        // shares its file.
+        let review = Identity {
+            system: format!("{prompt}Review the household's day."),
+            tools: Some("[1]".to_string()),
+        };
+        assert_ne!(store.path(&review, OPTIONS), path);
+        let retooled = Identity {
+            tools: Some("[1,2]".to_string()),
+            ..chat.clone()
+        };
+        assert_ne!(store.path(&retooled, OPTIONS), path);
+        let toolless = Identity {
+            tools: None,
+            ..chat.clone()
+        };
+        assert_ne!(store.path(&toolless, OPTIONS), path);
+        let no_thinking = Options {
+            enable_thinking: false,
+            ..OPTIONS
+        };
+        assert_ne!(store.path(&chat, no_thinking), path);
+        let other_model = Snapshots {
+            model: "/models/other.litertlm".to_string(),
+            ..snapshot_store(&dir)
+        };
+        assert_ne!(other_model.path(&chat, OPTIONS), path);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_snapshots_and_drops_abandoned_partial_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let write = |name: &str, age: Duration| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"kv").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        };
+        for kept in 0..SNAPSHOTS_KEPT {
+            write(
+                &format!("kept-{kept}.kv"),
+                Duration::from_secs(10 + kept as u64),
+            );
+        }
+        write("oldest.kv", Duration::from_secs(60));
+        write("abandoned.kv.tmp", STALE_PARTIAL_SNAPSHOT * 2);
+        write("writing.kv.tmp", Duration::from_secs(5));
+
+        snapshot_store(dir.path()).prune();
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected: Vec<String> = (0..SNAPSHOTS_KEPT)
+            .map(|kept| format!("kept-{kept}.kv"))
+            .chain(["writing.kv.tmp".to_string()])
+            .collect();
+        expected.sort();
+        assert_eq!(left, expected);
+    }
+
+    #[test]
+    fn snapshot_names_are_stable_and_fields_stay_apart() {
+        // FNV-1a 64 over the little-endian length and the bytes, computed
+        // independently; a change here orphans every saved snapshot.
+        assert_eq!(fnv1a(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(&[b"chat"]), 0x508a_ff55_cbf4_5cff);
+        assert_ne!(fnv1a(&[b"ab", b"c"]), fnv1a(&[b"a", b"bc"]));
     }
 
     #[test]
@@ -819,9 +1518,10 @@ mod tests {
                 prefill: vec![(200, 1000.0)],
                 decode_tokens: 50,
             }),
+            whole_prompt: false,
         };
         assert_eq!(extended.prefill_ms(), Some(200));
-        assert_eq!(extended.reused_prefix_tokens(), 1000);
+        assert_eq!(extended.reused_prefix_tokens(), Some(1000));
         assert_eq!(extended.prompt_tokens(), 1200);
         assert_eq!(extended.decode_tokens(), Some(50));
 
@@ -832,42 +1532,146 @@ mod tests {
                 prefill: vec![(600, 1200.0), (200, 400.0)],
                 decode_tokens: 50,
             }),
+            whole_prompt: false,
         };
-        assert_eq!(rewound.reused_prefix_tokens(), 400);
+        assert_eq!(rewound.reused_prefix_tokens(), Some(400));
         assert_eq!(rewound.prefill_ms(), Some(1000));
 
         let unmeasured = TurnNumbers {
             tokens_before: 300,
             tokens_after: None,
             new_turns: None,
+            whole_prompt: false,
         };
         assert_eq!(unmeasured.prefill_ms(), None);
-        assert_eq!(unmeasured.reused_prefix_tokens(), 300);
+        assert_eq!(unmeasured.reused_prefix_tokens(), Some(300));
         assert_eq!(unmeasured.prompt_tokens(), 300);
+
+        // The benchmark counts the skipped tokens of a whole prompt as
+        // prefilled; its time is still the real prefill time.
+        let restored = TurnNumbers {
+            tokens_before: 6000,
+            tokens_after: Some(6250),
+            new_turns: Some(ffi::NewTurns {
+                prefill: vec![(6200, 31000.0)],
+                decode_tokens: 50,
+            }),
+            whole_prompt: true,
+        };
+        assert_eq!(restored.reused_prefix_tokens(), None);
+        assert_eq!(restored.prefill_ms(), Some(200));
+        assert_eq!(restored.prompt_tokens(), 6200);
     }
 
     struct Reply {
         text: String,
         tool_requests: Vec<(String, String, serde_json::Map<String, Value>)>,
         stats: Option<ProviderStats>,
+        input_tokens: Option<i32>,
         error: Option<ProviderError>,
     }
 
-    fn weather_tool() -> Tool {
+    fn one_parameter_tool(name: &str, description: &str, parameter: &str, about: &str) -> Tool {
         Tool::new(
-            "weather__get_weather",
-            "Get the current weather for a city.",
+            name.to_string(),
+            description.to_string(),
             std::sync::Arc::new(
                 json!({
                     "type": "object",
-                    "properties": {"city": {"type": "string", "description": "City name"}},
-                    "required": ["city"],
+                    "properties": {parameter: {"type": "string", "description": about}},
+                    "required": [parameter],
                 })
                 .as_object()
                 .cloned()
                 .unwrap(),
             ),
         )
+    }
+
+    fn weather_tool() -> Tool {
+        one_parameter_tool(
+            "weather__get_weather",
+            "Get the current weather for a city.",
+            "city",
+            "City name",
+        )
+    }
+
+    /// A household's tool list, long enough that the chat is worth a KV
+    /// snapshot when a side call sets it aside.
+    fn household_tools() -> Vec<Tool> {
+        let mut tools = vec![weather_tool()];
+        for (name, description, parameter, about) in [
+            (
+                "lights__set_brightness",
+                "Set the brightness of the lights in a room.",
+                "room",
+                "Room name, such as kitchen",
+            ),
+            (
+                "timer__start",
+                "Start a countdown timer.",
+                "duration",
+                "Duration such as 10 minutes",
+            ),
+            (
+                "music__play",
+                "Play a song, artist, album or playlist.",
+                "query",
+                "What to play",
+            ),
+            (
+                "calendar__list_events",
+                "List the household's calendar events for a day.",
+                "day",
+                "Day such as today or 2026-10-05",
+            ),
+            (
+                "reminders__add",
+                "Add a reminder for a member of the household.",
+                "text",
+                "What to be reminded of",
+            ),
+            (
+                "news__headlines",
+                "Read the latest news headlines on a topic.",
+                "topic",
+                "Topic such as sport or Kenya",
+            ),
+            (
+                "wikipedia__search",
+                "Look up a topic on Wikipedia.",
+                "query",
+                "Topic to look up",
+            ),
+            (
+                "shopping__add_item",
+                "Add an item to the shared shopping list.",
+                "item",
+                "Item such as milk",
+            ),
+            (
+                "thermostat__set",
+                "Set the target temperature of the heating.",
+                "celsius",
+                "Temperature in degrees Celsius",
+            ),
+            (
+                "translate__text",
+                "Translate text into another language.",
+                "text",
+                "Text to translate",
+            ),
+            (
+                "recipes__find",
+                "Find a recipe from the ingredients at hand.",
+                "ingredients",
+                "Comma-separated ingredients",
+            ),
+        ] {
+            tools.push(one_parameter_tool(name, description, parameter, about));
+        }
+        tools
     }
 
     fn generate_once(
@@ -884,6 +1688,7 @@ mod tests {
             text: String::new(),
             tool_requests: Vec::new(),
             stats: None,
+            input_tokens: None,
             error: None,
         };
         let outcome = std::thread::scope(|scope| {
@@ -928,13 +1733,17 @@ mod tests {
                             }
                         }
                         if let Some(usage) = usage {
+                            reply.input_tokens = usage.usage.input_tokens;
                             reply.stats = usage.stats;
                         }
                         if stop_after_first_piece {
                             break;
                         }
                     }
-                    Ok((None, Some(ProviderUsage { stats, .. }))) => reply.stats = stats,
+                    Ok((None, Some(ProviderUsage { usage, stats, .. }))) => {
+                        reply.input_tokens = usage.input_tokens;
+                        reply.stats = stats;
+                    }
                     Ok((None, None)) => {}
                     Err(error) => reply.error = Some(error),
                 }
@@ -948,11 +1757,14 @@ mod tests {
         reply
     }
 
-    /// A real conversation with a tool round, a side call and a cancelled
-    /// turn. Run with `cargo test -p goose-local-inference -- --ignored litert`,
+    /// A real conversation with a tool round, a side call, a regenerated
+    /// turn and a cancelled one. Run with
+    /// `cargo test -p goose-local-inference -- --ignored litert`,
     /// `GOOSE_LITERT_LIB_DIR` and `GOOSE_LITERT_TEST_MODEL` set.
     /// `GOOSE_LITERT_TEST_BACKEND` picks `gpu` (default) or `cpu`;
-    /// `GOOSE_LITERT_TEST_THINKING` turns thinking on.
+    /// `GOOSE_LITERT_TEST_THINKING` turns thinking on. With a giap-main
+    /// library it also checks that the side call sets the chat aside as a KV
+    /// snapshot and the next turn restores it.
     #[test]
     #[ignore = "needs the LiteRT-LM library and a .litertlm model"]
     fn litert_live_conversation_with_a_tool() {
@@ -968,6 +1780,18 @@ mod tests {
         };
         let root = std::env::temp_dir().join("goose-litert-live-test");
         let _env = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(root.to_str().unwrap()))]);
+        let snapshot_dir = Paths::in_data_dir(SNAPSHOT_SUBDIR);
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        let snapshot_files = || -> Vec<(PathBuf, SystemTime)> {
+            let Ok(entries) = std::fs::read_dir(&snapshot_dir) else {
+                return Vec::new();
+            };
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension() == Some("kv".as_ref()))
+                .map(|entry| (entry.path(), entry.metadata().unwrap().modified().unwrap()))
+                .collect()
+        };
         let execution =
             std::env::var("GOOSE_LITERT_TEST_BACKEND").unwrap_or_else(|_| "gpu".to_string());
         let thinking = std::env::var_os("GOOSE_LITERT_TEST_THINKING").is_some();
@@ -994,19 +1818,26 @@ mod tests {
         let mut loaded = backend
             .load_model("gemma-4-E2B-it", &resolved, &settings)
             .expect("model loads");
+        let snapshots = loaded
+            .as_any_mut()
+            .downcast_mut::<LoadedModel>()
+            .unwrap()
+            .snapshots
+            .is_some();
         eprintln!(
-            "[{execution}] thinking {thinking}, load {} ms",
+            "[{execution}] thinking {thinking}, snapshots {snapshots}, load {} ms",
             load_started.elapsed().as_millis()
         );
 
         let system = "You are a concise household assistant. Use the weather tool for any \
                       weather question, then answer in one short sentence.";
-        let tools = vec![weather_tool()];
+        let tools = household_tools();
         let report = |label: &str, reply: &Reply| {
             let stats = reply.stats.clone().unwrap_or_default();
             eprintln!(
-                "[{execution}] {label}: ttft {:?} ms, prefill {:?} ms, reused {:?}, output {:?}, \
-                 elapsed {:?} ms, text {:?}",
+                "[{execution}] {label}: prompt {:?}, ttft {:?} ms, prefill {:?} ms, reused {:?}, \
+                 output {:?}, elapsed {:?} ms, text {:?}",
+                reply.input_tokens,
                 stats.time_to_first_token_ms,
                 stats.prefill_ms,
                 stats.reused_prefix_tokens,
@@ -1015,21 +1846,25 @@ mod tests {
                 reply.text
             );
         };
+        let reused = |reply: &Reply| reply.stats.as_ref().unwrap().reused_prefix_tokens;
+        let mut ask = |system: &str, history: &[Message], tools: &[Tool], stop: bool| {
+            generate_once(
+                &backend,
+                loaded.as_mut(),
+                &resolved,
+                system,
+                history,
+                tools,
+                stop,
+            )
+        };
 
         let mut history =
             vec![Message::user().with_text("What is the weather in Paris right now?")];
-        let first = generate_once(
-            &backend,
-            loaded.as_mut(),
-            &resolved,
-            system,
-            &history,
-            &tools,
-            false,
-        );
+        let first = ask(system, &history, &tools, false);
         report("turn 1", &first);
         assert!(first.error.is_none(), "{:?}", first.error);
-        assert_eq!(first.stats.as_ref().unwrap().reused_prefix_tokens, Some(0));
+        assert_eq!(reused(&first), Some(0));
         let (id, name, arguments) = first
             .tool_requests
             .first()
@@ -1052,26 +1887,15 @@ mod tests {
                 r#"{"city":"Paris","condition":"sunny","temp_c":21}"#,
             )])),
         ));
-        let answer = generate_once(
-            &backend,
-            loaded.as_mut(),
-            &resolved,
-            system,
-            &history,
-            &tools,
-            false,
-        );
+        let answer = ask(system, &history, &tools, false);
         report("tool result", &answer);
         assert!(answer.error.is_none(), "{:?}", answer.error);
         assert!(answer.tool_requests.is_empty());
         assert!(!answer.text.trim().is_empty());
-        assert!(answer.stats.as_ref().unwrap().reused_prefix_tokens.unwrap() > 0);
+        assert!(reused(&answer).unwrap() > 0);
 
         history.push(Message::assistant().with_text(answer.text.clone()));
-        let side = generate_once(
-            &backend,
-            loaded.as_mut(),
-            &resolved,
+        let side = ask(
             "Reply with one word.",
             &[Message::user().with_text("Say yes.")],
             &[],
@@ -1079,74 +1903,89 @@ mod tests {
         );
         report("side call", &side);
         assert!(side.error.is_none(), "{:?}", side.error);
+        let parked = snapshot_files();
+        if snapshots {
+            assert_eq!(parked.len(), 1, "the side call saves the chat: {parked:?}");
+        } else {
+            assert!(parked.is_empty());
+        }
 
-        history.push(Message::user().with_text("Is that warm or cold? One word."));
-        let second = generate_once(
-            &backend,
-            loaded.as_mut(),
-            &resolved,
-            system,
-            &history,
-            &tools,
+        // A second side call while nothing is retained, as titling follows a
+        // memory pass: it stays a side call and leaves the chat's file alone.
+        let titling = ask(
+            "Give this conversation a title of three words.",
+            &[Message::user().with_text("The weather in Paris.")],
+            &[],
             false,
         );
+        report("second side call", &titling);
+        assert!(titling.error.is_none(), "{:?}", titling.error);
+        assert_eq!(
+            snapshot_files(),
+            parked,
+            "the second side call writes nothing"
+        );
+
+        history.push(Message::user().with_text("Is that warm or cold? One word."));
+        let second = ask(system, &history, &tools, false);
         report("turn 2", &second);
         assert!(second.error.is_none(), "{:?}", second.error);
         assert!(!second.text.trim().is_empty());
-        // With thinking on, LiteRT-LM drops the first user turn's thoughts by
-        // rewinding to the checkpoint it saved before that turn, which is step 0.
-        if !thinking {
+        if snapshots {
+            // Restored: the whole prompt was prefilled over the snapshot.
+            assert_eq!(reused(&second), None);
+            let restored = snapshot_files();
+            assert_eq!(restored.len(), 1);
+            assert!(restored[0].1 > parked[0].1, "turn 2 restores the snapshot");
+        } else if !thinking {
+            // With thinking on, LiteRT-LM drops the first user turn's thoughts
+            // by rewinding to the checkpoint it saved before that turn: step 0.
             assert!(
-                second.stats.as_ref().unwrap().reused_prefix_tokens.unwrap() > 0,
+                reused(&second).unwrap() > 0,
                 "the side call must leave the retained conversation intact"
             );
         }
 
         history.push(Message::assistant().with_text(second.text.clone()));
         history.push(Message::user().with_text("And in Fahrenheit? Just the number."));
-        let third = generate_once(
-            &backend,
-            loaded.as_mut(),
-            &resolved,
-            system,
-            &history,
-            &tools,
-            false,
-        );
+        let third = ask(system, &history, &tools, false);
         report("turn 3", &third);
         assert!(third.error.is_none(), "{:?}", third.error);
-        assert!(third.stats.as_ref().unwrap().reused_prefix_tokens.unwrap() > 0);
+        if !thinking {
+            assert!(
+                reused(&third).unwrap() > 0,
+                "a restored conversation extends like any other"
+            );
+        }
 
-        history.push(Message::assistant().with_text(third.text.clone()));
+        // The same request again, as when a reply is regenerated.
+        let again = ask(system, &history, &tools, false);
+        report("regenerated", &again);
+        assert!(again.error.is_none(), "{:?}", again.error);
+        assert!(!again.text.trim().is_empty());
+        assert_eq!(reused(&again), if snapshots { None } else { Some(0) });
+
+        history.push(Message::assistant().with_text(again.text.clone()));
         history.push(Message::user().with_text("Describe Paris in three long paragraphs."));
-        let cancelled = generate_once(
-            &backend,
-            loaded.as_mut(),
-            &resolved,
-            system,
-            &history,
-            &tools,
-            true,
-        );
+        let cancelled = ask(system, &history, &tools, true);
         report("cancelled", &cancelled);
         assert!(cancelled.error.is_none(), "{:?}", cancelled.error);
 
-        let recovered = generate_once(
-            &backend,
-            loaded.as_mut(),
-            &resolved,
-            system,
-            &history,
-            &tools,
-            false,
-        );
+        let recovered = ask(system, &history, &tools, false);
         report("after cancel", &recovered);
         assert!(recovered.error.is_none(), "{:?}", recovered.error);
         assert!(!recovered.text.trim().is_empty());
-        assert_eq!(
-            recovered.stats.as_ref().unwrap().reused_prefix_tokens,
-            Some(0),
-            "a cancelled conversation is recreated, not reused"
-        );
+        // A cancelled conversation is never reused; with snapshots the chat's
+        // is restored instead of prefilled from nothing.
+        assert_eq!(reused(&recovered), if snapshots { None } else { Some(0) });
+
+        history.push(Message::assistant().with_text(recovered.text.clone()));
+        history.push(Message::user().with_text("Thank you. One word."));
+        let last = ask(system, &history, &tools, false);
+        report("after recovery", &last);
+        assert!(last.error.is_none(), "{:?}", last.error);
+        if !thinking {
+            assert!(reused(&last).unwrap() > 0);
+        }
     }
 }
