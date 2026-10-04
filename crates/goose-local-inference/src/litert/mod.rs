@@ -43,10 +43,12 @@ const SNAPSHOT_SUBDIR: &str = "litert-lm/kv-snapshots";
 /// A conversation holding fewer tokens is cheaper to prefill again than to save.
 const MIN_SNAPSHOT_TOKENS: usize = 512;
 /// Each snapshot is the whole KV cache, its full window whatever it holds
-/// (151 MB for gemma-4-E2B with 16384 tokens); the most recently used are kept.
-/// Three, so a background job that took the slot during a quiet spell, such as
-/// a proactive review, cannot push the chat's out.
-const SNAPSHOTS_KEPT: usize = 3;
+/// (151 MB for gemma-4-E2B with 16384 tokens, 235 MB for gemma-4-E4B with
+/// 8192); the most recently used are kept. Two: one for each chat a household
+/// switches between, such as typed and spoken, each with its own system
+/// prompt. One-shot work is never saved (`worth_saving`), so it cannot push a
+/// chat's out.
+const SNAPSHOTS_KEPT: usize = 2;
 /// Age at which a snapshot left half-written by a process that died is removed.
 const STALE_PARTIAL_SNAPSHOT: Duration = Duration::from_secs(60 * 60);
 const STREAM_POLL: Duration = Duration::from_millis(100);
@@ -770,7 +772,7 @@ fn set_aside(loaded: &mut LoadedModel) {
         weight: weight(&main.identity, &main.consumed),
     });
     let tokens = main.conversation.token_count().unwrap_or(0);
-    if tokens < MIN_SNAPSHOT_TOKENS {
+    if !worth_saving(&main.identity, tokens) {
         return;
     }
     let path = snapshots.path(&main.identity, main.options);
@@ -790,6 +792,16 @@ fn set_aside(loaded: &mut LoadedModel) {
             "Could not save the retained LiteRT-LM conversation's KV snapshot"
         ),
     }
+}
+
+/// Whether a conversation set aside will be asked again, so its KV cache is
+/// worth a snapshot. A chat carries tools; one-shot work, such as compacting a
+/// conversation, summarising one or naming one, carries none and is never
+/// resumed. On a Jetson Orin every in-turn compaction saved its own
+/// conversation too (5,261 tokens, 235 MB, 1.5 s) while memory was tightest,
+/// and it took one of the kept files from a chat.
+fn worth_saving(identity: &Identity, tokens: usize) -> bool {
+    identity.tools.is_some() && tokens >= MIN_SNAPSHOT_TOKENS
 }
 
 /// A new conversation without a preface, holding the snapshot at `snapshot`
@@ -1445,6 +1457,24 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(left, expected);
+    }
+
+    #[test]
+    fn only_a_chat_holding_enough_is_worth_a_snapshot() {
+        let chat = Identity {
+            system: "You are the household assistant.".to_string(),
+            tools: Some("[{\"name\":\"get_weather\"}]".to_string()),
+        };
+        let compaction = Identity {
+            system: "Distill the conversation below into a summary.".to_string(),
+            tools: None,
+        };
+        assert!(worth_saving(&chat, 6_580));
+        assert!(!worth_saving(&chat, MIN_SNAPSHOT_TOKENS - 1));
+        assert!(
+            !worth_saving(&compaction, 5_261),
+            "a compaction call is never resumed, however long it was"
+        );
     }
 
     #[test]
