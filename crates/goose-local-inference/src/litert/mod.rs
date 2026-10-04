@@ -12,6 +12,7 @@
 //! of its family restores the snapshot into a new conversation.
 
 mod convert;
+mod fc_repair;
 mod ffi;
 
 use std::any::Any;

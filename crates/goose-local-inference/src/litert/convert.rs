@@ -369,11 +369,12 @@ fn message_events(chunk: &str) -> Vec<ChunkEvent> {
     if !text.is_empty() {
         events.push(ChunkEvent::TextDelta(text));
     }
-    let calls: Vec<ToolCall> = message
+    let mut calls: Vec<ToolCall> = message
         .get("tool_calls")
         .and_then(Value::as_array)
         .map(|calls| calls.iter().filter_map(parse_tool_call).collect())
         .unwrap_or_default();
+    calls.extend(rejected_calls(message.get("content")));
     if !calls.is_empty() {
         events.push(ChunkEvent::ToolCalls(calls));
     }
@@ -389,16 +390,50 @@ fn content_text(content: Option<&Value>) -> String {
     }
 }
 
+/// A part's text; a tool call the engine's parser rejected is not text, see [`rejected_calls`].
 fn part_text(part: &Value) -> &str {
     let is_text = part
         .get("type")
         .and_then(Value::as_str)
         .is_none_or(|kind| kind == "text");
-    if is_text {
+    if is_text && part.get("error").is_none() {
         part.get("text").and_then(Value::as_str).unwrap_or_default()
     } else {
         ""
     }
+}
+
+/// Tool calls the engine's parser rejected, which a conversation that keeps them returns as text
+/// parts with an "error" field, read leniently. One still unreadable is left out and logged.
+fn rejected_calls(content: Option<&Value>) -> Vec<ToolCall> {
+    let Some(Value::Array(parts)) = content else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter(|part| part.get("error").is_some())
+        .filter_map(|part| {
+            let block = part.get("text").and_then(Value::as_str).unwrap_or_default();
+            match super::fc_repair::parse_call(block) {
+                Some((name, arguments)) => {
+                    tracing::info!(
+                        backend = "litert",
+                        tool = %name,
+                        "Read a tool call LiteRT-LM's parser rejected"
+                    );
+                    Some(ToolCall { name, arguments })
+                }
+                None => {
+                    tracing::warn!(
+                        backend = "litert",
+                        block,
+                        "Left out a tool call LiteRT-LM's parser rejected and that could not be read"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 fn parse_tool_call(call: &Value) -> Option<ToolCall> {
@@ -451,6 +486,36 @@ mod tests {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
+    #[test]
+    fn a_tool_call_the_engine_rejected_is_read_and_kept_out_of_the_text() {
+        let chunk = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Saving that. "},
+                {
+                    "type": "text",
+                    "text": "call:giap-memory__save_memory{content:<|\"|>Wanjiru is seven.<|\"|>,segment:knowledge}",
+                    "error": "Failed to parse tool calls: NoViableAltError"
+                },
+                {"type": "text", "text": "call:!!", "error": "Failed to parse tool calls: ..."}
+            ]
+        })
+        .to_string();
+        let events = chunk_events(Some(&chunk), false, None);
+        assert_eq!(
+            events,
+            vec![
+                ChunkEvent::TextDelta("Saving that. ".to_string()),
+                ChunkEvent::ToolCalls(vec![ToolCall {
+                    name: "giap-memory__save_memory".to_string(),
+                    arguments: json!({"content": "Wanjiru is seven.", "segment": "knowledge"})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                }]),
+            ]
+        );
+    }
     #[test]
     fn tools_use_the_openai_wrapped_form() {
         let tools = tools_json(&[weather_tool()]).unwrap().unwrap();

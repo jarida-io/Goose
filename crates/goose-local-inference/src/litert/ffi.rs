@@ -152,6 +152,10 @@ struct Api {
         unsafe extern "C" fn(*const RawBenchmarkInfo, c_int, *mut c_int) -> Status,
     benchmark_info_get_prefill_tokens_per_sec_at:
         unsafe extern "C" fn(*const RawBenchmarkInfo, c_int, *mut f64) -> Status,
+    /// giap-main: a tool call the parser rejects comes back as a text part with an "error"
+    /// field instead of failing the turn, and the backend reads it leniently.
+    conversation_config_set_return_error_on_parse_failure:
+        Option<unsafe extern "C" fn(*mut RawConversationConfig, bool) -> Status>,
     /// GIAP's additions, when the library is built from giap-main.
     giap: Option<GiapApi>,
     /// Never unloaded: the function pointers above point into it.
@@ -209,6 +213,11 @@ macro_rules! resolve_api {
     ($library:ident; $($field:ident),* $(,)?) => {
         Api {
             $( $field: symbol(&$library, concat!("litert_lm_", stringify!($field)))?, )*
+            conversation_config_set_return_error_on_parse_failure: symbol(
+                &$library,
+                "litert_lm_conversation_config_set_return_error_on_parse_failure",
+            )
+            .ok(),
             giap: GiapApi::resolve(&$library),
             _library: $library,
         }
@@ -723,6 +732,14 @@ impl Engine {
                 api.check(
                     (api.conversation_config_set_messages)(raw, preface.as_ptr()),
                     "conversation_config_set_messages",
+                )?;
+            }
+            if let Some(keep_rejected_calls) =
+                api.conversation_config_set_return_error_on_parse_failure
+            {
+                api.check(
+                    keep_rejected_calls(raw, false),
+                    "conversation_config_set_return_error_on_parse_failure",
                 )?;
             }
         }
