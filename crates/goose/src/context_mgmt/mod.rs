@@ -168,7 +168,14 @@ pub async fn compact_messages(
     let (merged_continuation, _issues) = merge_consecutive_messages(continuation_messages);
     final_messages.extend(merged_continuation);
 
-    if let Some(user_msg) = preserved_user_message {
+    if let Some(mut user_msg) = preserved_user_message {
+        // Stamped now, not when it was found: a session reloads its messages in `created`
+        // order, and a copy stamped before a summarisation that takes seconds sorted ahead of
+        // the summary on the next turn and was merged into it.
+        let last = final_messages
+            .last()
+            .map_or(i64::MIN, |message| message.created);
+        user_msg.created = chrono::Utc::now().timestamp().max(last);
         final_messages.push(user_msg);
     }
 
@@ -695,6 +702,8 @@ mod tests {
         message: Message,
         config: ModelConfig,
         max_tool_responses: Option<usize>,
+        /// How long a reply takes; the reply is stamped when it returns, as a real one is.
+        delay: Option<std::time::Duration>,
     }
 
     impl MockProvider {
@@ -713,11 +722,17 @@ mod tests {
                     request_headers: None,
                 },
                 max_tool_responses: None,
+                delay: None,
             }
         }
 
         fn with_max_tool_responses(mut self, max: usize) -> Self {
             self.max_tool_responses = Some(max);
+            self
+        }
+
+        fn with_delay(mut self, delay: std::time::Duration) -> Self {
+            self.delay = Some(delay);
             self
         }
     }
@@ -754,7 +769,11 @@ mod tests {
                 }
             }
 
-            let message = self.message.clone();
+            let mut message = self.message.clone();
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+                message.created = chrono::Utc::now().timestamp();
+            }
             let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
             Ok(stream_from_single_message(message, usage))
         }
@@ -765,6 +784,48 @@ mod tests {
         ) -> Result<usize, ProviderError> {
             Ok(self.config.context_limit())
         }
+    }
+
+    /// A session reloads its messages ordered by `created`, then by insertion, so compaction's
+    /// output has to be in that order already. With a summary that took more than a second, as
+    /// on a device, the kept user message sorted ahead of the summary on the next turn and was
+    /// merged into it, the continuation into the reply after it.
+    #[tokio::test]
+    async fn compaction_output_is_already_in_reload_order() {
+        let provider = MockProvider::new(Message::assistant().with_text("<mock summary>"), 100_000)
+            .with_delay(std::time::Duration::from_millis(1100));
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::user().with_text("first question"),
+            Message::assistant().with_text("first answer"),
+            Message::user().with_text("the question compaction keeps"),
+        ]);
+
+        let model_config = provider.config.clone();
+        let compaction = compact_messages(
+            &provider,
+            &model_config,
+            "test-session-id",
+            &conversation,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let messages = compaction.conversation.messages();
+        let mut reloaded: Vec<usize> = (0..messages.len()).collect();
+        reloaded.sort_by_key(|&i| (messages[i].created, i));
+        assert_eq!(reloaded, (0..messages.len()).collect::<Vec<_>>());
+
+        let visible = compaction.conversation.agent_visible_messages();
+        let texts: Vec<String> = visible.iter().map(|m| m.as_concat_text()).collect();
+        assert_eq!(
+            texts.len(),
+            3,
+            "summary, continuation, the kept question: {texts:?}"
+        );
+        assert!(texts[0].contains("<mock summary>"));
+        assert!(texts[1].starts_with("Your context was compacted."));
+        assert_eq!(texts[2], "the question compaction keeps");
     }
 
     #[tokio::test]
