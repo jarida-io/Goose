@@ -516,7 +516,7 @@ impl LocalInferenceBackend for LiteRtBackend {
             Plan::Extend { from } => extend(loaded, &messages, from, &request),
             Plan::Rematch => rematch(loaded, identity, options, &messages, &request),
             Plan::Recreate => {
-                set_aside(loaded);
+                set_aside(loaded, request.replaces_history);
                 recreate(loaded, identity, options, &messages, &request, true)
             }
             Plan::Throwaway => throwaway(loaded, &identity, options, &messages, &request),
@@ -739,7 +739,7 @@ fn throwaway(
     request: &LocalGenerationRequest<'_>,
 ) -> Result<Turn, ProviderError> {
     if loaded.snapshots.is_some() {
-        set_aside(loaded);
+        set_aside(loaded, request.replaces_history);
     }
     let history = messages.len() - 1;
     let mut conversation = open_conversation(
@@ -759,8 +759,9 @@ fn throwaway(
 
 /// Deletes the retained conversation, first saving its KV cache as its
 /// family's snapshot when the library can and it holds enough to be worth
-/// restoring.
-fn set_aside(loaded: &mut LoadedModel) {
+/// restoring. `replaces_history`: the call it is set aside for replaces its
+/// history, as a compaction's summary does.
+fn set_aside(loaded: &mut LoadedModel, replaces_history: bool) {
     let Some(main) = loaded.main.take() else {
         return;
     };
@@ -772,10 +773,26 @@ fn set_aside(loaded: &mut LoadedModel) {
         weight: weight(&main.identity, &main.consumed),
     });
     let tokens = main.conversation.token_count().unwrap_or(0);
-    if !worth_saving(&main.identity, tokens) {
+    let path = snapshots.path(&main.identity, main.options);
+    let family_has_snapshot = path.is_file();
+    if !worth_saving(
+        &main.identity,
+        tokens,
+        replaces_history,
+        family_has_snapshot,
+    ) {
+        if replaces_history && family_has_snapshot {
+            tracing::info!(
+                target: "giap::kv",
+                backend = LITERT_BACKEND_ID,
+                tokens,
+                file = %path.display(),
+                "Did not save the retained LiteRT-LM conversation: the call replaces its history, \
+                 and the family's snapshot already holds what the next turn can reuse"
+            );
+        }
         return;
     }
-    let path = snapshots.path(&main.identity, main.options);
     let saving = Instant::now();
     match snapshots.save(&main.conversation, &path) {
         Ok(()) => tracing::info!(
@@ -800,8 +817,22 @@ fn set_aside(loaded: &mut LoadedModel) {
 /// resumed. On a Jetson Orin every in-turn compaction saved its own
 /// conversation too (5,261 tokens, 235 MB, 1.5 s) while memory was tightest,
 /// and it took one of the kept files from a chat.
-fn worth_saving(identity: &Identity, tokens: usize) -> bool {
-    identity.tools.is_some() && tokens >= MIN_SNAPSHOT_TOKENS
+///
+/// Nor is a chat whose history is about to be replaced, when its family
+/// already has a snapshot: after a compaction the chat shares only its
+/// preamble with what it held, and every snapshot of the family holds that.
+/// On the Orin the save at a compaction raised the GPU's share by about 140 MB
+/// while the summary ran, and the turn after it reused the same 3,800 tokens
+/// from the older snapshot.
+fn worth_saving(
+    identity: &Identity,
+    tokens: usize,
+    replaces_history: bool,
+    family_has_snapshot: bool,
+) -> bool {
+    identity.tools.is_some()
+        && tokens >= MIN_SNAPSHOT_TOKENS
+        && !(replaces_history && family_has_snapshot)
 }
 
 /// A new conversation without a preface, holding the snapshot at `snapshot`
@@ -1469,11 +1500,31 @@ mod tests {
             system: "Distill the conversation below into a summary.".to_string(),
             tools: None,
         };
-        assert!(worth_saving(&chat, 6_580));
-        assert!(!worth_saving(&chat, MIN_SNAPSHOT_TOKENS - 1));
+        assert!(worth_saving(&chat, 6_580, false, false));
+        assert!(!worth_saving(&chat, MIN_SNAPSHOT_TOKENS - 1, false, false));
         assert!(
-            !worth_saving(&compaction, 5_261),
+            !worth_saving(&compaction, 5_261, false, false),
             "a compaction call is never resumed, however long it was"
+        );
+    }
+
+    #[test]
+    fn a_chat_about_to_be_compacted_is_saved_only_when_its_family_has_no_snapshot() {
+        let chat = Identity {
+            system: "You are the household assistant.".to_string(),
+            tools: Some("[{\"name\":\"get_weather\"}]".to_string()),
+        };
+        assert!(
+            !worth_saving(&chat, 7_097, true, true),
+            "the snapshot on disk already holds all the next turn can reuse"
+        );
+        assert!(
+            worth_saving(&chat, 7_097, true, false),
+            "the first compaction saves, or the next turn has no preamble to restore"
+        );
+        assert!(
+            worth_saving(&chat, 7_097, false, true),
+            "a side call that leaves the history alone resumes it whole"
         );
     }
 
@@ -1743,6 +1794,7 @@ mod tests {
                         message_id: &message_id,
                         tx: &tx,
                         log: &mut log,
+                        replaces_history: false,
                     },
                 )
             });

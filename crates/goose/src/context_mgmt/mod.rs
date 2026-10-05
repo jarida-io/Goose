@@ -352,13 +352,17 @@ async fn do_compact(
             .with_text("Please summarize the conversation history provided in the system prompt.");
         let summarization_request = vec![user_message];
 
-        match crate::model_config::complete_fast(
-            provider,
-            model_config,
-            session_id,
-            &system_prompt,
-            &summarization_request,
-            &[],
+        // The summary replaces the history it summarises, so a provider keeping that conversation
+        // for its next turn (a local engine's KV cache) need not save it first.
+        match goose_providers::request_context::replacing_history(
+            crate::model_config::complete_fast(
+                provider,
+                model_config,
+                session_id,
+                &system_prompt,
+                &summarization_request,
+                &[],
+            ),
         )
         .await
         {
@@ -704,6 +708,8 @@ mod tests {
         max_tool_responses: Option<usize>,
         /// How long a reply takes; the reply is stamped when it returns, as a real one is.
         delay: Option<std::time::Duration>,
+        /// Whether the last call reached the provider marked as replacing its history.
+        replaced_history: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MockProvider {
@@ -723,6 +729,7 @@ mod tests {
                 },
                 max_tool_responses: None,
                 delay: None,
+                replaced_history: Default::default(),
             }
         }
 
@@ -750,6 +757,10 @@ mod tests {
             messages: &[Message],
             _tools: &[Tool],
         ) -> Result<MessageStream, ProviderError> {
+            self.replaced_history.store(
+                goose_providers::request_context::replaces_history(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
             // If max_tool_responses is set, fail if we have too many
             if let Some(max) = self.max_tool_responses {
                 let tool_response_count = messages
@@ -826,6 +837,44 @@ mod tests {
         assert!(texts[0].contains("<mock summary>"));
         assert!(texts[1].starts_with("Your context was compacted."));
         assert_eq!(texts[2], "the question compaction keeps");
+    }
+
+    /// A local engine keeps the conversation a summary replaces only if nobody says so; the
+    /// summary call reaches the provider marked, through `complete_fast` and its session scope.
+    #[tokio::test]
+    async fn the_summary_call_reaches_the_provider_marked_as_replacing_history() {
+        use std::sync::atomic::Ordering;
+        let provider = MockProvider::new(Message::assistant().with_text("<mock summary>"), 100_000);
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::user().with_text("a question"),
+            Message::assistant().with_text("an answer"),
+        ]);
+        let model_config = provider.config.clone();
+
+        compact_messages(
+            &provider,
+            &model_config,
+            "test-session-id",
+            &conversation,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(provider.replaced_history.load(Ordering::SeqCst));
+
+        provider
+            .complete(
+                &model_config,
+                "system",
+                &[Message::user().with_text("hi")],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !provider.replaced_history.load(Ordering::SeqCst),
+            "an ordinary call is not marked"
+        );
     }
 
     #[tokio::test]

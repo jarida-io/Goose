@@ -28,6 +28,9 @@ pub(super) struct LocalGenerationRequest<'a> {
     pub message_id: &'a str,
     pub tx: &'a StreamSender,
     pub log: &'a mut Option<Box<dyn RequestLogHandle>>,
+    /// The answer replaces the history of the conversation it was asked about, as a compaction's
+    /// summary does (see `request_context::replacing_history`).
+    pub replaces_history: bool,
 }
 
 pub(super) trait LocalInferenceBackend: Send + Sync {
