@@ -2024,19 +2024,6 @@ pub(super) fn generation_loop(
     Ok(output_token_count)
 }
 
-/// Prefill a session directly, for tests that need a context standing on a
-/// known prompt without the snapshot and plan machinery around it.
-#[cfg(test)]
-pub(super) fn decode_tokens_for_test(
-    kv: &mut SessionKv,
-    prompt: &[LlamaToken],
-) -> Result<(), ProviderError> {
-    decode_tokens(kv.ctx.ctx_mut(), prompt, 0)?;
-    kv.tokens.clear();
-    kv.tokens.extend_from_slice(prompt);
-    Ok(())
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -2693,7 +2680,6 @@ pub(super) mod tests {
         ] {
             prefill_prompt(
                 &mut session,
-                None,
                 &mut snapshot,
                 &model_path,
                 &model,

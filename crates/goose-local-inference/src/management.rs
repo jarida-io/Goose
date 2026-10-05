@@ -238,10 +238,14 @@ pub fn update_model_settings(
     model_id: &str,
     settings: LocalInferenceModelSettingsDto,
 ) -> Result<LocalInferenceModelSettingsUpdateResponse> {
-    let settings = model_settings_from_dto(settings);
+    let mut settings = model_settings_from_dto(settings);
     let mut registry = get_registry()
         .lock()
         .map_err(|_| anyhow!("Failed to acquire registry lock"))?;
+    // The DTO does not carry the LiteRT-LM block, so an update keeps the stored one.
+    settings.litert = registry
+        .get_model_settings(model_id)
+        .and_then(|stored| stored.litert.clone());
     registry.update_model_settings(model_id, settings.clone())?;
     Ok(LocalInferenceModelSettingsUpdateResponse {
         settings: model_settings_to_dto(&settings),
@@ -597,6 +601,7 @@ pub fn model_settings_from_dto(settings: LocalInferenceModelSettingsDto) -> Mode
         vision_capable: settings.vision_capable,
         image_token_estimate: settings.image_token_estimate,
         mmproj_size_bytes: settings.mmproj_size_bytes,
+        litert: None,
     }
 }
 
