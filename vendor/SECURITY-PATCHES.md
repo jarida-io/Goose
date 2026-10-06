@@ -18,7 +18,9 @@ path patches, not replacements in the registry cache.
 
 Changes are limited to RMCP 2.1 dependency requirements, the OpenTelemetry
 0.32 release family with SDK >=0.32.1, and flattening registry content handling
-to the RMCP ContentBlock type. Code-mode also accepts the resolved code
+to the RMCP ContentBlock type. The PCTX HTTP client also disables redirects
+to prevent custom API headers from reaching a different endpoint; a local
+HTTP regression test covers ordinary responses and 307/308 redirects. Code-mode also accepts the resolved code
 generator's infallible Tool constructor; schema parsing still returns errors. No code-mode feature, permission, or sandbox
 boundary is removed. The execution runtime's generated JavaScript is retained
 unchanged. Consumers of Goose as a path dependency must mirror these four

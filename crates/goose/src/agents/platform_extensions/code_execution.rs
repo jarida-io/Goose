@@ -681,6 +681,47 @@ impl CodeModeState {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn custom_headers_never_follow_redirects() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [200, 307, 308] {
+            let destination = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&destination)
+                .await;
+            let endpoint = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(
+                    ResponseTemplate::new(status).insert_header("Location", destination.uri()),
+                )
+                .mount(&endpoint)
+                .await;
+            let config: pctx_code_mode::config::server::ServerConfig =
+                serde_json::from_value(serde_json::json!({
+                    "name": "test", "url": endpoint.uri(),
+                    "auth": {"type": "headers", "headers": {"x-api-key": "synthetic-test-token"}}
+                }))
+                .unwrap();
+            // The stub isn't an MCP server; the observable contract is routing the
+            // initialization request only to the explicitly configured endpoint.
+            assert!(config.connect().await.is_err());
+            let requests = endpoint.received_requests().await.unwrap();
+            assert!(!requests.is_empty());
+            assert_eq!(
+                requests[0].headers.get("x-api-key").unwrap(),
+                "synthetic-test-token"
+            );
+            assert!(
+                destination.received_requests().await.unwrap().is_empty(),
+                "PCTX followed redirect status {status}"
+            );
+        }
+    }
+
     use super::*;
     use pctx_code_mode::model::FunctionId;
 

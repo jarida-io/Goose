@@ -631,7 +631,10 @@ async fn connect_with_auth(
         );
     }
     #[allow(unused_mut)]
-    let mut auth_client_builder = reqwest::Client::builder().default_headers(auth_headers);
+    let mut auth_client_builder = reqwest::Client::builder()
+        // MCP headers may contain credentials; redirects must never forward them.
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(auth_headers);
     #[cfg(target_os = "linux")]
     {
         auth_client_builder = auth_client_builder.tcp_user_timeout(Some(timeout));
@@ -709,7 +712,10 @@ async fn create_streamable_http_client(
     let timeout_duration = Duration::from_secs(resolve_timeout(timeout));
 
     #[allow(unused_mut)]
-    let mut http_client_builder = reqwest::Client::builder().default_headers(default_headers);
+    let mut http_client_builder = reqwest::Client::builder()
+        // MCP headers may contain credentials; redirects must never forward them.
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(default_headers);
     #[cfg(target_os = "linux")]
     {
         http_client_builder = http_client_builder.tcp_user_timeout(Some(timeout_duration));
@@ -3205,53 +3211,67 @@ mod tests {
         use wiremock::matchers::any;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let mock_server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&mock_server)
+        for status in [200, 307, 308] {
+            let destination = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&destination)
+                .await;
+            let mock_server = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(
+                    ResponseTemplate::new(status).insert_header("Location", destination.uri()),
+                )
+                .mount(&mock_server)
+                .await;
+
+            let mut headers = HashMap::new();
+            headers.insert("x-api-key".to_string(), "test-secret-123".to_string());
+
+            let temp_dir = tempdir().unwrap();
+            let provider: SharedProvider = Arc::new(Mutex::new(None));
+            let capabilities = GooseMcpClientCapabilities {
+                mcpui: false,
+                host_info: None,
+            };
+
+            // The MCP handshake will fail against the stub server. We only care that
+            // the outgoing HTTP request carried the custom header.
+            let _ = create_streamable_http_client(
+                &mock_server.uri(),
+                None,
+                &headers,
+                "test-ext",
+                None,
+                Box::new(rmcp::transport::auth::InMemoryCredentialStore::new()),
+                provider,
+                "goose-test".to_string(),
+                capabilities,
+                temp_dir.path(),
+            )
             .await;
 
-        let mut headers = HashMap::new();
-        headers.insert("x-api-key".to_string(), "test-secret-123".to_string());
-
-        let temp_dir = tempdir().unwrap();
-        let provider: SharedProvider = Arc::new(Mutex::new(None));
-        let capabilities = GooseMcpClientCapabilities {
-            mcpui: false,
-            host_info: None,
-        };
-
-        // The MCP handshake will fail against the stub server. We only care that
-        // the outgoing HTTP request carried the custom header.
-        let _ = create_streamable_http_client(
-            &mock_server.uri(),
-            None,
-            &headers,
-            "test-ext",
-            None,
-            Box::new(rmcp::transport::auth::InMemoryCredentialStore::new()),
-            provider,
-            "goose-test".to_string(),
-            capabilities,
-            temp_dir.path(),
-        )
-        .await;
-
-        let received = mock_server.received_requests().await.unwrap();
-        assert!(
-            !received.is_empty(),
-            "expected at least one HTTP request to reach the mock server"
-        );
-        let header_found = received.iter().any(|req| {
-            req.headers
-                .get("x-api-key")
-                .map(|v| v == "test-secret-123")
-                .unwrap_or(false)
-        });
-        assert!(
-            header_found,
-            "custom header x-api-key was not forwarded to the extension server"
-        );
+            let received = mock_server.received_requests().await.unwrap();
+            assert!(
+                !received.is_empty(),
+                "expected at least one HTTP request to reach the mock server"
+            );
+            let header_found = received.iter().any(|req| {
+                req.headers
+                    .get("x-api-key")
+                    .map(|v| v == "test-secret-123")
+                    .unwrap_or(false)
+            });
+            assert!(
+                header_found,
+                "custom header x-api-key was not forwarded to the extension server"
+            );
+            assert!(
+                destination.received_requests().await.unwrap().is_empty(),
+                "MCP client followed redirect status {status}"
+            );
+        }
     }
 
     /// Directly exercises `connect_with_auth`, which is the code path fixed by
@@ -3267,71 +3287,85 @@ mod tests {
         use wiremock::matchers::any;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let mock_server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&mock_server)
+        for status in [200, 307, 308] {
+            let destination = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&destination)
+                .await;
+            let mock_server = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(
+                    ResponseTemplate::new(status).insert_header("Location", destination.uri()),
+                )
+                .mount(&mock_server)
+                .await;
+
+            let mut headers = HashMap::new();
+            headers.insert("x-api-key".to_string(), "test-secret-oauth".to_string());
+
+            // Build a fake, non-expiring token. token_received_at=None skips the
+            // expiry check, so get_access_token() returns without any network call.
+            let token_response: OAuthTokenResponse = serde_json::from_value(serde_json::json!({
+                "access_token": "fake-test-token",
+                "token_type": "bearer",
+            }))
+            .expect("valid fake token JSON");
+            let creds = StoredCredentials::new(
+                "test-client".to_string(),
+                Some(token_response),
+                vec![],
+                None,
+            );
+            let store = InMemoryCredentialStore::new();
+            store.save(creds).await.unwrap();
+
+            let mut auth_manager = rmcp::transport::AuthorizationManager::new(mock_server.uri())
+                .await
+                .expect("AuthorizationManager::new should not make network calls");
+            auth_manager.set_credential_store(store);
+
+            let temp_dir = tempdir().unwrap();
+            let provider: SharedProvider = Arc::new(Mutex::new(None));
+            let capabilities = GooseMcpClientCapabilities {
+                mcpui: false,
+                host_info: None,
+            };
+
+            // connect_with_auth will fail (mock server isn't an MCP server) but we
+            // only care that the outgoing request carried the custom header.
+            let _ = connect_with_auth(
+                auth_manager,
+                &mock_server.uri(),
+                Duration::from_secs(5),
+                &headers,
+                provider,
+                "goose-test".to_string(),
+                capabilities,
+                temp_dir.path(),
+            )
             .await;
 
-        let mut headers = HashMap::new();
-        headers.insert("x-api-key".to_string(), "test-secret-oauth".to_string());
-
-        // Build a fake, non-expiring token. token_received_at=None skips the
-        // expiry check, so get_access_token() returns without any network call.
-        let token_response: OAuthTokenResponse = serde_json::from_value(serde_json::json!({
-            "access_token": "fake-test-token",
-            "token_type": "bearer",
-        }))
-        .expect("valid fake token JSON");
-        let creds = StoredCredentials::new(
-            "test-client".to_string(),
-            Some(token_response),
-            vec![],
-            None,
-        );
-        let store = InMemoryCredentialStore::new();
-        store.save(creds).await.unwrap();
-
-        let mut auth_manager = rmcp::transport::AuthorizationManager::new(mock_server.uri())
-            .await
-            .expect("AuthorizationManager::new should not make network calls");
-        auth_manager.set_credential_store(store);
-
-        let temp_dir = tempdir().unwrap();
-        let provider: SharedProvider = Arc::new(Mutex::new(None));
-        let capabilities = GooseMcpClientCapabilities {
-            mcpui: false,
-            host_info: None,
-        };
-
-        // connect_with_auth will fail (mock server isn't an MCP server) but we
-        // only care that the outgoing request carried the custom header.
-        let _ = connect_with_auth(
-            auth_manager,
-            &mock_server.uri(),
-            Duration::from_secs(5),
-            &headers,
-            provider,
-            "goose-test".to_string(),
-            capabilities,
-            temp_dir.path(),
-        )
-        .await;
-
-        let received = mock_server.received_requests().await.unwrap();
-        assert!(
-            !received.is_empty(),
-            "expected at least one HTTP request to reach the mock server"
-        );
-        let header_found = received.iter().any(|req| {
-            req.headers
-                .get("x-api-key")
-                .map(|v| v == "test-secret-oauth")
-                .unwrap_or(false)
-        });
-        assert!(
-            header_found,
-            "custom header x-api-key was not forwarded through the OAuth connection path"
-        );
+            let received = mock_server.received_requests().await.unwrap();
+            assert!(
+                !received.is_empty(),
+                "expected at least one HTTP request to reach the mock server"
+            );
+            let header_found = received.iter().any(|req| {
+                req.headers
+                    .get("x-api-key")
+                    .map(|v| v == "test-secret-oauth")
+                    .unwrap_or(false)
+            });
+            assert!(
+                header_found,
+                "custom header x-api-key was not forwarded through the OAuth connection path"
+            );
+            assert!(
+                destination.received_requests().await.unwrap().is_empty(),
+                "MCP client followed redirect status {status}"
+            );
+        }
     }
 }

@@ -163,6 +163,8 @@ impl ServerConfig {
                 }
 
                 let reqwest_client = reqwest::Client::builder()
+                    // Custom API headers must not be forwarded to a redirect destination.
+                    .redirect(reqwest::redirect::Policy::none())
                     .default_headers(default_headers)
                     .build()
                     .map_err(|e| McpConnectionError::Failed(e.to_string()))?;

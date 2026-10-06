@@ -5,6 +5,8 @@ This branch ports aaif-goose/goose commit
 2.1.0. This includes the fixes for GHSA-33f5-2c5q-wgwj,
 GHSA-9pj6-vhgr-3mwh, GHSA-c9xm-49cp-xcr9 and GHSA-9g45-5xwm-f3wc.
 The fork-specific LiteRT tool-result conversion also uses ContentBlock.
+Custom HTTP clients, including OAuth and PCTX clients, explicitly disable
+redirects because supplying a client bypasses RMCP's default redirect policy.
 
 Optional code-mode remains available. Four small compatibility patches to
 published PCTX crates remove its RMCP 1.x and OpenTelemetry SDK 0.31 instances.
