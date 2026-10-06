@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use goose_provider_types::conversation::message::{Message, MessageContent, ToolResponse};
 use goose_provider_types::errors::ProviderError;
 use goose_provider_types::formats::openai::format_tools;
-use rmcp::model::{CallToolRequestParams, ErrorData, RawContent, ResourceContents, Role, Tool};
+use rmcp::model::{CallToolRequestParams, ContentBlock, ErrorData, ResourceContents, Role, Tool};
 use serde_json::{json, Map, Value};
 
 const IMAGE_NOT_SUPPORTED: &str =
@@ -330,12 +330,16 @@ fn tool_response_payload(response: &ToolResponse) -> Value {
     let text = result
         .content
         .iter()
-        .filter_map(|content| match &content.raw {
-            RawContent::Text(text) => Some(text.text.clone()),
-            RawContent::Image(_) => Some(IMAGE_NOT_SUPPORTED.to_string()),
-            RawContent::Resource(resource) => match &resource.resource {
+        .filter_map(|content| match content {
+            ContentBlock::Text(text) => Some(text.text.clone()),
+            ContentBlock::Image(_) => Some(IMAGE_NOT_SUPPORTED.to_string()),
+            ContentBlock::Resource(resource) => match &resource.resource {
                 ResourceContents::TextResourceContents { text, .. } => Some(text.clone()),
                 ResourceContents::BlobResourceContents { .. } => None,
+                _ => {
+                    tracing::warn!("Unsupported resource content in LiteRT tool response");
+                    None
+                }
             },
             _ => None,
         })
