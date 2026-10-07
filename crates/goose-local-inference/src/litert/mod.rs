@@ -1195,7 +1195,7 @@ mod tests {
     use super::*;
     use crate::local_model_registry::LiteRtSettings;
     use goose_provider_types::conversation::token_usage::ProviderUsage;
-    use rmcp::model::{CallToolResult, Content, Tool};
+    use rmcp::model::{CallToolResult, ContentBlock, Tool};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -1966,7 +1966,7 @@ mod tests {
         ));
         history.push(Message::user().with_tool_response(
             &id,
-            Ok(CallToolResult::success(vec![Content::text(
+            Ok(CallToolResult::success(vec![ContentBlock::text(
                 r#"{"city":"Paris","condition":"sunny","temp_c":21}"#,
             )])),
         ));
