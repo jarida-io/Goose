@@ -463,7 +463,7 @@ fn parse_tool_call(call: &Value) -> Option<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{CallToolResult, Content};
+    use rmcp::model::{CallToolResult, ContentBlock};
     use std::borrow::Cow;
 
     fn args(value: Value) -> Map<String, Value> {
@@ -487,7 +487,7 @@ mod tests {
     }
 
     fn text_result(text: &str) -> Result<CallToolResult, ErrorData> {
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[test]
