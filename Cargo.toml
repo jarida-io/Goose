@@ -20,7 +20,7 @@ uninlined_format_args = "allow"
 string_slice = "warn"
 
 [workspace.dependencies]
-rmcp = { version = "1.4", default-features = false, features = ["schemars", "auth"] }
+rmcp = { version = "=2.1.0", default-features = false, features = ["schemars", "auth"] }
 agent-client-protocol-schema = { version = "1.1", default-features = false, features = ["unstable"] }
 agent-client-protocol = { version = "1.0", default-features = false }
 agent-client-protocol-http = { version = "1.0", default-features = false, features = ["server", "unstable_cancel_request"] }
@@ -112,6 +112,10 @@ icu_calendar = { version = "=2.1.1", default-features = false }
 icu_locale = { version = "=2.1.1", default-features = false }
 
 [patch.crates-io]
+pctx_code_mode = { path = "vendor/pctx_code_mode" }
+pctx_config = { path = "vendor/pctx_config" }
+pctx_registry = { path = "vendor/pctx_registry" }
+pctx_code_execution_runtime = { path = "vendor/pctx_code_execution_runtime" }
 v8 = { path = "vendor/v8" }
 cudaforge = { git = "https://github.com/jbg/cudaforge", rev = "e7c1967340e40673db98dc9e17da0f04834a456f" }
 
