@@ -57,6 +57,10 @@ safemlx = { default-features = false, features = ["accelerate", "metal", "safete
 safemlx-lm = { optional = true, version = "0.1.5" }
 safemlx-lm-utils = { optional = true, version = "0.1.2" }
 
+# posix_fadvise and madvise, to release a loaded model's file from the page cache.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2.182", default-features = false, features = ["std"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 llama-cpp-2 = { workspace = true, features = ["sampler", "metal", "mtmd"] }
 

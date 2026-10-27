@@ -9,6 +9,7 @@ mod backend;
 pub mod hf_models;
 mod litert;
 mod llamacpp;
+pub mod load_error;
 pub mod local_model_registry;
 pub mod management;
 mod mlx;
