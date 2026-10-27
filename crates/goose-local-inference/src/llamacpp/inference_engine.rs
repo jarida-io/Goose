@@ -28,6 +28,10 @@ const MIB: u64 = 1024 * 1024;
 /// the bookkeeping costs more than the decode it saves.
 const REUSE_MIN_TOKENS: usize = 256;
 
+/// How long a chat's cache stays protected from another chat's prompt. A conversation's turns,
+/// side calls and subagents come within seconds; a cache idle longer belongs to one that is over.
+const CHAT_CACHE_PROTECTED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Sliding-window checkpoints kept per retained context, newest last. Each is
 /// the window layers' cells, 16 MiB for Gemma 4 E4B at q8_0 and 768 cells.
 const WINDOW_CHECKPOINTS: usize = 4;
@@ -338,6 +342,8 @@ pub(super) struct SessionKv {
     /// The last prefill into this cache was one-shot work, so nothing will
     /// resume from it and it protects nothing (see `prefill_plan`).
     one_shot: bool,
+    /// When a generation last ran on this cache.
+    last_used: std::time::Instant,
     /// The model's sliding window, 0 for a model without one.
     n_swa: usize,
     checkpoints: Vec<WindowCheckpoint>,
@@ -481,6 +487,7 @@ impl SessionKv {
             tokens: Vec::new(),
             n_ctx,
             one_shot: false,
+            last_used: std::time::Instant::now(),
             n_swa,
             checkpoints: Vec::new(),
             _model: model,
@@ -499,6 +506,7 @@ impl SessionKv {
 
     pub(super) fn record_generated(&mut self, tokens: &[LlamaToken]) {
         self.tokens.extend_from_slice(tokens);
+        self.last_used = std::time::Instant::now();
     }
 
     /// First position `tokens` describes.
@@ -687,6 +695,12 @@ pub(super) fn common_prefix_len(cached: &[LlamaToken], prompt: &[LlamaToken]) ->
 /// summarisation) between long conversational turns.
 fn is_sacrificial_prompt(prompt_tokens: usize, cached_tokens: usize) -> bool {
     prompt_tokens > 0 && prompt_tokens.saturating_mul(2) < cached_tokens
+}
+
+/// Whether a cache a chat filled still protects itself from `prompt_is_chat`. A side call never
+/// evicts it; another chat does once it has sat idle, or that chat's next turn prefills it all again.
+fn chat_cache_protected(prompt_is_chat: bool, idle: std::time::Duration) -> bool {
+    !prompt_is_chat || idle < CHAT_CACHE_PROTECTED_FOR
 }
 
 /// Decide how to prefill a prompt whose plain-token part is `prompt`.
@@ -1575,6 +1589,15 @@ fn write_snapshot_if_due(
     // checkpoint at or before `keep` puts it back, and the stretch from there
     // to `keep` is decoded again before the write.
     let Some(at) = kv.window_resume(prompt, keep) else {
+        // Logged: a shape that is due a snapshot and never gets one is otherwise invisible.
+        tracing::info!(
+            target: "giap::kv",
+            event = "not_written",
+            reason = "no window checkpoint at or before the stable prefix",
+            stable_tokens = keep,
+            prompt_tokens = prompt.len(),
+            "kv snapshot not written"
+        );
         return;
     };
     if trim_to_prefix(kv, at).is_err() {
@@ -1625,6 +1648,7 @@ fn prefill_prompt(
     settings: &ModelSettings,
     prompt: &[LlamaToken],
     effective_ctx: usize,
+    one_shot: bool,
 ) -> Result<PrefilledPrompt, ProviderError> {
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
@@ -1647,11 +1671,13 @@ fn prefill_prompt(
         session.as_ref().map(|kv| {
             // A text-only prompt carries no media, so it can never reproduce a
             // retained media head and nothing behind that head is resumable.
-            if kv.head.is_some() {
+            let mut retained = if kv.head.is_some() {
                 RetainedPrefix::opaque(kv)
             } else {
                 RetainedPrefix::resumable(kv)
-            }
+            };
+            retained.worth_protecting &= chat_cache_protected(!one_shot, kv.last_used.elapsed());
+            retained
         }),
         prompt,
         n_ctx,
@@ -2319,6 +2345,7 @@ pub(super) fn prepare_generation(
             ctx.settings,
             &tokens,
             ectx,
+            ctx.one_shot,
         )?;
         text_breakdown = Some((
             t_tok_done.duration_since(t_log_done).as_millis(),
@@ -2342,6 +2369,7 @@ pub(super) fn prepare_generation(
             if let Some(kv) = ctx.session.as_mut() {
                 kv.session_ctx_mut().ctx_mut().synchronize();
                 kv.one_shot = ctx.one_shot;
+                kv.last_used = std::time::Instant::now();
                 // A rewind into this prompt's reply resumes at its end.
                 let tokens = std::mem::take(&mut kv.tokens);
                 kv.checkpoint_window(&tokens);
@@ -3358,6 +3386,7 @@ pub(super) mod tests {
                 &settings,
                 prompt,
                 n_ctx,
+                false,
             )
             .expect("prefill");
         }
@@ -4032,6 +4061,32 @@ pub(super) mod tests {
             prefill_plan(Some(retained(&leftover, 16_384)), &chat_turn, 16_384),
             PrefillPlan::SacrificialContext,
             "a chat's cache of that size is still protected"
+        );
+    }
+
+    #[test]
+    fn a_new_conversation_takes_over_a_chat_cache_left_idle() {
+        let second = std::time::Duration::from_secs(1);
+        assert!(chat_cache_protected(
+            true,
+            CHAT_CACHE_PROTECTED_FOR - second
+        ));
+        assert!(!chat_cache_protected(true, CHAT_CACHE_PROTECTED_FOR));
+        assert!(
+            chat_cache_protected(false, CHAT_CACHE_PROTECTED_FOR * 60),
+            "a side call never evicts a chat's cache, however long it has sat"
+        );
+
+        // The Orin's case: a 3,456-token voice turn against a 6,939-token cache.
+        let earlier_chat = tokens(10_000..16_939);
+        let new_conversation = tokens(0..3_456);
+        let idle = RetainedPrefix {
+            worth_protecting: chat_cache_protected(true, CHAT_CACHE_PROTECTED_FOR),
+            ..retained(&earlier_chat, 16_384)
+        };
+        assert_eq!(
+            prefill_plan(Some(idle), &new_conversation, 16_384),
+            PrefillPlan::FullPrefillInPlace
         );
     }
 
