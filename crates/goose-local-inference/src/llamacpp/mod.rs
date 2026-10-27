@@ -387,6 +387,19 @@ impl MemoryPolicy {
     }
 }
 
+/// Whether the retry after a failed load maps the GGUF again, or reads it. Read with unified
+/// memory: a model load maps the file with `MAP_POPULATE` and `MADV_WILLNEED`
+/// (`init_mappings(true)`), so the whole file enters the page cache before the GPU buffers are
+/// allocated, and on a Jetson that cache is the `MemFree` those allocations need. On 2026-10-27
+/// a released cache (1,874 to 4,915 MiB free) refilled to 3.3 GB within a mapped retry and the
+/// 2,197 MiB weight allocation failed again. Read, the buffers are allocated first and the
+/// progress release keeps the cache of what has been read small; the CPU-side tensors then
+/// live in host memory, which they occupy as mapped pages anyway. The first attempt always maps
+/// (see [`LlamaCppBackend::model_params`]), so a model that fits loads as it always has.
+fn retry_maps_file(unified_memory: bool) -> bool {
+    !unified_memory
+}
+
 impl LlamaCppBackend {
     pub(super) fn new() -> Result<Self> {
         check_cpu_supports_local_inference()?;
@@ -424,16 +437,22 @@ impl LlamaCppBackend {
         })
     }
 
-    /// Load parameters for the GGUF at `path`. With page-cache release on, the load releases
-    /// the file every [`memory::RELEASE_STEP_BYTES`] of progress, so the cache never holds the
-    /// weights it has already copied to the GPU.
-    fn model_params(&self, path: &Path, settings: &ModelSettings) -> LlamaModelParams {
-        // Explicit, because the default (`AUTO`) turns mmap off on an integrated GPU: on a Jetson
-        // Orin that copied the CPU-side tensors (Gemma's per-layer embeddings and token table,
-        // 1,872 MiB for E4B) into pinned host memory nothing can reclaim. Mapped, they are page
-        // cache, and a token reads only its own rows. The GPU-side weights are copied out of the
-        // mapping either way; `release_model_files` takes that copy back out of the page cache.
-        let mut params = LlamaModelParams::default().with_use_mmap(true);
+    /// Load parameters for the GGUF at `path`, mapped or read (`mapped`). With page-cache release
+    /// on, the load releases the file every [`memory::RELEASE_STEP_BYTES`] of progress, so the
+    /// cache never holds the weights it has already copied to the GPU.
+    ///
+    /// Mapped is explicit, because the default (`AUTO`) turns mmap off on an integrated GPU: on a
+    /// Jetson Orin that copies the CPU-side tensors (Gemma's per-layer embeddings and token
+    /// table, 1,872 MiB for E4B) into host memory nothing can reclaim. Mapped, they are page
+    /// cache, and a token reads only its own rows. Only a retry on unified memory reads
+    /// ([`retry_maps_file`]).
+    fn model_params(
+        &self,
+        path: &Path,
+        settings: &ModelSettings,
+        mapped: bool,
+    ) -> LlamaModelParams {
+        let mut params = LlamaModelParams::default().with_use_mmap(mapped);
         if let Some(n_gpu_layers) = settings.n_gpu_layers {
             params = params.with_n_gpu_layers(n_gpu_layers);
         }
@@ -457,7 +476,7 @@ impl LlamaCppBackend {
         let first = match LlamaModel::load_from_file(
             &self.backend,
             model_path,
-            &self.model_params(model_path, settings),
+            &self.model_params(model_path, settings, true),
         ) {
             Ok(model) => {
                 self.remember_model_file(model_path);
@@ -479,12 +498,14 @@ impl LlamaCppBackend {
             free_mb_after = after.map(|m| m.free / MIB),
             cached_mb_before = before.map(|m| m.cached / MIB),
             cached_mb_after = after.map(|m| m.cached / MIB),
+            retry_mapped = retry_maps_file(self.memory.unified_memory),
             "model load failed; retrying once with its files released from the page cache"
         );
+        let mapped = retry_maps_file(self.memory.unified_memory);
         LlamaModel::load_from_file(
             &self.backend,
             model_path,
-            &self.model_params(model_path, settings),
+            &self.model_params(model_path, settings, mapped),
         )
         .map_err(|e| {
             let needed_mb = std::fs::metadata(model_path).map_or(0, |m| m.len() / MIB);
@@ -681,7 +702,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
                 match LlamaModel::load_from_file(
                     &self.backend,
                     path,
-                    &self.model_params(path, settings),
+                    &self.model_params(path, settings, true),
                 ) {
                     Ok(d) => {
                         tracing::info!(
@@ -999,6 +1020,12 @@ fn log_inference_backend_devices() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retry_on_unified_memory_reads_the_file_and_maps_it_elsewhere() {
+        assert!(!retry_maps_file(true));
+        assert!(retry_maps_file(false));
+    }
 
     fn template_result(parser: Option<&str>, parse_tool_calls: bool) -> ChatTemplateResult {
         ChatTemplateResult {
