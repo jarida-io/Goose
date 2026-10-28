@@ -1,13 +1,14 @@
 mod inference_emulated_tools;
 mod inference_engine;
 mod inference_native_tools;
+mod memory;
 pub(super) mod mtp;
 mod prompt_snapshot;
 
 use std::any::Any;
 use std::ffi::CStr;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -21,7 +22,11 @@ use self::inference_emulated_tools::{
 };
 use self::inference_engine::{GenerationContext, LoadedChatTemplates, LoadedModel};
 use self::inference_native_tools::generate_with_native_tools;
+use self::memory::{
+    KvGeometry, LoadProgressRelease, MemInfo, MemoryFit, PageCache, SystemPageCache,
+};
 use crate::backend::{BackendLoadedModel, LocalGenerationRequest, LocalInferenceBackend};
+use crate::load_error::LoadStage;
 use crate::local_model_registry::{ChatTemplate, ModelSettings, ToolCallingMode};
 use crate::multimodal::ExtractedImage;
 use crate::tool_parsing::compact_tools_json;
@@ -30,6 +35,8 @@ use goose_provider_types::errors::ProviderError;
 use goose_provider_types::formats::openai::format_tools;
 
 pub(super) const LLAMACPP_BACKEND_ID: &str = "llamacpp";
+
+const MIB: u64 = 1024 * 1024;
 
 const CODE_EXECUTION_TOOL: &str = "code_execution__execute_typescript";
 
@@ -345,6 +352,52 @@ fn check_cpu_supports_local_inference() -> Result<()> {
 
 pub(super) struct LlamaCppBackend {
     backend: LlamaBackend,
+    memory: MemoryPolicy,
+    page_cache: Arc<dyn PageCache>,
+    /// Every model file this process has loaded weights from: the targets, their drafters and
+    /// picture encoders. What a retry after a failed allocation releases from the page cache.
+    /// Releasing one no longer loaded only drops cache nothing on the GPU path reads.
+    model_files: Mutex<Vec<PathBuf>>,
+}
+
+/// What this machine's memory needs from a load, decided once from the backend's devices.
+#[derive(Debug, Clone, Copy)]
+struct MemoryPolicy {
+    /// Linux with a GPU: weights are copied off the mapped file, so its page cache is a second
+    /// copy worth releasing. Not on a CPU-only build, whose weights are read from the mapping on
+    /// every token.
+    release_page_cache: bool,
+    /// Linux with an integrated GPU (a Jetson): GPU allocations come out of `MemFree`, so a
+    /// context is sized to it and a failed allocation is classified against it.
+    unified_memory: bool,
+}
+
+impl MemoryPolicy {
+    fn detect() -> Self {
+        let devices = list_llama_ggml_backend_devices();
+        let linux = cfg!(target_os = "linux");
+        Self {
+            release_page_cache: linux
+                && devices.iter().any(|d| is_accelerator_device(d.device_type)),
+            unified_memory: linux
+                && devices
+                    .iter()
+                    .any(|d| d.device_type == LlamaBackendDeviceType::IntegratedGpu),
+        }
+    }
+}
+
+/// Whether the retry after a failed load maps the GGUF again, or reads it. Read with unified
+/// memory: a model load maps the file with `MAP_POPULATE` and `MADV_WILLNEED`
+/// (`init_mappings(true)`), so the whole file enters the page cache before the GPU buffers are
+/// allocated, and on a Jetson that cache is the `MemFree` those allocations need. On 2026-10-27
+/// a released cache (1,874 to 4,915 MiB free) refilled to 3.3 GB within a mapped retry and the
+/// 2,197 MiB weight allocation failed again. Read, the buffers are allocated first and the
+/// progress release keeps the cache of what has been read small; the CPU-side tensors then
+/// live in host memory, which they occupy as mapped pages anyway. The first attempt always maps
+/// (see [`LlamaCppBackend::model_params`]), so a model that fits loads as it always has.
+fn retry_maps_file(unified_memory: bool) -> bool {
+    !unified_memory
 }
 
 impl LlamaCppBackend {
@@ -367,8 +420,197 @@ impl LlamaCppBackend {
 
         llama_cpp_2::send_logs_to_tracing(LogOptions::default());
         log_inference_backend_devices();
+        let memory = MemoryPolicy::detect();
+        tracing::info!(
+            target: "giap::trace",
+            kind = "inference_memory_policy",
+            release_page_cache = memory.release_page_cache,
+            unified_memory = memory.unified_memory,
+            "llama.cpp backend memory policy"
+        );
 
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            memory,
+            page_cache: Arc::new(SystemPageCache),
+            model_files: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Load parameters for the GGUF at `path`, mapped or read (`mapped`). With page-cache release
+    /// on, the load releases the file every [`memory::RELEASE_STEP_BYTES`] of progress, so the
+    /// cache never holds the weights it has already copied to the GPU.
+    ///
+    /// Mapped is explicit, because the default (`AUTO`) turns mmap off on an integrated GPU: on a
+    /// Jetson Orin that copies the CPU-side tensors (Gemma's per-layer embeddings and token
+    /// table, 1,872 MiB for E4B) into host memory nothing can reclaim. Mapped, they are page
+    /// cache, and a token reads only its own rows. Only a retry on unified memory reads
+    /// ([`retry_maps_file`]).
+    fn model_params(
+        &self,
+        path: &Path,
+        settings: &ModelSettings,
+        mapped: bool,
+    ) -> LlamaModelParams {
+        let mut params = LlamaModelParams::default().with_use_mmap(mapped);
+        if let Some(n_gpu_layers) = settings.n_gpu_layers {
+            params = params.with_n_gpu_layers(n_gpu_layers);
+        }
+        if settings.use_mlock {
+            params = params.with_use_mlock(true);
+        } else if self.memory.release_page_cache && settings.n_gpu_layers != Some(0) {
+            let mut release = LoadProgressRelease::new(Arc::clone(&self.page_cache), path);
+            params = params.with_progress_callback(move |progress| release.on_progress(progress));
+        }
+        params
+    }
+
+    /// Load the target's weights, retrying once after releasing the page cache when the first
+    /// attempt fails (logged as `kind="model_load_retry"`). A second failure with free memory
+    /// short of the file is [`OutOfGpuMemory`](crate::load_error::ModelLoadError::OutOfGpuMemory).
+    fn load_weights(
+        &self,
+        model_path: &Path,
+        settings: &ModelSettings,
+    ) -> Result<LlamaModel, ProviderError> {
+        let first = match LlamaModel::load_from_file(
+            &self.backend,
+            model_path,
+            &self.model_params(model_path, settings, true),
+        ) {
+            Ok(model) => {
+                self.remember_model_file(model_path);
+                return Ok(model);
+            }
+            Err(e) if self.memory.release_page_cache => e,
+            Err(e) => return Err(ProviderError::ExecutionError(e.to_string())),
+        };
+        self.remember_model_file(model_path);
+        let before = MemInfo::read();
+        let after = self.release_model_files("model_load_retry");
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "model_load_retry",
+            stage = "weights",
+            model = %model_path.display(),
+            error = %first,
+            free_mb_before = before.map(|m| m.free / MIB),
+            free_mb_after = after.map(|m| m.free / MIB),
+            cached_mb_before = before.map(|m| m.cached / MIB),
+            cached_mb_after = after.map(|m| m.cached / MIB),
+            retry_mapped = retry_maps_file(self.memory.unified_memory),
+            "model load failed; retrying once with its files released from the page cache"
+        );
+        let mapped = retry_maps_file(self.memory.unified_memory);
+        LlamaModel::load_from_file(
+            &self.backend,
+            model_path,
+            &self.model_params(model_path, settings, mapped),
+        )
+        .map_err(|e| {
+            let needed_mb = std::fs::metadata(model_path).map_or(0, |m| m.len() / MIB);
+            self.classify_failure(LoadStage::Weights, needed_mb, e.to_string())
+        })
+    }
+
+    /// Record a file this process loaded from, once.
+    fn remember_model_file(&self, path: &Path) {
+        let mut files = self.model_files.lock().unwrap_or_else(|e| e.into_inner());
+        if !files.iter().any(|f| f == path) {
+            files.push(path.to_path_buf());
+        }
+    }
+
+    /// Release every remembered model file from the page cache (see [`memory::release_files`]).
+    /// `None` when release is off on this machine or the kernel does not report memory.
+    fn release_model_files(&self, reason: &'static str) -> Option<MemInfo> {
+        if !self.memory.release_page_cache {
+            return None;
+        }
+        let files = self
+            .model_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let paths: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+        memory::release_files(self.page_cache.as_ref(), &paths, reason)
+    }
+
+    /// Whether a failed allocation is worth one retry after a release.
+    fn retries_after_release(&self) -> bool {
+        self.memory.release_page_cache
+    }
+
+    /// The error for an allocation that failed twice: [`OutOfGpuMemory`](crate::load_error::ModelLoadError::OutOfGpuMemory) on
+    /// unified memory with free memory short of `needed_mb`, logged as
+    /// `kind="model_out_of_gpu_memory"`; otherwise llama.cpp's own error, unchanged.
+    fn classify_failure(&self, stage: LoadStage, needed_mb: u64, error: String) -> ProviderError {
+        let oom = self
+            .memory
+            .unified_memory
+            .then(|| memory::out_of_gpu_memory(stage, needed_mb, MemInfo::read()))
+            .flatten();
+        match oom {
+            Some(oom) => {
+                tracing::error!(
+                    target: "giap::trace",
+                    kind = "model_out_of_gpu_memory",
+                    stage = ?stage,
+                    needed_mb,
+                    llama_error = %error,
+                    "{oom}"
+                );
+                oom.into()
+            }
+            None => ProviderError::ExecutionError(error),
+        }
+    }
+
+    /// The context budget a model just loaded may spend, logged as `kind="context_sized"`.
+    /// `None` off unified memory, or when the kernel or the model's header does not say.
+    fn memory_fit(
+        &self,
+        model_id: &str,
+        model: &LlamaModel,
+        settings: &ModelSettings,
+        free_after_load: Option<MemInfo>,
+    ) -> Option<MemoryFit> {
+        if !self.memory.unified_memory {
+            return None;
+        }
+        let geometry = KvGeometry::of(model)?;
+        let type_v = settings
+            .type_v
+            .as_deref()
+            .filter(|_| settings.flash_attention == Some(true));
+        let fit = MemoryFit {
+            kv_bytes_per_token: geometry.bytes_per_token(settings.type_k.as_deref(), type_v),
+            // The picture encoder loads per picture turn, after this.
+            free_bytes: free_after_load?
+                .free
+                .saturating_sub(settings.mmproj_size_bytes),
+        };
+        let requested = settings
+            .context_size
+            .map_or(memory::CONTEXT_LADDER[0], |c| c as usize);
+        let chosen = fit.fit(requested);
+        tracing::info!(
+            target: "giap::trace",
+            kind = "context_sized",
+            model = model_id,
+            requested,
+            pinned = settings.context_size.is_some(),
+            n_ctx = chosen.n_ctx,
+            reason = chosen.reason.as_str(),
+            kv_kib_per_token = fit.kv_bytes_per_token / 1024,
+            free_mb = fit.free_bytes / MIB,
+            kv_budget_mb = fit.kv_budget() / MIB,
+            compute_reserve_mb = memory::COMPUTE_RESERVE_BYTES / MIB,
+            margin_mb = memory::SAFETY_MARGIN_BYTES / MIB,
+            encoder_mb = settings.mmproj_size_bytes / MIB,
+            "context window sized to the memory free after the load"
+        );
+        Some(fit)
     }
 
     pub(super) fn llama_backend(&self) -> &LlamaBackend {
@@ -438,19 +680,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             model_path.display()
         );
 
-        // Explicit, because the default (`AUTO`) turns mmap off on an integrated GPU: on a Jetson
-        // Orin that copied the CPU-side tensors (Gemma's per-layer embeddings and token table,
-        // 1,872 MiB for E4B) into pinned host memory nothing can reclaim. Mapped, they are page
-        // cache, and a token reads only its own rows.
-        let mut params = LlamaModelParams::default().with_use_mmap(true);
-        if let Some(n_gpu_layers) = settings.n_gpu_layers {
-            params = params.with_n_gpu_layers(n_gpu_layers);
-        }
-        if settings.use_mlock {
-            params = params.with_use_mlock(true);
-        }
-        let model = LlamaModel::load_from_file(&self.backend, model_path, &params)
-            .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
+        let model = self.load_weights(model_path, settings)?;
 
         // The MTP drafter, when the registry names one. A drafter that fails to
         // load degrades to no speculation rather than failing the model load:
@@ -470,13 +700,18 @@ impl LocalInferenceBackend for LlamaCppBackend {
                 None
             }
             Some(path) if path.exists() => {
-                match LlamaModel::load_from_file(&self.backend, path, &params) {
+                match LlamaModel::load_from_file(
+                    &self.backend,
+                    path,
+                    &self.model_params(path, settings, true),
+                ) {
                     Ok(d) => {
                         tracing::info!(
                             backend = self.id(),
                             draft = %path.display(),
                             "MTP drafter loaded"
                         );
+                        self.remember_model_file(path);
                         Some(Arc::new(d))
                     }
                     Err(e) => {
@@ -499,6 +734,11 @@ impl LocalInferenceBackend for LlamaCppBackend {
             None => None,
         };
 
+        // The weights are on the GPU; the copies the load left in the page cache are
+        // what a Jetson's KV cache would otherwise fail to allocate against.
+        let free_after_load = self.release_model_files("model_loaded");
+        let memory_fit = self.memory_fit(model_id, &model, settings, free_after_load);
+
         let templates = load_chat_templates(&model, settings)?;
 
         // Vision encoder is loaded on-demand per turn rather than holding ~1 GB resident in VRAM.
@@ -519,6 +759,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             snapshot: None,
             suspended: None,
             model_path: model_path.clone(),
+            memory_fit,
         }))
     }
 
@@ -645,6 +886,15 @@ impl LocalInferenceBackend for LlamaCppBackend {
                 &request.resolved_model.mmproj_path,
                 request.settings,
             );
+            // The encoder reads its file whole onto the GPU, and this turn's context is
+            // allocated next, against what that read left free.
+            if let (Some(_), Some(mmproj)) = (
+                loaded.mtmd_ctx.as_ref(),
+                request.resolved_model.mmproj_path.as_ref(),
+            ) {
+                self.remember_model_file(mmproj);
+                self.release_model_files("encoder_loaded");
+            }
         }
 
         let template = select_generation_template(
@@ -667,6 +917,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             session: &mut loaded.session,
             snapshot: &mut loaded.snapshot,
             model_path: &loaded.model_path,
+            memory_fit: loaded.memory_fit,
             backend: self,
             template,
             settings: request.settings,
@@ -777,6 +1028,12 @@ fn log_inference_backend_devices() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retry_on_unified_memory_reads_the_file_and_maps_it_elsewhere() {
+        assert!(!retry_maps_file(true));
+        assert!(retry_maps_file(false));
+    }
 
     fn template_result(parser: Option<&str>, parse_tool_calls: bool) -> ChatTemplateResult {
         ChatTemplateResult {

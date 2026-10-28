@@ -18,7 +18,11 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use super::super::StreamSender;
+use super::memory::{KvGeometry, MemInfo, MemoryFit, COMPUTE_RESERVE_BYTES};
 use super::LlamaCppBackend;
+use crate::load_error::LoadStage;
+
+const MIB: u64 = 1024 * 1024;
 
 /// Shortest shared prompt prefix worth a partial KV cache removal. Below this
 /// the bookkeeping costs more than the decode it saves.
@@ -85,6 +89,8 @@ pub(super) struct GenerationContext<'a> {
     pub snapshot: &'a mut Option<super::prompt_snapshot::SnapshotSlot>,
     /// The GGUF this slot loaded, for keying that cache.
     pub model_path: &'a std::path::Path,
+    /// The context budget fixed when the model loaded; `None` off unified memory.
+    pub memory_fit: Option<MemoryFit>,
     pub backend: &'a LlamaCppBackend,
     pub template: &'a LlamaChatTemplate,
     pub settings: &'a ModelSettings,
@@ -135,6 +141,8 @@ pub(super) struct LoadedModel {
     pub suspended: Option<SuspendedKv>,
     /// Where this model was loaded from. Part of the snapshot key.
     pub model_path: std::path::PathBuf,
+    /// What a context may spend on a unified-memory board, measured once after the load.
+    pub memory_fit: Option<MemoryFit>,
 }
 
 pub(super) struct LoadedChatTemplates {
@@ -370,7 +378,51 @@ pub(super) struct SessionKv {
 unsafe impl Send for SessionKv {}
 
 impl SessionKv {
+    /// Create a context of `n_ctx`. A failure is retried once after releasing the loaded
+    /// models' files from the page cache (logged as `kind="model_load_retry"`), and a second
+    /// one with free memory short of the KV cache is
+    /// [`OutOfGpuMemory`](crate::load_error::ModelLoadError::OutOfGpuMemory).
     pub(super) fn create(
+        model: &Arc<LlamaModel>,
+        draft: Option<&Arc<LlamaModel>>,
+        backend: &LlamaCppBackend,
+        n_ctx: u32,
+        settings: &ModelSettings,
+    ) -> Result<Self, ProviderError> {
+        let first = match Self::try_create(model, draft, backend, n_ctx, settings) {
+            Ok(kv) => return Ok(kv),
+            Err(e) if backend.retries_after_release() => e,
+            Err(e) => return Err(e),
+        };
+        let before = MemInfo::read();
+        let after = backend.release_model_files("context_retry");
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "model_load_retry",
+            stage = "context",
+            n_ctx,
+            error = %first,
+            free_mb_before = before.map(|m| m.free / MIB),
+            free_mb_after = after.map(|m| m.free / MIB),
+            cached_mb_before = before.map(|m| m.cached / MIB),
+            cached_mb_after = after.map(|m| m.cached / MIB),
+            "context creation failed; retrying once with the model files released from the page cache"
+        );
+        Self::try_create(model, draft, backend, n_ctx, settings).map_err(|e| {
+            let type_v = settings
+                .type_v
+                .as_deref()
+                .filter(|_| settings.flash_attention == Some(true));
+            let kv_bytes = KvGeometry::of(model).map_or(0, |g| {
+                u64::from(n_ctx)
+                    .saturating_mul(g.bytes_per_token(settings.type_k.as_deref(), type_v))
+            });
+            let needed_mb = kv_bytes.saturating_add(COMPUTE_RESERVE_BYTES) / MIB;
+            backend.classify_failure(LoadStage::Context, needed_mb, e.to_string())
+        })
+    }
+
+    fn try_create(
         model: &Arc<LlamaModel>,
         draft: Option<&Arc<LlamaModel>>,
         backend: &LlamaCppBackend,
@@ -1019,7 +1071,36 @@ pub(super) fn estimate_max_context_for_memory(
     Some((usable / bytes_per_token) as usize)
 }
 
+/// The window a request gets: the requested one ([`requested_context`]), narrowed to what the
+/// memory free at load buys on a unified-memory board ([`MemoryFit::fit`]). The fit only ever
+/// narrows, so a pinned window or a host's `context_window_override` that already fits is kept
+/// exactly; one that does not fit would fail to allocate rather than run.
 pub(super) fn context_cap(
+    settings: &crate::local_model_registry::ModelSettings,
+    context_limit: usize,
+    n_ctx_train: usize,
+    memory_max_ctx: Option<usize>,
+    memory_fit: Option<MemoryFit>,
+) -> usize {
+    let requested = requested_context(settings, context_limit, n_ctx_train, memory_max_ctx);
+    let Some(fit) = memory_fit else {
+        return requested;
+    };
+    let chosen = fit.fit(requested);
+    if chosen.n_ctx != requested {
+        tracing::debug!(
+            target: "giap::trace",
+            requested,
+            n_ctx = chosen.n_ctx,
+            reason = chosen.reason.as_str(),
+            "context window narrowed to the memory free at load"
+        );
+    }
+    chosen.n_ctx
+}
+
+/// The window the settings, the request and the engine's own estimate ask for, before memory.
+fn requested_context(
     settings: &crate::local_model_registry::ModelSettings,
     context_limit: usize,
     n_ctx_train: usize,
@@ -1100,8 +1181,15 @@ pub(super) fn effective_context_size(
     context_limit: usize,
     n_ctx_train: usize,
     memory_max_ctx: Option<usize>,
+    memory_fit: Option<MemoryFit>,
 ) -> usize {
-    let limit = context_cap(settings, context_limit, n_ctx_train, memory_max_ctx);
+    let limit = context_cap(
+        settings,
+        context_limit,
+        n_ctx_train,
+        memory_max_ctx,
+        memory_fit,
+    );
     let min_generation_headroom = 512;
     if prompt_token_count + min_generation_headroom > limit {
         tracing::warn!(
@@ -1273,6 +1361,8 @@ pub(super) fn build_sampler(
 
 /// Validate prompt tokens against memory limits and compute the effective
 /// context size. Returns `(prompt_token_count, effective_ctx)`.
+// Eight: the load-time memory fit joined the seven inputs the window already had.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_and_compute_context(
     model: &LlamaModel,
     has_mtmd: bool,
@@ -1281,6 +1371,7 @@ pub(super) fn validate_and_compute_context(
     context_limit: usize,
     settings: &crate::local_model_registry::ModelSettings,
     retained_kv_tokens: usize,
+    memory_fit: Option<MemoryFit>,
 ) -> Result<(usize, usize), ProviderError> {
     let n_ctx_train = model.n_ctx_train() as usize;
     let mmproj_overhead = if has_mtmd {
@@ -1296,6 +1387,7 @@ pub(super) fn validate_and_compute_context(
         context_limit,
         n_ctx_train,
         memory_max_ctx,
+        memory_fit,
     );
     if let Some(mem_max) = memory_max_ctx {
         if prompt_token_count > mem_max {
@@ -2197,6 +2289,7 @@ fn prefill_multimodal(
     images: &[ExtractedImage],
     context_limit: usize,
     settings: &ModelSettings,
+    memory_fit: Option<MemoryFit>,
 ) -> Result<(usize, PrefilledPrompt), ProviderError> {
     let mtmd_ctx = mtmd_ctx.ok_or_else(|| {
         ProviderError::ExecutionError(
@@ -2249,6 +2342,7 @@ fn prefill_multimodal(
         context_limit,
         n_ctx_train,
         memory_max_ctx,
+        memory_fit,
     );
 
     let min_generation_headroom = 512;
@@ -2407,7 +2501,13 @@ pub(super) fn prepare_generation(
         mmproj_overhead,
         retained_kv_tokens,
     );
-    let cap = context_cap(ctx.settings, ctx.context_limit, n_ctx_train, memory_max_ctx);
+    let cap = context_cap(
+        ctx.settings,
+        ctx.context_limit,
+        n_ctx_train,
+        memory_max_ctx,
+        ctx.memory_fit,
+    );
     let token_budget = cap.saturating_sub(min_generation_headroom);
     let t_ctx_done = std::time::Instant::now();
     let estimated_image_tokens = ctx.images.len() * ctx.settings.image_token_estimate;
@@ -2508,6 +2608,7 @@ pub(super) fn prepare_generation(
             ctx.images,
             ctx.context_limit,
             ctx.settings,
+            ctx.memory_fit,
         )?;
         (ptc, prefilled, Vec::new())
     } else {
@@ -2524,6 +2625,7 @@ pub(super) fn prepare_generation(
             ctx.context_limit,
             ctx.settings,
             retained_kv_tokens,
+            ctx.memory_fit,
         )?;
         let t_validate_done = std::time::Instant::now();
         let prefilled = prefill_prompt(
@@ -2774,7 +2876,7 @@ pub(super) mod tests {
     #[test]
     fn test_effective_context_size_uses_full_limit() {
         assert_eq!(
-            effective_context_size(100, &default_settings(), 4096, 4096, None),
+            effective_context_size(100, &default_settings(), 4096, 4096, None, None),
             4096
         );
     }
@@ -2782,7 +2884,7 @@ pub(super) mod tests {
     #[test]
     fn test_effective_context_size_capped_by_limit() {
         assert_eq!(
-            effective_context_size(100, &default_settings(), 1024, 8192, None),
+            effective_context_size(100, &default_settings(), 1024, 8192, None, None),
             1024
         );
     }
@@ -2791,7 +2893,7 @@ pub(super) mod tests {
     #[test]
     fn test_effective_context_size_capped_by_memory() {
         assert_eq!(
-            effective_context_size(100, &default_settings(), 0, 4096, Some(800)),
+            effective_context_size(100, &default_settings(), 0, 4096, Some(800), None),
             800
         );
     }
@@ -2799,7 +2901,7 @@ pub(super) mod tests {
     #[test]
     fn test_effective_context_size_memory_smaller_than_prompt() {
         assert_eq!(
-            effective_context_size(600, &default_settings(), 0, 4096, Some(700)),
+            effective_context_size(600, &default_settings(), 0, 4096, Some(700), None),
             700
         );
     }
@@ -2808,7 +2910,7 @@ pub(super) mod tests {
     #[test]
     fn test_effective_context_size_a_set_limit_outranks_the_memory_estimate() {
         assert_eq!(
-            effective_context_size(100, &default_settings(), 4096, 4096, Some(800)),
+            effective_context_size(100, &default_settings(), 4096, 4096, Some(800), None),
             4096
         );
     }
@@ -2816,7 +2918,7 @@ pub(super) mod tests {
     #[test]
     fn test_effective_context_size_zero_limit_uses_train() {
         assert_eq!(
-            effective_context_size(100, &default_settings(), 0, 2048, None),
+            effective_context_size(100, &default_settings(), 0, 2048, None, None),
             2048
         );
     }
@@ -2824,7 +2926,7 @@ pub(super) mod tests {
     #[test]
     fn test_effective_context_size_prompt_exceeds_all_limits() {
         assert_eq!(
-            effective_context_size(5000, &default_settings(), 4096, 4096, None),
+            effective_context_size(5000, &default_settings(), 4096, 4096, None, None),
             4096
         );
     }
@@ -2833,22 +2935,56 @@ pub(super) mod tests {
     fn test_context_cap_with_settings_override() {
         let mut settings = default_settings();
         settings.context_size = Some(2048);
-        assert_eq!(context_cap(&settings, 4096, 8192, Some(1024)), 2048);
+        assert_eq!(context_cap(&settings, 4096, 8192, Some(1024), None), 2048);
     }
 
     #[test]
     fn test_context_cap_without_override() {
-        assert_eq!(context_cap(&default_settings(), 4096, 8192, None), 4096);
+        assert_eq!(
+            context_cap(&default_settings(), 4096, 8192, None, None),
+            4096
+        );
     }
 
     #[test]
     fn test_context_cap_memory_limited() {
-        assert_eq!(context_cap(&default_settings(), 0, 8192, Some(2048)), 2048);
         assert_eq!(
-            context_cap(&default_settings(), 4096, 8192, Some(2048)),
+            context_cap(&default_settings(), 0, 8192, Some(2048), None),
+            2048
+        );
+        assert_eq!(
+            context_cap(&default_settings(), 4096, 8192, Some(2048), None),
             4096,
             "a limit the host set wins over the memory estimate"
         );
+    }
+
+    /// The Jetson's pin (16,384, stamped from a static budget) is narrowed when the memory free
+    /// after the load cannot hold it, and kept exactly when it can; a smaller host cap is kept.
+    #[test]
+    fn test_context_cap_narrows_a_pin_to_the_memory_free_at_load() {
+        use super::super::memory::{COMPUTE_RESERVE_BYTES, SAFETY_MARGIN_BYTES};
+        let mut pinned = default_settings();
+        pinned.context_size = Some(16_384);
+        let per_token = 96 * 1024;
+        let reserves = COMPUTE_RESERVE_BYTES + SAFETY_MARGIN_BYTES;
+        let roomy = MemoryFit {
+            kv_bytes_per_token: per_token,
+            free_bytes: 16_384 * per_token + reserves,
+        };
+        let tight = MemoryFit {
+            free_bytes: 8_192 * per_token + reserves,
+            ..roomy
+        };
+        assert_eq!(context_cap(&pinned, 0, 32_768, None, Some(roomy)), 16_384);
+        assert_eq!(context_cap(&pinned, 0, 32_768, None, Some(tight)), 8_192);
+        assert_eq!(
+            context_cap(&pinned, 0, 32_768, None, None),
+            16_384,
+            "off unified memory"
+        );
+        pinned.context_size = Some(6_144);
+        assert_eq!(context_cap(&pinned, 0, 32_768, None, Some(tight)), 6_144);
     }
 
     fn tokens(ids: impl IntoIterator<Item = i32>) -> Vec<LlamaToken> {
