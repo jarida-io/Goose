@@ -79,13 +79,13 @@ const SNAPSHOT_MIN_TOKENS: usize = 1024;
 
 /// The most one snapshot may hold.
 ///
-/// Writing measured 67 MiB/s, so the file size IS the write latency: at
-/// 56 KiB/token a 16,384-token prefix would be 900 MiB and take a quarter of a
-/// minute to save, on a turn. Past a few thousand tokens the prefill being saved
-/// is already amortised across every future cold start, and the marginal token
-/// buys less than it costs to store. The cap is on tokens rather than bytes
-/// because the byte cost is only known after the write.
-const SNAPSHOT_MAX_TOKENS: usize = 6144;
+/// Writing measured 67 MiB/s, so the file size IS the write latency. Gemma 4
+/// E4B on the Orin stores about 20 KiB a token (6,144 tokens are 122 MB), so
+/// this cap is about 200 MB and a 3 s write, once per shape. It has to clear
+/// the chat preamble, about 8,700 tokens with every tool: a cap below it
+/// re-decodes the rest on every cold chat turn. The cap is on tokens rather
+/// than bytes because the byte cost is only known after the write.
+const SNAPSHOT_MAX_TOKENS: usize = 10_240;
 
 /// Token depths the prefix ladder hashes at.
 ///
