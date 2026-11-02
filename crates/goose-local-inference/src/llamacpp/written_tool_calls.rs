@@ -1,16 +1,14 @@
 //! A tool call the model wrote as text instead of in its native wrapper. llama.cpp's parser
 //! streams it as content, so the call never runs; Gemma 4 does this with thinking off, as
-//! `<NAME key="value" />` or as its own `NAME{key:value}` grammar behind `<call>` or
-//! `<tool_call>`. This reads such a call out of the visible content when it names a declared
-//! tool, and holds back only text that could still become one.
+//! `<NAME key="value" />` or as its own `NAME{key:value}` grammar behind a tag it makes up,
+//! such as `<call>`, `<tool_call>` or `<execute_tool>`. This reads such a call out of the
+//! visible content when it names a declared tool, and holds back only text that could still
+//! become one.
 
 use serde_json::{Map, Value};
 
 use crate::litert::fc_repair::{arguments_end, parse_arguments};
 
-/// Fences the model put around a call in its own grammar instead of `<|tool_call>`.
-const FENCES: [&str; 2] = ["call>", "tool_call>"];
-const FENCE_CLOSERS: [&str; 2] = ["</call>", "</tool_call>"];
 /// Held text past this is released: no written call has come near it.
 const MAX_HELD_BYTES: usize = 4096;
 
@@ -88,19 +86,25 @@ impl WrittenToolCalls {
 
     /// Reads what follows a `<`.
     fn read(&self, text: &str, at_end: bool) -> Read {
-        for fence in FENCES {
-            if let Some(body) = text.strip_prefix(fence) {
-                return self.read_fenced(body, at_end);
-            }
-            if fence.starts_with(text) && !at_end {
-                return Read::Unfinished;
-            }
+        let (word, rest) = text.split_at(word_len(text));
+        if rest.is_empty() {
+            return if at_end {
+                Read::NotACall
+            } else {
+                Read::Unfinished
+            };
         }
-        self.read_tag(text, at_end)
+        if word.is_empty() {
+            return Read::NotACall;
+        }
+        match rest.strip_prefix('>') {
+            Some(body) => self.read_fenced(word, body, at_end),
+            None => self.read_tag(word, rest, at_end),
+        }
     }
 
-    /// `NAME{key:value,...}`, optionally as `call:NAME{...}`, after a fence.
-    fn read_fenced(&self, body: &str, at_end: bool) -> Read {
+    /// `NAME{key:value,...}`, optionally as `call:NAME{...}`, after `<FENCE>`.
+    fn read_fenced(&self, fence: &str, body: &str, at_end: bool) -> Read {
         let body = body.trim_start();
         let body = match body.strip_prefix("call:") {
             Some(rest) => rest,
@@ -126,12 +130,13 @@ impl WrittenToolCalls {
                 None => Read::NotACall,
             };
         }
-        if at_end || FENCE_CLOSERS.iter().any(|closer| rest.starts_with(closer)) {
+        let closer = format!("</{fence}>");
+        if at_end || rest.starts_with(&closer) {
             Read::Call(WrittenCall {
                 name,
                 arguments: Map::new(),
             })
-        } else if FENCE_CLOSERS.iter().any(|closer| closer.starts_with(rest)) {
+        } else if closer.starts_with(rest) {
             Read::Unfinished
         } else {
             Read::NotACall
@@ -140,22 +145,11 @@ impl WrittenToolCalls {
 
     /// `NAME key="value" ... />`. A tag needs `/>` or an attribute to be a call, so a bare
     /// `<NAME>` in prose stays prose.
-    fn read_tag(&self, text: &str, at_end: bool) -> Read {
-        let (written, mut rest) = text.split_at(word_len(text));
-        if written.is_empty() {
-            return Read::NotACall;
-        }
-        if rest.is_empty() {
-            return if at_end {
-                Read::NotACall
-            } else {
-                Read::Unfinished
-            };
-        }
+    fn read_tag(&self, written: &str, mut rest: &str, at_end: bool) -> Read {
         let Some(name) = self.resolve(written) else {
             return Read::NotACall;
         };
-        if !rest.starts_with(|c: char| c.is_whitespace() || c == '/' || c == '>') {
+        if !rest.starts_with(|c: char| c.is_whitespace() || c == '/') {
             return Read::NotACall;
         }
         let mut arguments = Map::new();
@@ -321,6 +315,31 @@ mod tests {
     }
 
     #[test]
+    fn reads_a_call_behind_a_tag_it_made_up() {
+        assert_eq!(
+            read("<execute_tool>\ngiap-knowledge__search_web{question: \"how to get coffee stain out of cotton shirt\"}\n</execute_tool>"),
+            (
+                String::new(),
+                call(
+                    "giap-knowledge__search_web",
+                    json!({"question": "how to get coffee stain out of cotton shirt"})
+                )
+            )
+        );
+        assert_eq!(
+            read("<result>I will search the web for advice on how to fall asleep faster.</result>\n<call>giap-knowledge__search_web{question:<|\"|>how to fall asleep faster<|\"|>}</call>"),
+            (
+                "<result>I will search the web for advice on how to fall asleep faster.</result>\n"
+                    .to_string(),
+                call(
+                    "giap-knowledge__search_web",
+                    json!({"question": "how to fall asleep faster"})
+                )
+            )
+        );
+    }
+
+    #[test]
     fn reads_a_call_the_generation_cut_short() {
         assert_eq!(
             read(r#"<call>giap-knowledge__get_wikipedia_article{topic:"crocodile vs"#),
@@ -420,6 +439,8 @@ mod tests {
             "ends with <",
             "ends with <giap-knowledge__search_web",
             "<|\"|>quoted<|\"|>",
+            "<turn_plan>\n1. Search the web.\n</turn_plan>\nSteep it for one minute.",
+            "<response>\nBread rises because of yeast.",
         ] {
             assert_eq!(read(text), (text.to_string(), None), "{text}");
         }
@@ -447,7 +468,8 @@ mod tests {
     fn releases_a_tag_as_soon_as_it_cannot_be_a_call() {
         let mut calls = WrittenToolCalls::new(TOOLS);
         assert_eq!(calls.push("x <b"), "x ");
-        assert_eq!(calls.push(">bold"), "<b>bold");
+        assert_eq!(calls.push(">bold"), "");
+        assert_eq!(calls.push(" text"), "<b>bold text");
         assert_eq!(calls.push(" <giap-knowledge__search_web is"), " ");
         assert_eq!(calls.push(" great"), "<giap-knowledge__search_web is great");
     }
