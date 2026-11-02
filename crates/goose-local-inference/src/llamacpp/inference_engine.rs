@@ -417,8 +417,8 @@ impl SessionKv {
                 .as_deref()
                 .filter(|_| settings.flash_attention == Some(true));
             let kv_bytes = KvGeometry::of(model).map_or(0, |g| {
-                u64::from(n_ctx)
-                    .saturating_mul(g.bytes_per_token(settings.type_k.as_deref(), type_v))
+                g.cost(settings.type_k.as_deref(), type_v, settings.n_ubatch)
+                    .bytes(u64::from(n_ctx))
             });
             let needed_mb = kv_bytes.saturating_add(COMPUTE_RESERVE_BYTES) / MIB;
             backend.classify_failure(LoadStage::Context, needed_mb, e.to_string())
@@ -3017,13 +3017,16 @@ pub(super) mod tests {
     /// after the load cannot hold it, and kept exactly when it can; a smaller host cap is kept.
     #[test]
     fn test_context_cap_narrows_a_pin_to_the_memory_free_at_load() {
-        use super::super::memory::{COMPUTE_RESERVE_BYTES, SAFETY_MARGIN_BYTES};
+        use super::super::memory::{KvCost, COMPUTE_RESERVE_BYTES, SAFETY_MARGIN_BYTES};
         let mut pinned = default_settings();
         pinned.context_size = Some(16_384);
         let per_token = 96 * 1024;
         let reserves = COMPUTE_RESERVE_BYTES + SAFETY_MARGIN_BYTES;
         let roomy = MemoryFit {
-            kv_bytes_per_token: per_token,
+            kv: KvCost {
+                bytes_per_token: per_token,
+                sliding_bytes: 0,
+            },
             free_bytes: 16_384 * per_token + reserves,
             kv_type: None,
         };
@@ -3046,10 +3049,13 @@ pub(super) mod tests {
     /// estimate, but only up to the window the memory free at load narrows that limit to.
     #[test]
     fn a_set_limit_admits_a_prompt_up_to_the_window_the_memory_fit_leaves() {
-        use super::super::memory::{COMPUTE_RESERVE_BYTES, SAFETY_MARGIN_BYTES};
+        use super::super::memory::{KvCost, COMPUTE_RESERVE_BYTES, SAFETY_MARGIN_BYTES};
         let per_token = 96 * 1024;
         let tight = MemoryFit {
-            kv_bytes_per_token: per_token,
+            kv: KvCost {
+                bytes_per_token: per_token,
+                sliding_bytes: 0,
+            },
             free_bytes: 8_192 * per_token + COMPUTE_RESERVE_BYTES + SAFETY_MARGIN_BYTES,
             kv_type: None,
         };

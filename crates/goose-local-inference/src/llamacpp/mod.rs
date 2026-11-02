@@ -653,14 +653,18 @@ impl LlamaCppBackend {
             .map_or(memory::CONTEXT_LADDER[0], |c| c as usize);
         let adaptive = settings.kv_cache_policy == KvCachePolicy::Q8WhenTight;
         // A quantised V cache needs flash attention, so without it q8_0 is no candidate.
-        let quantized_bytes_per_token = (adaptive && flash_attention).then(|| {
-            geometry.bytes_per_token(Some(memory::TIGHT_KV_TYPE), Some(memory::TIGHT_KV_TYPE))
+        let quantized = (adaptive && flash_attention).then(|| {
+            geometry.cost(
+                Some(memory::TIGHT_KV_TYPE),
+                Some(memory::TIGHT_KV_TYPE),
+                settings.n_ubatch,
+            )
         });
         let choice = memory::choose_kv_cache(
             requested,
             free_bytes,
-            geometry.bytes_per_token(settings.type_k.as_deref(), type_v),
-            quantized_bytes_per_token,
+            geometry.cost(settings.type_k.as_deref(), type_v, settings.n_ubatch),
+            quantized,
         );
         if adaptive {
             tracing::info!(
@@ -693,7 +697,11 @@ impl LlamaCppBackend {
             pinned = settings.context_size.is_some(),
             n_ctx = chosen.n_ctx,
             reason = chosen.reason.as_str(),
-            kv_kib_per_token = fit.kv_bytes_per_token / 1024,
+            kv_kib_per_token = fit.kv.bytes_per_token / 1024,
+            sliding_kv_mb = fit.kv.sliding_bytes / MIB,
+            full_layers = geometry.full_layers,
+            sliding_layers = geometry.sliding_layers,
+            n_swa = geometry.n_swa,
             free_mb = fit.free_bytes / MIB,
             kv_budget_mb = fit.kv_budget() / MIB,
             compute_reserve_mb = memory::COMPUTE_RESERVE_BYTES / MIB,

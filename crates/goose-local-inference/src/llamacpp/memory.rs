@@ -30,10 +30,9 @@ pub(super) const RELEASE_STEP_BYTES: u64 = 256 * MIB;
 
 /// Context windows tried, widest first, when the requested one does not fit.
 ///
-/// 5,120 is there for a load just above the floor: on 2026-11-02 Gemma 4 E4B, its encoder
-/// reserved, left a 269 MiB KV budget, which holds ~5,400 tokens in q8_0. Without the rung that
-/// window rounded down to the floor like f16's ~2,900, and the ~3,300-token preamble had ~800
-/// tokens of turn where 5,120 gives it ~1,800.
+/// 5,120 is there for a load just above the floor, where q8_0 can hold more than 4,096 tokens but
+/// not 6,144: without the rung that window rounded down to the floor, f16's window, and q8_0 had
+/// nothing to gain. For a ~3,300-token preamble it is ~1,800 tokens of turn rather than ~800.
 pub(super) const CONTEXT_LADDER: [usize; 6] = [16_384, 12_288, 8_192, 6_144, 5_120, 4_096];
 
 /// The narrowest window the fit hands out, whatever free memory says. Below it a Gemma 4 E4B
@@ -316,55 +315,195 @@ impl LoadProgressRelease {
 
 // ── The context free memory buys ────────────────────────────────────────────
 
-/// What a KV cache costs, read from the model's own metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct KvGeometry {
-    /// Layers that allocate KV: all of them less `<arch>.attention.shared_kv_layers`.
-    pub owning_layers: u64,
-    pub kv_heads: u64,
+/// The narrowest physical batch a context of this engine is built with when it slides: llama.cpp's
+/// own default, and what a picture turn's prefill raises `n_ubatch` to. The sliding-window cache
+/// is sized by it, so charging at least this covers a picture turn's context too.
+const SLIDING_UBATCH_FLOOR: u32 = 512;
+
+/// The multiple of cells llama.cpp pads a sliding-window cache to (`llama_kv_cache_iswa`).
+const SLIDING_CELL_PAD: u64 = 256;
+
+/// The model's own KV metadata, as its GGUF header declares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KvMeta {
+    /// Layers that allocate KV: all of them less `<arch>.attention.shared_kv_layers`, which
+    /// reuse an earlier layer's cache.
+    pub owning_layers: usize,
+    /// `<arch>.attention.head_count_kv`: one value for every layer, or one per layer.
+    pub kv_heads: Vec<u64>,
+    /// K and V widths per head on a full-attention layer.
     pub key_length: u64,
     pub value_length: u64,
+    /// `<arch>.attention.key_length_swa` / `value_length_swa`: the widths on a sliding-window
+    /// layer, the full widths where the header does not say.
+    pub key_length_swa: u64,
+    pub value_length_swa: u64,
+    /// `<arch>.attention.sliding_window_pattern`, one flag per layer, `true` for a layer that
+    /// slides. `None` where the header has no per-layer pattern.
+    pub sliding: Option<Vec<bool>>,
+    /// `<arch>.attention.sliding_window`, positions a sliding layer attends to; 0 when none.
+    pub n_swa: u64,
+}
+
+impl KvMeta {
+    /// The geometry these figures give; `None` when no layer allocates any KV.
+    ///
+    /// A layer slides only when the header says so per layer and declares a window: without
+    /// the pattern every owning layer is charged as full attention, which is what llama.cpp
+    /// allocates at most. A `head_count_kv` list shorter than the layers is read at its largest.
+    pub(super) fn geometry(&self) -> Option<KvGeometry> {
+        let pattern = self
+            .sliding
+            .as_deref()
+            .filter(|p| self.n_swa > 0 && p.len() >= self.owning_layers);
+        let widest_heads = self.kv_heads.iter().copied().max().unwrap_or(0);
+        let mut geometry = KvGeometry {
+            full_k: 0,
+            full_v: 0,
+            sliding_k: 0,
+            sliding_v: 0,
+            full_layers: 0,
+            sliding_layers: 0,
+            n_swa: self.n_swa,
+        };
+        for layer in 0..self.owning_layers {
+            let heads = match self.kv_heads.as_slice() {
+                [one] => *one,
+                per_layer if per_layer.len() >= self.owning_layers => per_layer[layer],
+                _ => widest_heads,
+            };
+            if pattern.is_some_and(|p| p[layer]) {
+                geometry.sliding_k += heads * self.key_length_swa;
+                geometry.sliding_v += heads * self.value_length_swa;
+                geometry.sliding_layers += 1;
+            } else {
+                geometry.full_k += heads * self.key_length;
+                geometry.full_v += heads * self.value_length;
+                geometry.full_layers += 1;
+            }
+        }
+        if geometry.sliding_layers == 0 {
+            geometry.n_swa = 0;
+        }
+        (geometry.full_k + geometry.full_v + geometry.sliding_k + geometry.sliding_v > 0)
+            .then_some(geometry)
+    }
+}
+
+/// What a KV cache costs: K and V elements per cached position, summed over the layers that
+/// keep every position and over the sliding-window layers, which under the windowed cache
+/// (`swa_full = false`) keep only their window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KvGeometry {
+    pub full_k: u64,
+    pub full_v: u64,
+    pub sliding_k: u64,
+    pub sliding_v: u64,
+    pub full_layers: u64,
+    pub sliding_layers: u64,
+    /// The sliding window; 0 when no layer slides.
+    pub n_swa: u64,
 }
 
 impl KvGeometry {
-    /// The geometry `model` declares; `None` when a count it needs is zero. KV heads are layer
-    /// 0's, as llama.cpp reports them; key and value widths default to the head dimension.
+    /// The geometry `model` declares; `None` when the header gives no KV at all. KV heads
+    /// default to layer 0's, as llama.cpp reports them, and widths to the head dimension.
     pub(super) fn of(model: &llama_cpp_2::model::LlamaModel) -> Option<Self> {
         let arch = model.meta_val_str("general.architecture").ok()?;
-        let meta = |key: &str| {
-            model
-                .meta_val_str(&format!("{arch}.{key}"))
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-        };
+        let meta = |key: &str| model.meta_val_str(&format!("{arch}.{key}")).ok();
+        let number = |key: &str| meta(key).and_then(|value| value.trim().parse::<u64>().ok());
         let layers = u64::from(model.n_layer());
         let n_head = u64::from(model.n_head());
-        let kv_heads = u64::from(model.n_head_kv());
         let n_embd = u64::try_from(model.n_embd()).ok()?;
-        if layers == 0 || n_head == 0 || kv_heads == 0 {
+        if layers == 0 || n_head == 0 {
             return None;
         }
         let head_dim = n_embd / n_head;
-        let owning_layers = layers.saturating_sub(meta("attention.shared_kv_layers").unwrap_or(0));
-        (owning_layers > 0).then(|| Self {
-            owning_layers,
-            kv_heads,
-            key_length: meta("attention.key_length").unwrap_or(head_dim),
-            value_length: meta("attention.value_length").unwrap_or(head_dim),
-        })
+        let key_length = number("attention.key_length").unwrap_or(head_dim);
+        let value_length = number("attention.value_length").unwrap_or(head_dim);
+        let owning_layers =
+            layers.saturating_sub(number("attention.shared_kv_layers").unwrap_or(0));
+        KvMeta {
+            owning_layers: usize::try_from(owning_layers).ok()?,
+            kv_heads: meta("attention.head_count_kv")
+                .and_then(|value| parse_meta_list(&value, |v| v.parse::<u64>().ok()))
+                .unwrap_or_else(|| vec![u64::from(model.n_head_kv())]),
+            key_length,
+            value_length,
+            key_length_swa: number("attention.key_length_swa").unwrap_or(key_length),
+            value_length_swa: number("attention.value_length_swa").unwrap_or(value_length),
+            sliding: meta("attention.sliding_window_pattern")
+                .and_then(|value| parse_meta_list(&value, parse_meta_bool)),
+            n_swa: number("attention.sliding_window").unwrap_or(0),
+        }
+        .geometry()
     }
 
-    /// Bytes of KV cache per token of context.
-    ///
-    /// Charges every owning layer the full window at the full key width, at least what
-    /// llama.cpp's full-size cache costs. Contexts keep the windowed cache (`swa_full = false`),
-    /// whose sliding-window layers hold only their window: on the Orin E4B's 16K cache was
-    /// 476 MiB full-size and 152 MiB windowed (q8_0). The header does not say which layers
-    /// slide, so the bound errs on the side that cannot run out of memory.
-    pub(super) fn bytes_per_token(&self, type_k: Option<&str>, type_v: Option<&str>) -> u64 {
-        let per_head =
-            self.key_length * bytes_per_32(type_k) + self.value_length * bytes_per_32(type_v);
-        (self.owning_layers * self.kv_heads * per_head).div_ceil(32)
+    /// What a cache of these types costs, for contexts built with `n_ubatch` (`None`, llama.cpp's
+    /// default). Logged in `kind="context_sized"` as `kv_kib_per_token` and `sliding_kv_mb`.
+    pub(super) fn cost(
+        &self,
+        type_k: Option<&str>,
+        type_v: Option<&str>,
+        n_ubatch: Option<u32>,
+    ) -> KvCost {
+        let bytes =
+            |k: u64, v: u64| (k * bytes_per_32(type_k) + v * bytes_per_32(type_v)).div_ceil(32);
+        KvCost {
+            bytes_per_token: bytes(self.full_k, self.full_v),
+            sliding_bytes: bytes(self.sliding_k, self.sliding_v)
+                * sliding_cells(self.n_swa, n_ubatch),
+        }
+    }
+}
+
+/// The cells llama.cpp gives the sliding-window layers of one sequence (`llama_kv_cache_iswa`):
+/// `GGML_PAD(min(n_ctx, n_swa + n_ubatch), 256)`. Charged at its most, as though `n_ctx` were
+/// always the wider, and with `n_ubatch` at least [`SLIDING_UBATCH_FLOOR`]: an estimate that
+/// guards against running out of memory may be high, never low.
+pub(super) fn sliding_cells(n_swa: u64, n_ubatch: Option<u32>) -> u64 {
+    if n_swa == 0 {
+        return 0;
+    }
+    let ubatch = n_ubatch
+        .unwrap_or(SLIDING_UBATCH_FLOOR)
+        .max(SLIDING_UBATCH_FLOOR);
+    (n_swa + u64::from(ubatch)).next_multiple_of(SLIDING_CELL_PAD)
+}
+
+/// A KV cache's bytes: a part that grows with the window and a part fixed by the sliding window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KvCost {
+    /// Bytes per position of the window, on the full-attention layers.
+    pub bytes_per_token: u64,
+    /// Bytes of the sliding-window layers' cache, whatever the window.
+    pub sliding_bytes: u64,
+}
+
+impl KvCost {
+    /// The cache for a window of `n_ctx`.
+    pub(super) fn bytes(&self, n_ctx: u64) -> u64 {
+        n_ctx
+            .saturating_mul(self.bytes_per_token)
+            .saturating_add(self.sliding_bytes)
+    }
+}
+
+/// A metadata value llama.cpp renders as `[a, b, ...]`, or a single value standing for every
+/// layer; `None` when any element does not parse.
+fn parse_meta_list<T>(value: &str, parse: impl Fn(&str) -> Option<T>) -> Option<Vec<T>> {
+    let value = value.trim();
+    match value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+        Some(items) => items.split(',').map(|item| parse(item.trim())).collect(),
+        None => parse(value).map(|one| vec![one]),
+    }
+}
+
+fn parse_meta_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -444,11 +583,12 @@ pub(super) fn fit_context(requested: usize, kv_bytes_per_token: u64, budget: u64
 /// rebuild the retained context and change the preamble snapshot's key turn by turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MemoryFit {
-    pub kv_bytes_per_token: u64,
+    /// The KV cache's cost in the chosen types.
+    pub kv: KvCost,
     /// `MemFree` at load, less the picture encoder's weights when the model has one.
     pub free_bytes: u64,
     /// The element type [`choose_kv_cache`] put both K and V in, in place of the settings' own;
-    /// `None` keeps the settings'. `kv_bytes_per_token` is this type's cost.
+    /// `None` keeps the settings'. `kv` is this type's cost.
     pub kv_type: Option<&'static str>,
 }
 
@@ -461,7 +601,13 @@ impl MemoryFit {
     }
 
     pub(super) fn fit(&self, requested: usize) -> ContextFit {
-        fit_context(requested, self.kv_bytes_per_token, self.kv_budget())
+        // The sliding-window cache is the same size whatever the window, so it comes off the
+        // budget before the window is fitted to the rest.
+        fit_context(
+            requested,
+            self.kv.bytes_per_token,
+            self.kv_budget().saturating_sub(self.kv.sliding_bytes),
+        )
     }
 }
 
@@ -524,26 +670,26 @@ impl KvChoice {
 }
 
 /// Choose the KV cache type for a load with `free_bytes` free: the settings' own types
-/// (`preferred_bytes_per_token`), unless the window they leave for `requested` is under
-/// [`KV_TIGHT_WINDOW`] and [`TIGHT_KV_TYPE`] (`quantized_bytes_per_token`, `None` when it is no
-/// candidate) leaves a strictly wider one. Same window, the faster type is kept.
+/// (`preferred`), unless the window they leave for `requested` is under [`KV_TIGHT_WINDOW`] and
+/// [`TIGHT_KV_TYPE`] (`quantized`, `None` when it is no candidate) leaves a strictly wider one.
+/// Same window, the faster type is kept.
 pub(super) fn choose_kv_cache(
     requested: usize,
     free_bytes: u64,
-    preferred_bytes_per_token: u64,
-    quantized_bytes_per_token: Option<u64>,
+    preferred: KvCost,
+    quantized: Option<KvCost>,
 ) -> KvChoice {
     let preferred_fit = MemoryFit {
-        kv_bytes_per_token: preferred_bytes_per_token,
+        kv: preferred,
         free_bytes,
         kv_type: None,
     };
-    let preferred = preferred_fit.fit(requested);
-    let candidate = quantized_bytes_per_token.map(|kv_bytes_per_token| MemoryFit {
-        kv_bytes_per_token,
+    let candidate = quantized.map(|kv| MemoryFit {
+        kv,
         free_bytes,
         kv_type: Some(TIGHT_KV_TYPE),
     });
+    let preferred = preferred_fit.fit(requested);
     let quantized = candidate.map(|fit| fit.fit(requested));
     let fit = match (candidate, quantized) {
         (Some(candidate), Some(q))
@@ -727,34 +873,192 @@ mod tests {
         unsafe { libc::munmap(addr, len) };
     }
 
-    /// An illustrative geometry, not any shipped model's.
-    const GEOMETRY: KvGeometry = KvGeometry {
-        owning_layers: 24,
-        kv_heads: 2,
-        key_length: 512,
-        value_length: 512,
-    };
+    /// Every owning layer full attention: what a header without a sliding-window pattern gets.
+    fn all_full() -> KvGeometry {
+        KvMeta {
+            owning_layers: 24,
+            kv_heads: vec![2],
+            key_length: 512,
+            value_length: 512,
+            key_length_swa: 256,
+            value_length_swa: 256,
+            sliding: None,
+            n_swa: 512,
+        }
+        .geometry()
+        .expect("has KV")
+    }
+
+    /// Gemma 4 E4B's header (`gemma-4-E4B-it-Q4_K_M.gguf`): 42 layers, the last 18 sharing an
+    /// earlier layer's KV, 2 KV heads, 512-wide full-attention and 256-wide sliding heads, a
+    /// 512-position window, and five sliding layers to each full one.
+    fn e4b_meta() -> KvMeta {
+        KvMeta {
+            owning_layers: 42 - 18,
+            kv_heads: vec![2],
+            key_length: 512,
+            value_length: 512,
+            key_length_swa: 256,
+            value_length_swa: 256,
+            sliding: Some(
+                [true, true, true, true, true, false]
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(42)
+                    .collect(),
+            ),
+            n_swa: 512,
+        }
+    }
+
+    fn e4b() -> KvGeometry {
+        e4b_meta().geometry().expect("has KV")
+    }
 
     #[test]
     fn kv_cost_follows_the_cache_types() {
-        let f16 = GEOMETRY.bytes_per_token(None, None);
-        assert_eq!(f16, 24 * 2 * (512 + 512) * 2);
-        assert_eq!(GEOMETRY.bytes_per_token(Some("F16"), Some("f16")), f16);
+        let f16 = all_full().cost(None, None, None);
+        assert_eq!(f16.bytes_per_token, 24 * 2 * (512 + 512) * 2);
+        assert_eq!(f16.sliding_bytes, 0, "nothing slides without a pattern");
+        assert_eq!(all_full().cost(Some("F16"), Some("f16"), None), f16);
         assert_eq!(
-            GEOMETRY.bytes_per_token(Some("q8_0"), Some("q8_0")),
-            f16 * 34 / 64
+            all_full()
+                .cost(Some("q8_0"), Some("q8_0"), None)
+                .bytes_per_token,
+            f16.bytes_per_token * 34 / 64
         );
-        assert_eq!(GEOMETRY.bytes_per_token(Some("f32"), None), f16 * 3 / 2);
         assert_eq!(
-            GEOMETRY.bytes_per_token(Some("mystery"), None),
+            all_full().cost(Some("f32"), None, None).bytes_per_token,
+            f16.bytes_per_token * 3 / 2
+        );
+        assert_eq!(
+            all_full().cost(Some("mystery"), None, None),
             f16,
             "unknown is f16"
         );
     }
 
     #[test]
+    fn only_the_full_attention_layers_grow_with_the_window() {
+        let g = e4b();
+        assert_eq!((g.full_layers, g.sliding_layers, g.n_swa), (4, 20, 512));
+        let f16 = g.cost(None, None, Some(512));
+        assert_eq!(f16.bytes_per_token, 4 * 2 * (512 + 512) * 2);
+        // 20 layers x 2 heads x (256 + 256) x 2 bytes, over GGML_PAD(512 + 512, 256) cells.
+        assert_eq!(f16.sliding_bytes, 20 * 2 * (256 + 256) * 2 * 1_024);
+        assert_eq!(
+            f16.bytes(4_096) - f16.bytes(2_048),
+            2_048 * f16.bytes_per_token
+        );
+    }
+
+    /// The Orin's measurement, E4B at 16K with the windowed cache: 286 MiB in f16 and 152 in
+    /// q8_0, built with `n_ubatch` 256. llama.cpp's sizing reproduces both exactly; the estimate
+    /// charges the 512 a picture turn raises it to, a few percent over and never under.
+    #[test]
+    fn the_estimate_covers_the_measured_cache_by_a_few_percent() {
+        let g = e4b();
+        let measured_cells = (512 + 256_u64).next_multiple_of(256);
+        for (type_name, measured_mib) in [("f16", 286), ("q8_0", 152)] {
+            let cost = g.cost(Some(type_name), Some(type_name), Some(256));
+            let per_cell = cost.sliding_bytes / sliding_cells(512, Some(256));
+            let llama_cpp = 16_384 * cost.bytes_per_token + per_cell * measured_cells;
+            // llama.cpp logs MiB to two places; 151.94 is the 152 measured in q8_0.
+            assert_eq!(llama_cpp.div_ceil(MIB), measured_mib, "{type_name}");
+            let estimate = cost.bytes(16_384);
+            assert!(estimate >= measured_mib * MIB, "{type_name}: never under");
+            assert!(
+                estimate * 100 <= measured_mib * MIB * 104,
+                "{type_name}: {} MiB",
+                estimate / MIB
+            );
+        }
+        // The bound it replaces charged all 24 layers the whole window at the full width.
+        assert_eq!(all_full().cost(None, None, None).bytes(16_384) / MIB, 1_536);
+    }
+
+    #[test]
+    fn the_sliding_cache_is_sized_as_llama_cpp_sizes_it() {
+        assert_eq!(sliding_cells(512, Some(512)), 1_024);
+        assert_eq!(sliding_cells(512, Some(1_000)), 1_536, "padded to 256");
+        assert_eq!(
+            sliding_cells(512, Some(128)),
+            1_024,
+            "a picture turn's 512 at least"
+        );
+        assert_eq!(sliding_cells(512, None), 1_024, "llama.cpp's default batch");
+        assert_eq!(
+            sliding_cells(0, Some(512)),
+            0,
+            "no window, no sliding cache"
+        );
+    }
+
+    #[test]
+    fn a_header_that_does_not_say_which_layers_slide_is_charged_in_full() {
+        let without_window = KvMeta {
+            n_swa: 0,
+            ..e4b_meta()
+        };
+        let short_pattern = KvMeta {
+            sliding: Some(vec![true; 10]),
+            ..e4b_meta()
+        };
+        for meta in [without_window, short_pattern] {
+            let g = meta.geometry().expect("has KV");
+            assert_eq!((g.full_layers, g.sliding_layers, g.n_swa), (24, 0, 0));
+            assert_eq!(g, all_full());
+        }
+        let nothing = KvMeta {
+            owning_layers: 0,
+            ..e4b_meta()
+        };
+        assert_eq!(nothing.geometry(), None);
+    }
+
+    #[test]
+    fn kv_heads_may_be_given_per_layer() {
+        let per_layer = KvMeta {
+            kv_heads: (0..24)
+                .map(|layer| if layer % 6 == 5 { 4 } else { 1 })
+                .collect(),
+            ..e4b_meta()
+        }
+        .geometry()
+        .expect("has KV");
+        assert_eq!(per_layer.full_k, 4 * 4 * 512);
+        assert_eq!(per_layer.sliding_k, 20 * 256);
+        // A list that does not cover the layers is read at its widest.
+        let short = KvMeta {
+            kv_heads: vec![1, 3],
+            ..e4b_meta()
+        }
+        .geometry()
+        .expect("has KV");
+        assert_eq!(short.full_k, 4 * 3 * 512);
+    }
+
+    #[test]
+    fn metadata_lists_parse_as_llama_cpp_renders_them() {
+        assert_eq!(
+            parse_meta_list("[true, false, TRUE]", parse_meta_bool),
+            Some(vec![true, false, true])
+        );
+        assert_eq!(
+            parse_meta_list("[2, 4]", |v| v.parse::<u64>().ok()),
+            Some(vec![2, 4])
+        );
+        assert_eq!(
+            parse_meta_list(" 2 ", |v| v.parse::<u64>().ok()),
+            Some(vec![2])
+        );
+        assert_eq!(parse_meta_list("[true, maybe]", parse_meta_bool), None);
+    }
+
+    #[test]
     fn the_requested_window_is_kept_when_it_fits() {
-        let per_token = GEOMETRY.bytes_per_token(None, None);
+        let per_token = all_full().cost(None, None, None).bytes_per_token;
         let fit = fit_context(16_384, per_token, 16_384 * per_token);
         assert_eq!(
             fit,
@@ -811,11 +1115,11 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_keeps_the_compute_reserve_and_the_margin() {
-        let per_token = GEOMETRY.bytes_per_token(None, None);
-        let exactly = 16_384 * per_token + COMPUTE_RESERVE_BYTES + SAFETY_MARGIN_BYTES;
+    fn the_budget_keeps_the_compute_reserve_the_margin_and_the_sliding_cache() {
+        let kv = e4b().cost(None, None, None);
+        let exactly = kv.bytes(16_384) + COMPUTE_RESERVE_BYTES + SAFETY_MARGIN_BYTES;
         let fit = MemoryFit {
-            kv_bytes_per_token: per_token,
+            kv,
             free_bytes: exactly,
             kv_type: None,
         };
@@ -833,68 +1137,74 @@ mod tests {
         );
     }
 
-    /// Gemma 4 E4B's KV per token as the fit charges it: 24 owning layers, 2 KV heads, 512-wide
-    /// keys and values. 96 KiB in f16, as `kind="context_sized"` logs it on the Orin.
-    const E4B: KvGeometry = KvGeometry {
-        owning_layers: 24,
-        kv_heads: 2,
-        key_length: 512,
-        value_length: 512,
-    };
-
+    /// E4B as the Jetson stamps it (f16, `n_ubatch` 512), q8_0 the candidate.
     fn e4b_choice(free_mb: u64) -> KvChoice {
         choose_kv_cache(
             16_384,
             free_mb * MIB,
-            E4B.bytes_per_token(Some("f16"), Some("f16")),
-            Some(E4B.bytes_per_token(Some(TIGHT_KV_TYPE), Some(TIGHT_KV_TYPE))),
+            e4b().cost(Some("f16"), Some("f16"), Some(512)),
+            Some(e4b().cost(Some(TIGHT_KV_TYPE), Some(TIGHT_KV_TYPE), Some(512))),
         )
     }
 
+    /// 2026-11-02: 1,037 MB free (the encoder's 945 already taken off), a 269 MiB KV budget.
+    /// f16 at 16K needs 296 MiB, so it gets 12,288 (232 MiB), which is roomy: f16 stays.
+    #[test]
+    fn todays_load_keeps_f16_at_12288() {
+        let choice = e4b_choice(1_037);
+        assert_eq!(choice.fit.kv_budget() / MIB, 269);
+        assert_eq!(choice.preferred.n_ctx, 12_288);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(16_384));
+        assert_eq!(choice.fit.kv_type, None);
+        assert_eq!(choice.reason(), "roomy");
+    }
+
+    /// 2026-10-28: 1,419 MB free. f16 holds the whole 16,384.
     #[test]
     fn a_roomy_load_keeps_f16() {
-        let f16 = E4B.bytes_per_token(None, None);
-        assert_eq!(f16, 96 * 1024);
-        let free = (16_384 * f16 + COMPUTE_RESERVE_BYTES + SAFETY_MARGIN_BYTES) / MIB;
-        let choice = e4b_choice(free);
-        assert_eq!(choice.fit.kv_type, None);
-        assert_eq!(choice.fit.kv_bytes_per_token, f16);
-        assert_eq!(choice.preferred.n_ctx, 16_384);
-        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(16_384));
-        assert_eq!(choice.reason(), "roomy");
-        // f16 at exactly the threshold is roomy too: 8,192 tokens is 768 MiB of KV.
-        let choice = e4b_choice(768 + 256 + 512);
+        let choice = e4b_choice(1_419);
+        assert_eq!(
+            (choice.preferred, choice.fit.kv_type, choice.reason()),
+            (
+                ContextFit {
+                    n_ctx: 16_384,
+                    reason: FitReason::Requested
+                },
+                None,
+                "roomy"
+            )
+        );
+        // f16 at exactly the threshold is roomy too: 8,192 tokens is 128 + 40 MiB.
+        let choice = e4b_choice(128 + 40 + 256 + 512);
         assert_eq!(
             (choice.preferred.n_ctx, choice.fit.kv_type, choice.reason()),
             (8_192, None, "roomy")
         );
     }
 
-    /// 2026-10-28: 1,419 MB free after the load. f16 buys 6,144 tokens, q8_0 12,288.
+    /// A 160 MiB budget: f16 buys 6,144 tokens, q8_0 the whole 16,384.
     #[test]
     fn a_tight_load_takes_q8_0_and_the_wider_window() {
-        let choice = e4b_choice(1_419);
+        let choice = e4b_choice(160 + 768);
         assert_eq!(choice.preferred.n_ctx, 6_144);
-        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(12_288));
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(16_384));
         assert_eq!(choice.fit.kv_type, Some("q8_0"));
         assert_eq!(
-            choice.fit.kv_bytes_per_token,
-            E4B.bytes_per_token(Some("q8_0"), Some("q8_0"))
+            choice.fit.kv,
+            e4b().cost(Some("q8_0"), Some("q8_0"), Some(512))
         );
         assert_eq!(
             choice.fit.fit(16_384).n_ctx,
-            12_288,
+            16_384,
             "the window the load keeps"
         );
         assert_eq!(choice.reason(), "tight");
     }
 
-    /// 2026-11-02: 1,037 MB free (the encoder's 945 already taken off), a 269 MiB KV budget.
-    /// f16's ~2,900 tokens are under the floor; q8_0's ~5,400 reach the 5,120 rung.
+    /// A 70 MiB budget: f16 is under the floor, q8_0 reaches the 5,120 rung.
     #[test]
     fn a_load_at_the_floor_takes_q8_0_for_the_rung_above_it() {
-        let choice = e4b_choice(1_037);
-        assert_eq!(choice.fit.kv_budget() / MIB, 269);
+        let choice = e4b_choice(70 + 768);
         assert_eq!(choice.preferred.n_ctx, CONTEXT_FLOOR);
         assert_eq!(choice.preferred.reason, FitReason::Floor);
         assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(5_120));
@@ -905,7 +1215,7 @@ mod tests {
     /// Both types at the floor: same window, so the faster type stays.
     #[test]
     fn q8_0_is_not_taken_for_a_window_no_wider() {
-        let choice = e4b_choice(900);
+        let choice = e4b_choice(20 + 768);
         assert_eq!(choice.preferred.n_ctx, CONTEXT_FLOOR);
         assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(CONTEXT_FLOOR));
         assert_eq!(choice.fit.kv_type, None);
@@ -914,17 +1224,17 @@ mod tests {
 
     #[test]
     fn a_window_that_fits_as_requested_or_no_candidate_keeps_the_settings_types() {
-        let f16 = E4B.bytes_per_token(None, None);
-        let q8 = E4B.bytes_per_token(Some("q8_0"), Some("q8_0"));
+        let f16 = e4b().cost(None, None, Some(512));
+        let q8 = e4b().cost(Some("q8_0"), Some("q8_0"), Some(512));
         // A pin under the threshold that fits is not narrowed, so there is nothing to widen.
-        let small = choose_kv_cache(4_096, 1_419 * MIB, f16, Some(q8));
+        let small = choose_kv_cache(4_096, 1_037 * MIB, f16, Some(q8));
         assert_eq!(small.preferred.reason, FitReason::Requested);
         assert_eq!(
             (small.fit.kv_type, small.reason()),
             (None, "requested_fits")
         );
         // Policy fixed, or no flash attention: q8_0 is never weighed.
-        let fixed = choose_kv_cache(16_384, 1_419 * MIB, f16, None);
+        let fixed = choose_kv_cache(16_384, (160 + 768) * MIB, f16, None);
         assert_eq!(fixed.preferred.n_ctx, 6_144);
         assert_eq!(
             (fixed.quantized, fixed.fit.kv_type, fixed.reason()),
@@ -941,7 +1251,7 @@ mod tests {
             context_size: Some(16_384),
             ..ModelSettings::default()
         };
-        let tight = e4b_choice(1_419).fit;
+        let tight = e4b_choice(160 + 768).fit;
         let fitted = with_fitted_kv_type(&settings, Some(tight));
         assert_eq!(fitted.type_k.as_deref(), Some("q8_0"));
         assert_eq!(fitted.type_v.as_deref(), Some("q8_0"));
