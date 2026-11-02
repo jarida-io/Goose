@@ -29,7 +29,12 @@ const MIB: u64 = 1024 * 1024;
 pub(super) const RELEASE_STEP_BYTES: u64 = 256 * MIB;
 
 /// Context windows tried, widest first, when the requested one does not fit.
-pub(super) const CONTEXT_LADDER: [usize; 5] = [16_384, 12_288, 8_192, 6_144, 4_096];
+///
+/// 5,120 is there for a load just above the floor: on 2026-11-02 Gemma 4 E4B, its encoder
+/// reserved, left a 269 MiB KV budget, which holds ~5,400 tokens in q8_0. Without the rung that
+/// window rounded down to the floor like f16's ~2,900, and the ~3,300-token preamble had ~800
+/// tokens of turn where 5,120 gives it ~1,800.
+pub(super) const CONTEXT_LADDER: [usize; 6] = [16_384, 12_288, 8_192, 6_144, 5_120, 4_096];
 
 /// The narrowest window the fit hands out, whatever free memory says. Below it a Gemma 4 E4B
 /// turn (a ~4,500-token preamble) cannot run at all, so a context this small that then fails to
@@ -785,6 +790,10 @@ mod tests {
             fit_context(16_384, per_token, 6_144 * per_token).n_ctx,
             6_144
         );
+        assert_eq!(
+            fit_context(16_384, per_token, 6_143 * per_token).n_ctx,
+            5_120
+        );
     }
 
     #[test]
@@ -880,11 +889,23 @@ mod tests {
         assert_eq!(choice.reason(), "tight");
     }
 
-    /// 2026-11-02: 1,037 MB free (the encoder's 945 already taken off). f16 is at the floor,
-    /// and q8_0's ~5,400 tokens reach no rung above it: same window, so the faster type stays.
+    /// 2026-11-02: 1,037 MB free (the encoder's 945 already taken off), a 269 MiB KV budget.
+    /// f16's ~2,900 tokens are under the floor; q8_0's ~5,400 reach the 5,120 rung.
+    #[test]
+    fn a_load_at_the_floor_takes_q8_0_for_the_rung_above_it() {
+        let choice = e4b_choice(1_037);
+        assert_eq!(choice.fit.kv_budget() / MIB, 269);
+        assert_eq!(choice.preferred.n_ctx, CONTEXT_FLOOR);
+        assert_eq!(choice.preferred.reason, FitReason::Floor);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(5_120));
+        assert_eq!(choice.fit.kv_type, Some("q8_0"));
+        assert_eq!(choice.reason(), "tight");
+    }
+
+    /// Both types at the floor: same window, so the faster type stays.
     #[test]
     fn q8_0_is_not_taken_for_a_window_no_wider() {
-        let choice = e4b_choice(1_037);
+        let choice = e4b_choice(900);
         assert_eq!(choice.preferred.n_ctx, CONTEXT_FLOOR);
         assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(CONTEXT_FLOOR));
         assert_eq!(choice.fit.kv_type, None);
