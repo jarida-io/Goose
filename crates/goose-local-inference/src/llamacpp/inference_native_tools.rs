@@ -1,6 +1,6 @@
 use goose_provider_types::conversation::message::{Message, MessageContent};
 use goose_provider_types::errors::ProviderError;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, Tool};
 use serde_json::Value;
 use std::borrow::Cow;
 use uuid::Uuid;
@@ -10,12 +10,14 @@ use super::super::thinking_output::ThinkingOutputFilter;
 use super::inference_engine::{
     generation_loop, prepare_generation, GenerationContext, StopSuffixTrimmer, TokenAction,
 };
+use super::written_tool_calls::WrittenToolCalls;
 
 pub(super) fn generate_with_native_tools(
     ctx: &mut GenerationContext<'_>,
     oai_messages_json: &str,
     full_tools_json: Option<&str>,
     compact_tools: Option<&str>,
+    declared_tools: &[Tool],
 ) -> Result<(), ProviderError> {
     let generation_started = std::time::Instant::now();
     let mut first_piece_at: Option<std::time::Instant> = None;
@@ -34,6 +36,8 @@ pub(super) fn generate_with_native_tools(
     let mut generated_text = String::new();
     let mut stop_trimmer = StopSuffixTrimmer::new(&template_result.additional_stops);
     let mut stop_string_emitted = false;
+    let mut written_calls =
+        WrittenToolCalls::new(declared_tools.iter().map(|tool| tool.name.as_ref()));
 
     // Initialize streaming parser — handles thinking tokens, tool calls, etc.
     let t_parser = std::time::Instant::now();
@@ -111,6 +115,7 @@ pub(super) fn generate_with_native_tools(
                                     let filtered = output_filter.push_text(content);
                                     let (content, seen) = stop_trimmer.push(&filtered.content);
                                     stop_seen |= seen;
+                                    let content = written_calls.push(&content);
                                     prose_in_piece |= !content.trim().is_empty();
                                     if !content.is_empty() {
                                         let mut msg = Message::assistant().with_text(content);
@@ -137,6 +142,7 @@ pub(super) fn generate_with_native_tools(
                     let filtered = output_filter.push_text(piece);
                     let (content, seen) = stop_trimmer.push(&filtered.content);
                     stop_seen |= seen;
+                    let content = written_calls.push(&content);
                     if !content.is_empty() {
                         let mut msg = Message::assistant().with_text(content);
                         msg.id = Some(message_id.to_string());
@@ -147,7 +153,9 @@ pub(super) fn generate_with_native_tools(
                 }
             }
 
+            // Past a written call the model would only guess at the tool's result.
             let should_stop = stop_seen
+                || written_calls.found()
                 || template_result
                     .additional_stops
                     .iter()
@@ -209,6 +217,7 @@ pub(super) fn generate_with_native_tools(
                         let filtered = output_filter.push_text(content);
                         let (content, stop_seen) = stop_trimmer.push(&filtered.content);
                         stop_string_emitted |= stop_seen;
+                        let content = written_calls.push(&content);
                         if !content.is_empty() {
                             let mut msg = Message::assistant().with_text(content);
                             msg.id = Some(message_id.to_string());
@@ -241,6 +250,8 @@ pub(super) fn generate_with_native_tools(
         }
         content
     };
+    let mut content = written_calls.push(&content);
+    content.push_str(&written_calls.finish());
     if !content.is_empty() {
         let mut msg = Message::assistant().with_text(content);
         msg.id = Some(message_id.to_string());
@@ -253,7 +264,20 @@ pub(super) fn generate_with_native_tools(
     //   1. Extract thinking and attach it to per-tool-request messages
     //   2. Enable merge_split_tool_call_messages to reconstruct the standard
     //      OpenAI format (one assistant msg with N tool_calls, then N tool results)
-    let tool_call_contents = extract_oai_tool_call_contents(&accumulated_tool_calls);
+    let mut tool_call_contents = extract_oai_tool_call_contents(&accumulated_tool_calls);
+    if let Some(call) = written_calls.take() {
+        tracing::info!(
+            target: "giap::kv",
+            tool = %call.name,
+            "a tool call written as text became a tool request"
+        );
+        let request =
+            CallToolRequestParams::new(Cow::Owned(call.name)).with_arguments(call.arguments);
+        tool_call_contents.push(MessageContent::tool_request(
+            Uuid::new_v4().to_string(),
+            Ok(request),
+        ));
+    }
     if !tool_call_contents.is_empty() {
         let mut contents: Vec<MessageContent> = Vec::new();
         if !output_filter.accumulated_thinking().is_empty() {
