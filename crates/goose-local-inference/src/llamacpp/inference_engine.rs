@@ -33,7 +33,9 @@ const REUSE_MIN_TOKENS: usize = 256;
 const CHAT_CACHE_PROTECTED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Sliding-window checkpoints kept per retained context, newest last. Each is
-/// the window layers' cells, 16 MiB for Gemma 4 E4B at q8_0 and 768 cells.
+/// the window layers' cells, 16 MiB for Gemma 4 E4B at q8_0 and 768 cells. The
+/// oldest is kept when one is dropped: it is usually the preamble's boundary,
+/// where the next conversation resumes.
 const WINDOW_CHECKPOINTS: usize = 4;
 
 /// How far behind the end of a prefill window checkpoints reach, one at each
@@ -561,7 +563,7 @@ impl SessionKv {
                     state,
                 });
                 if self.checkpoints.len() > WINDOW_CHECKPOINTS {
-                    self.checkpoints.remove(0);
+                    self.checkpoints.remove(1);
                 }
             }
             Err(error) => tracing::debug!(%error, pos, "window checkpoint not taken"),
@@ -1658,6 +1660,7 @@ fn seed_from_snapshot(
     };
 
     kv.tokens.extend_from_slice(&prompt[..restored]);
+    kv.checkpoint_window(&prompt[..restored]);
     match decode_checkpointed(&mut kv, prompt, restored) {
         Ok(()) => {
             kv.tokens.extend_from_slice(&prompt[restored..]);
@@ -1833,6 +1836,7 @@ fn write_snapshot_if_due(
     );
 
     // Put the tail back: the turn still has to generate from the whole prompt.
+    kv.checkpoint_window(&prompt[..keep]);
     match decode_checkpointed(kv, prompt, keep) {
         Ok(()) => kv.tokens.extend_from_slice(&prompt[keep..]),
         Err(e) => {
@@ -2051,56 +2055,58 @@ fn prefill_prompt(
         PrefillPlan::CreateContext | PrefillPlan::FullPrefillInPlace => {}
     }
 
-    // A compile rebuilding a preamble decodes exactly that far, saves it, then decodes the rest:
-    // once the whole prompt is in, a windowed cache keeps no checkpoint that far back.
-    if let (Some(keep), Some(slot)) = (rebuild_preamble, snapshot.as_mut()) {
-        if keep < prompt.len() {
-            full_prefill(
-                session,
-                draft,
-                model,
-                backend,
-                settings,
-                &prompt[..keep],
-                n_ctx,
-            )?;
-            let kv = session
-                .as_mut()
-                .expect("full_prefill leaves a session on success");
-            slot.write(kv.ctx.ctx(), &kv.tokens, class, compile_prefill);
-            if let Err(e) = decode_checkpointed(kv, prompt, keep) {
-                *session = None;
-                return Err(e);
-            }
-            kv.tokens.extend_from_slice(&prompt[keep..]);
-            return Ok(PrefilledPrompt {
-                reused_prefix_tokens: 0,
-                transient: None,
-                effective_ctx,
-            });
-        }
-    }
-
+    // A preamble due a snapshot, or one a compile rebuilds, is decoded exactly that far, saved,
+    // then the rest: once the whole prompt is in, a windowed cache keeps no checkpoint that far
+    // back, and a shape whose preamble sits far from its prompt's end is never written.
+    let preamble = rebuild_preamble
+        .or_else(|| {
+            snapshot
+                .as_ref()
+                .and_then(|slot| slot.writable_prefix(prompt))
+        })
+        .filter(|&keep| keep < prompt.len());
+    let first = &prompt[..preamble.unwrap_or(prompt.len())];
     let retained = session.is_some();
-    match full_prefill(session, draft, model, backend, settings, prompt, n_ctx) {
+    match full_prefill(session, draft, model, backend, settings, first, n_ctx) {
         Ok(()) => {}
         Err(e) if retained => {
             // `full_prefill` dropped the poisoned context, so this attempt runs
             // against a freshly created one.
             tracing::warn!(error = %e, "prompt prefill failed; retrying with a new context");
-            full_prefill(session, draft, model, backend, settings, prompt, n_ctx)?;
+            full_prefill(session, draft, model, backend, settings, first, n_ctx)?;
         }
         Err(e) => return Err(e),
     }
-    // Cold: this path decoded the whole prompt.
-    write_snapshot_if_due(
-        session,
-        snapshot,
-        prompt,
-        true,
-        class,
-        compile_prefill.zip(rebuild_preamble),
-    );
+    match preamble {
+        Some(keep) => {
+            let kv = session
+                .as_mut()
+                .expect("full_prefill leaves a session on success");
+            if let Some(slot) = snapshot.as_mut() {
+                slot.write(
+                    kv.ctx.ctx(),
+                    &kv.tokens,
+                    class,
+                    compile_prefill.filter(|_| rebuild_preamble.is_some()),
+                );
+            }
+            kv.checkpoint_window(&prompt[..keep]);
+            if let Err(e) = decode_checkpointed(kv, prompt, keep) {
+                *session = None;
+                return Err(e);
+            }
+            kv.tokens.extend_from_slice(&prompt[keep..]);
+        }
+        // Cold: this path decoded the whole prompt.
+        None => write_snapshot_if_due(
+            session,
+            snapshot,
+            prompt,
+            true,
+            class,
+            compile_prefill.zip(rebuild_preamble),
+        ),
+    }
     Ok(PrefilledPrompt {
         reused_prefix_tokens: 0,
         transient: None,

@@ -6,7 +6,9 @@
 //! in the grammar the parser uses (`call:NAME{key:value,...}`, strings between `<|"|>`) and lets
 //! a stray string delimiter, an unclosed string, a trailing comma or a missing closing bracket
 //! pass. Extended to an unquoted word where a string belongs: gemma-4-E2B wrote
-//! `segment:knowledge,tier:permanent`, and the parser failed the whole turn on it.
+//! `segment:knowledge,tier:permanent`, and the parser failed the whole turn on it. Also reads
+//! JSON-style `"..."` strings, which Gemma 4 writes in a call it puts in text instead of its
+//! native wrapper; the llama.cpp backend reads those calls' arguments here too.
 
 use std::sync::LazyLock;
 
@@ -37,6 +39,64 @@ pub(super) fn parse_call(block: &str) -> Option<(String, Map<String, Value>)> {
     }
     .call()
     .ok()
+}
+
+/// Reads a `{key:value,...}` argument block with the same forgiveness as [`parse_call`].
+pub(crate) fn parse_arguments(block: &str) -> Option<Map<String, Value>> {
+    let mut reader = Reader {
+        text: block.trim(),
+        pos: 0,
+    };
+    if !reader.rest().starts_with('{') {
+        return None;
+    }
+    reader.object().ok()
+}
+
+/// Where the argument block at the start of `text` closes, just past its `}`, or `None` while
+/// it is still open. Strict where [`parse_arguments`] forgives: a string runs to its delimiter.
+pub(crate) fn arguments_end(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut pos = 0;
+    while let Some(rest) = text.get(pos..).filter(|rest| !rest.is_empty()) {
+        if let Some(escape) = ESCAPES.iter().find(|escape| rest.starts_with(*escape)) {
+            let body = rest.get(escape.len()..).unwrap_or_default();
+            let close = ESCAPES
+                .iter()
+                .filter_map(|close| body.find(close).map(|at| at + close.len()))
+                .min()?;
+            pos += escape.len() + close;
+            continue;
+        }
+        if let Some(body) = rest.strip_prefix('"') {
+            pos += 1 + quoted_len(body)?;
+            continue;
+        }
+        if rest.starts_with('{') {
+            depth += 1;
+        } else if rest.starts_with('}') {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(pos + 1);
+            }
+        }
+        pos += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+/// The length of a `"`-quoted string's body plus its closing quote, if it closes.
+fn quoted_len(body: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (at, c) in body.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return Some(at + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 struct Unreadable;
@@ -86,7 +146,11 @@ impl<'a> Reader<'a> {
                 self.pos += escape.len();
                 continue;
             }
-            let key = self.identifier()?;
+            let key = if self.rest().starts_with('"') {
+                self.quoted()
+            } else {
+                self.identifier()?
+            };
             self.expect(':')?;
             let value = self.value()?;
             result.insert(key, value);
@@ -122,6 +186,9 @@ impl<'a> Reader<'a> {
             self.pos += escape.len();
             return Ok(Value::String(self.string()));
         }
+        if self.rest().starts_with('"') {
+            return Ok(Value::String(self.quoted()));
+        }
         if self.rest().starts_with('{') {
             return Ok(Value::Object(self.object()?));
         }
@@ -149,6 +216,19 @@ impl<'a> Reader<'a> {
             .unwrap_or(rest.len());
         self.pos += stop;
         rest.get(..stop).unwrap_or_default().to_string()
+    }
+
+    /// A `"`-quoted string, JSON escapes and all; unclosed, it ends like an unclosed [`Self::string`].
+    fn quoted(&mut self) -> String {
+        let rest = self.rest();
+        let body = rest.strip_prefix('"').unwrap_or(rest);
+        let Some(len) = quoted_len(body) else {
+            self.pos += 1;
+            return self.string();
+        };
+        self.pos += 1 + len;
+        serde_json::from_str(rest.get(..=len).unwrap_or_default())
+            .unwrap_or_else(|_| body.get(..len - 1).unwrap_or_default().to_string())
     }
 
     /// An unquoted value, up to the next comma or closing bracket: `true`, `false`, `null`, a
@@ -346,6 +426,34 @@ mod tests {
                 json!({"duration": "10 minutes"})
             ))
         );
+    }
+
+    #[test]
+    fn reads_json_style_strings_and_keys() {
+        assert_eq!(
+            parse_arguments(r#"{topic:"crocodile vs \"alligator\"", "days":2}"#).map(Value::Object),
+            Some(json!({"topic": "crocodile vs \"alligator\"", "days": 2}))
+        );
+        assert_eq!(
+            parse_arguments(&format!(r#"{{q:{Q}5" screen{Q}}}"#)).map(Value::Object),
+            Some(json!({"q": "5\" screen"}))
+        );
+        assert_eq!(
+            parse_arguments(r#"{topic:"crocodile vs"#).map(Value::Object),
+            Some(json!({"topic": "crocodile vs"}))
+        );
+    }
+
+    #[test]
+    fn finds_where_arguments_end_only_once_they_close() {
+        let block = format!(r#"{{a:{{b:{Q}}}{Q}}},c:"}}"}}"#);
+        assert_eq!(
+            arguments_end(&format!("{block} trailing")),
+            Some(block.len())
+        );
+        for open in ["{a:1", "{a:{b:1}", "{a:\"}", "{a:<|\"|>}", "{a:<|\""] {
+            assert_eq!(arguments_end(open), None, "{open}");
+        }
     }
 
     #[test]

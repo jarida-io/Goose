@@ -4,6 +4,7 @@ mod inference_native_tools;
 mod memory;
 pub(super) mod mtp;
 mod prompt_snapshot;
+mod written_tool_calls;
 
 use std::any::Any;
 use std::ffi::CStr;
@@ -985,6 +986,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
                 &oai_messages_json,
                 full_tools_json.as_deref(),
                 compact_tools.as_deref(),
+                request.tools,
             )
         };
         if !images.is_empty() {
