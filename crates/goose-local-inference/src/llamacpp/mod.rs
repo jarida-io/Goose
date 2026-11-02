@@ -8,7 +8,7 @@ mod prompt_snapshot;
 use std::any::Any;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::Result;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -368,6 +368,10 @@ pub(super) struct LlamaCppBackend {
     /// picture encoders. What a retry after a failed allocation releases from the page cache.
     /// Releasing one no longer loaded only drops cache nothing on the GPU path reads.
     model_files: Mutex<Vec<PathBuf>>,
+    /// The KV layout of each loaded target, read from its file once at load on unified memory
+    /// ([`memory::kv_geometry`]), for the memory fit and a failed context's estimate, neither of
+    /// which has the file. Held weakly: an entry dies with its model.
+    kv_geometries: Mutex<Vec<(Weak<LlamaModel>, KvGeometry)>>,
 }
 
 /// What this machine's memory needs from a load, decided once from the backend's devices.
@@ -495,7 +499,25 @@ impl LlamaCppBackend {
             memory,
             page_cache: Arc::new(SystemPageCache),
             model_files: Mutex::new(Vec::new()),
+            kv_geometries: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Record `model`'s KV layout, dropping entries whose model is gone.
+    fn remember_kv_geometry(&self, model: &Arc<LlamaModel>, geometry: KvGeometry) {
+        let mut geometries = self.kv_geometries.lock().unwrap_or_else(|e| e.into_inner());
+        geometries.retain(|(held, _)| held.strong_count() > 0);
+        geometries.push((Arc::downgrade(model), geometry));
+    }
+
+    /// The KV layout recorded for `model` at its load; `None` off unified memory, or when its
+    /// layout could not be read at all.
+    fn kv_geometry(&self, model: &Arc<LlamaModel>) -> Option<KvGeometry> {
+        let geometries = self.kv_geometries.lock().unwrap_or_else(|e| e.into_inner());
+        geometries
+            .iter()
+            .find(|(held, _)| held.strong_count() > 0 && held.as_ptr() == Arc::as_ptr(model))
+            .map(|(_, geometry)| *geometry)
     }
 
     /// Load parameters for the GGUF at `path`, mapped or read (`mapped`). With page-cache release
@@ -634,14 +656,14 @@ impl LlamaCppBackend {
     fn memory_fit(
         &self,
         model_id: &str,
-        model: &LlamaModel,
+        model: &Arc<LlamaModel>,
         settings: &ModelSettings,
         free_after_load: Option<MemInfo>,
     ) -> Option<MemoryFit> {
         if !self.memory.unified_memory {
             return None;
         }
-        let geometry = KvGeometry::of(model)?;
+        let geometry = self.kv_geometry(model)?;
         let flash_attention = settings.flash_attention == Some(true);
         let type_v = settings.type_v.as_deref().filter(|_| flash_attention);
         // The picture encoder loads per picture turn, after this.
@@ -779,7 +801,13 @@ impl LocalInferenceBackend for LlamaCppBackend {
             model_path.display()
         );
 
-        let model = self.load_weights(model_path, settings)?;
+        let model = Arc::new(self.load_weights(model_path, settings)?);
+        // Read before the release below, which drops the header's pages along with the rest.
+        if self.memory.unified_memory {
+            if let Some(geometry) = memory::kv_geometry(model_id, &model, model_path) {
+                self.remember_kv_geometry(&model, geometry);
+            }
+        }
 
         let draft_model = resolved
             .draft_model_path
@@ -803,7 +831,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
         );
 
         Ok(Box::new(LoadedModel {
-            model: Arc::new(model),
+            model,
             draft: draft_model,
             draft_tried: resolved.draft_model_path.clone(),
             templates,

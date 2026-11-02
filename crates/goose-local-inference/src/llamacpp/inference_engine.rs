@@ -18,7 +18,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use super::super::StreamSender;
-use super::memory::{KvGeometry, MemInfo, MemoryFit, COMPUTE_RESERVE_BYTES};
+use super::memory::{MemInfo, MemoryFit, COMPUTE_RESERVE_BYTES};
 use super::LlamaCppBackend;
 use crate::load_error::LoadStage;
 
@@ -416,7 +416,7 @@ impl SessionKv {
                 .type_v
                 .as_deref()
                 .filter(|_| settings.flash_attention == Some(true));
-            let kv_bytes = KvGeometry::of(model).map_or(0, |g| {
+            let kv_bytes = backend.kv_geometry(model).map_or(0, |g| {
                 g.cost(settings.type_k.as_deref(), type_v, settings.n_ubatch)
                     .bytes(u64::from(n_ctx))
             });

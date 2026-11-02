@@ -335,9 +335,9 @@ pub(super) struct KvMeta {
     pub key_length: u64,
     pub value_length: u64,
     /// `<arch>.attention.key_length_swa` / `value_length_swa`: the widths on a sliding-window
-    /// layer, the full widths where the header does not say.
-    pub key_length_swa: u64,
-    pub value_length_swa: u64,
+    /// layer; the full widths are used where the header does not say.
+    pub key_length_swa: Option<u64>,
+    pub value_length_swa: Option<u64>,
     /// `<arch>.attention.sliding_window_pattern`, one flag per layer, `true` for a layer that
     /// slides. `None` where the header has no per-layer pattern.
     pub sliding: Option<Vec<bool>>,
@@ -346,6 +346,101 @@ pub(super) struct KvMeta {
 }
 
 impl KvMeta {
+    /// The layout the GGUF at `path` declares, read from its header with ggml's own reader and
+    /// no tensor data.
+    ///
+    /// From the file, not `LlamaModel::meta_val_str`: llama.cpp keeps only scalar metadata as
+    /// strings (`llama_model_base::load_hparams` skips every array), so the per-layer
+    /// `sliding_window_pattern`, and a per-layer `head_count_kv`, never reach the model's
+    /// metadata. Read that way on the Orin, Gemma 4 E4B had no pattern and was charged in full.
+    pub(super) fn read(path: &Path) -> Result<Self, String> {
+        let header = GgufHeader::open(path)?;
+        let arch = header
+            .string("general.architecture")
+            .ok_or("no general.architecture")?;
+        let key = |name: &str| format!("{arch}.{name}");
+        let required = |name: &str| {
+            header
+                .uint(&key(name))
+                .filter(|&n| n > 0)
+                .ok_or_else(|| format!("no {}", key(name)))
+        };
+        let layers = required("block_count")?;
+        let n_head = required("attention.head_count")?;
+        let head_dim = required("embedding_length")? / n_head;
+        let key_length = header
+            .uint(&key("attention.key_length"))
+            .unwrap_or(head_dim);
+        let value_length = header
+            .uint(&key("attention.value_length"))
+            .unwrap_or(head_dim);
+        let shared = header.uint(&key("attention.shared_kv_layers")).unwrap_or(0);
+        Ok(Self {
+            owning_layers: usize::try_from(layers.saturating_sub(shared))
+                .map_err(|e| e.to_string())?,
+            // llama.cpp's default when the header has none: one KV head per query head.
+            kv_heads: header
+                .uints(&key("attention.head_count_kv"))
+                .unwrap_or_else(|| vec![n_head]),
+            key_length,
+            value_length,
+            key_length_swa: header.uint(&key("attention.key_length_swa")),
+            value_length_swa: header.uint(&key("attention.value_length_swa")),
+            sliding: header.flags(&key("attention.sliding_window_pattern")),
+            n_swa: header.uint(&key("attention.sliding_window")).unwrap_or(0),
+        })
+    }
+
+    /// What `model` itself says, for a file whose header cannot be read: its scalar metadata
+    /// only, so never a sliding pattern. KV heads are layer 0's, as llama.cpp reports them, and
+    /// widths default to the head dimension. `None` when the model reports no layers or heads.
+    fn of_model(model: &llama_cpp_2::model::LlamaModel) -> Option<Self> {
+        let arch = model.meta_val_str("general.architecture").ok()?;
+        let number = |key: &str| {
+            model
+                .meta_val_str(&format!("{arch}.{key}"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        };
+        let layers = u64::from(model.n_layer());
+        let n_head = u64::from(model.n_head());
+        let n_embd = u64::try_from(model.n_embd()).ok()?;
+        if layers == 0 || n_head == 0 {
+            return None;
+        }
+        let head_dim = n_embd / n_head;
+        let shared = number("attention.shared_kv_layers").unwrap_or(0);
+        Some(Self {
+            owning_layers: usize::try_from(layers.saturating_sub(shared)).ok()?,
+            kv_heads: vec![u64::from(model.n_head_kv())],
+            key_length: number("attention.key_length").unwrap_or(head_dim),
+            value_length: number("attention.value_length").unwrap_or(head_dim),
+            key_length_swa: number("attention.key_length_swa"),
+            value_length_swa: number("attention.value_length_swa"),
+            sliding: None,
+            n_swa: number("attention.sliding_window").unwrap_or(0),
+        })
+    }
+
+    /// The header key whose absence leaves a model that slides charged in full: one that
+    /// declares a window, sliding widths or a pattern but not all that [`Self::geometry`]
+    /// needs. `None` when nothing slides or nothing is missing.
+    pub(super) fn missing_sliding_key(&self) -> Option<&'static str> {
+        let slides = self.n_swa > 0
+            || self.key_length_swa.is_some()
+            || self.value_length_swa.is_some()
+            || self.sliding.is_some();
+        match &self.sliding {
+            _ if !slides => None,
+            None => Some("attention.sliding_window_pattern"),
+            Some(_) if self.n_swa == 0 => Some("attention.sliding_window"),
+            Some(pattern) if pattern.len() < self.owning_layers => {
+                Some("attention.sliding_window_pattern (shorter than the KV layers)")
+            }
+            Some(_) => None,
+        }
+    }
+
     /// The geometry these figures give; `None` when no layer allocates any KV.
     ///
     /// A layer slides only when the header says so per layer and declares a window: without
@@ -357,6 +452,8 @@ impl KvMeta {
             .as_deref()
             .filter(|p| self.n_swa > 0 && p.len() >= self.owning_layers);
         let widest_heads = self.kv_heads.iter().copied().max().unwrap_or(0);
+        let key_length_swa = self.key_length_swa.unwrap_or(self.key_length);
+        let value_length_swa = self.value_length_swa.unwrap_or(self.value_length);
         let mut geometry = KvGeometry {
             full_k: 0,
             full_v: 0,
@@ -373,8 +470,8 @@ impl KvMeta {
                 _ => widest_heads,
             };
             if pattern.is_some_and(|p| p[layer]) {
-                geometry.sliding_k += heads * self.key_length_swa;
-                geometry.sliding_v += heads * self.value_length_swa;
+                geometry.sliding_k += heads * key_length_swa;
+                geometry.sliding_v += heads * value_length_swa;
                 geometry.sliding_layers += 1;
             } else {
                 geometry.full_k += heads * self.key_length;
@@ -387,6 +484,171 @@ impl KvMeta {
         }
         (geometry.full_k + geometry.full_v + geometry.sliding_k + geometry.sliding_v > 0)
             .then_some(geometry)
+    }
+}
+
+/// The KV layout of `model`, loaded from `path`, as the fit charges it: read from the file's
+/// header ([`KvMeta::read`]), else from the model's scalar metadata. A model that slides but
+/// whose layout says not which layers do is charged every layer the whole window, logged as
+/// `kind="kv_estimate_fallback"` with the key that was missing (or why the header was
+/// unreadable), since that bound can cost it most of its window.
+pub(super) fn kv_geometry(
+    model_id: &str,
+    model: &llama_cpp_2::model::LlamaModel,
+    path: &Path,
+) -> Option<KvGeometry> {
+    let meta = match KvMeta::read(path) {
+        Ok(meta) => meta,
+        Err(error) => {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "kv_estimate_fallback",
+                model = model_id,
+                file = %path.display(),
+                missing_key = "gguf header",
+                error = %error,
+                "could not read the model's KV layout from its file; using what the loaded model reports"
+            );
+            KvMeta::of_model(model)?
+        }
+    };
+    if let Some(missing_key) = meta.missing_sliding_key() {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "kv_estimate_fallback",
+            model = model_id,
+            file = %path.display(),
+            missing_key,
+            n_swa = meta.n_swa,
+            owning_layers = meta.owning_layers,
+            "the model slides but its header does not say which layers; charging every KV layer the whole window"
+        );
+    }
+    meta.geometry()
+}
+
+/// A GGUF file's metadata, read with ggml's own reader (`gguf_init_from_file` with no tensor
+/// data); freed on drop. Every getter checks the stored type first, since ggml aborts the
+/// process on a getter of the wrong type.
+struct GgufHeader(std::ptr::NonNull<llama_cpp_sys_2::gguf_context>);
+
+impl GgufHeader {
+    fn open(path: &Path) -> Result<Self, String> {
+        let name = path
+            .to_str()
+            .and_then(|p| std::ffi::CString::new(p).ok())
+            .ok_or_else(|| format!("{} is not a C path", path.display()))?;
+        let params = llama_cpp_sys_2::gguf_init_params {
+            no_alloc: true,
+            ctx: std::ptr::null_mut(),
+        };
+        // SAFETY: `name` is a NUL-terminated string that outlives the call; with `no_alloc` and
+        // no ggml context requested, ggml reads the header and allocates no tensor data.
+        let ctx = unsafe { llama_cpp_sys_2::gguf_init_from_file(name.as_ptr(), params) };
+        std::ptr::NonNull::new(ctx)
+            .map(Self)
+            .ok_or_else(|| format!("ggml could not read the GGUF header of {}", path.display()))
+    }
+
+    fn ctx(&self) -> *const llama_cpp_sys_2::gguf_context {
+        self.0.as_ptr()
+    }
+
+    /// The key's id and stored type, `None` when the header has no such key.
+    fn find(&self, key: &str) -> Option<(i64, llama_cpp_sys_2::gguf_type)> {
+        let key = std::ffi::CString::new(key).ok()?;
+        // SAFETY: a live context and a NUL-terminated key; an id is checked before use.
+        let id = unsafe { llama_cpp_sys_2::gguf_find_key(self.ctx(), key.as_ptr()) };
+        // SAFETY: `id` is a valid key id of this context.
+        (id >= 0).then(|| {
+            (id, unsafe {
+                llama_cpp_sys_2::gguf_get_kv_type(self.ctx(), id)
+            })
+        })
+    }
+
+    /// An unsigned or non-negative integer scalar.
+    fn uint(&self, key: &str) -> Option<u64> {
+        use llama_cpp_sys_2 as sys;
+        let (id, kind) = self.find(key)?;
+        let ctx = self.ctx();
+        // SAFETY: each getter is called only for the type the header stores under `id`.
+        unsafe {
+            match kind {
+                sys::GGUF_TYPE_UINT8 => Some(u64::from(sys::gguf_get_val_u8(ctx, id))),
+                sys::GGUF_TYPE_UINT16 => Some(u64::from(sys::gguf_get_val_u16(ctx, id))),
+                sys::GGUF_TYPE_UINT32 => Some(u64::from(sys::gguf_get_val_u32(ctx, id))),
+                sys::GGUF_TYPE_UINT64 => Some(sys::gguf_get_val_u64(ctx, id)),
+                sys::GGUF_TYPE_INT32 => u64::try_from(sys::gguf_get_val_i32(ctx, id)).ok(),
+                sys::GGUF_TYPE_INT64 => u64::try_from(sys::gguf_get_val_i64(ctx, id)).ok(),
+                _ => None,
+            }
+        }
+    }
+
+    fn string(&self, key: &str) -> Option<String> {
+        let (id, kind) = self.find(key)?;
+        (kind == llama_cpp_sys_2::GGUF_TYPE_STRING).then(|| {
+            // SAFETY: a string-typed key; ggml returns a NUL-terminated string the context owns.
+            unsafe { std::ffi::CStr::from_ptr(llama_cpp_sys_2::gguf_get_val_str(self.ctx(), id)) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    /// The elements of an array-typed key whose elements are `element`, each `width` bytes,
+    /// mapped through `read`.
+    fn array<T>(
+        &self,
+        id: i64,
+        element: llama_cpp_sys_2::gguf_type,
+        width: usize,
+        read: impl Fn(&[u8]) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        use llama_cpp_sys_2 as sys;
+        let ctx = self.ctx();
+        // SAFETY: `id` is an array-typed key of this context (checked by the callers).
+        if unsafe { sys::gguf_get_arr_type(ctx, id) } != element {
+            return None;
+        }
+        // SAFETY: as above; a non-string array's data is `n` packed elements of its type, owned
+        // by the context for its lifetime, which outlives this borrow.
+        let bytes = unsafe {
+            let n = sys::gguf_get_arr_n(ctx, id);
+            let data = sys::gguf_get_arr_data(ctx, id).cast::<u8>();
+            std::slice::from_raw_parts(data, n.checked_mul(width)?)
+        };
+        bytes.chunks_exact(width).map(read).collect()
+    }
+
+    /// An integer scalar as one value, or an array of unsigned 32-bit integers as one per layer.
+    fn uints(&self, key: &str) -> Option<Vec<u64>> {
+        let (id, kind) = self.find(key)?;
+        if kind != llama_cpp_sys_2::GGUF_TYPE_ARRAY {
+            return self.uint(key).map(|one| vec![one]);
+        }
+        self.array(id, llama_cpp_sys_2::GGUF_TYPE_UINT32, 4, |b| {
+            Some(u64::from(u32::from_le_bytes(b.try_into().ok()?)))
+        })
+    }
+
+    /// A bool scalar as one flag, or an array of bools as one per layer.
+    fn flags(&self, key: &str) -> Option<Vec<bool>> {
+        use llama_cpp_sys_2 as sys;
+        let (id, kind) = self.find(key)?;
+        match kind {
+            // SAFETY: a bool-typed scalar key.
+            sys::GGUF_TYPE_BOOL => Some(vec![unsafe { sys::gguf_get_val_bool(self.ctx(), id) }]),
+            sys::GGUF_TYPE_ARRAY => self.array(id, sys::GGUF_TYPE_BOOL, 1, |b| Some(b[0] != 0)),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for GgufHeader {
+    fn drop(&mut self) {
+        // SAFETY: the context `open` created, freed once.
+        unsafe { llama_cpp_sys_2::gguf_free(self.0.as_ptr()) }
     }
 }
 
@@ -406,39 +668,6 @@ pub(super) struct KvGeometry {
 }
 
 impl KvGeometry {
-    /// The geometry `model` declares; `None` when the header gives no KV at all. KV heads
-    /// default to layer 0's, as llama.cpp reports them, and widths to the head dimension.
-    pub(super) fn of(model: &llama_cpp_2::model::LlamaModel) -> Option<Self> {
-        let arch = model.meta_val_str("general.architecture").ok()?;
-        let meta = |key: &str| model.meta_val_str(&format!("{arch}.{key}")).ok();
-        let number = |key: &str| meta(key).and_then(|value| value.trim().parse::<u64>().ok());
-        let layers = u64::from(model.n_layer());
-        let n_head = u64::from(model.n_head());
-        let n_embd = u64::try_from(model.n_embd()).ok()?;
-        if layers == 0 || n_head == 0 {
-            return None;
-        }
-        let head_dim = n_embd / n_head;
-        let key_length = number("attention.key_length").unwrap_or(head_dim);
-        let value_length = number("attention.value_length").unwrap_or(head_dim);
-        let owning_layers =
-            layers.saturating_sub(number("attention.shared_kv_layers").unwrap_or(0));
-        KvMeta {
-            owning_layers: usize::try_from(owning_layers).ok()?,
-            kv_heads: meta("attention.head_count_kv")
-                .and_then(|value| parse_meta_list(&value, |v| v.parse::<u64>().ok()))
-                .unwrap_or_else(|| vec![u64::from(model.n_head_kv())]),
-            key_length,
-            value_length,
-            key_length_swa: number("attention.key_length_swa").unwrap_or(key_length),
-            value_length_swa: number("attention.value_length_swa").unwrap_or(value_length),
-            sliding: meta("attention.sliding_window_pattern")
-                .and_then(|value| parse_meta_list(&value, parse_meta_bool)),
-            n_swa: number("attention.sliding_window").unwrap_or(0),
-        }
-        .geometry()
-    }
-
     /// What a cache of these types costs, for contexts built with `n_ubatch` (`None`, llama.cpp's
     /// default). Logged in `kind="context_sized"` as `kv_kib_per_token` and `sliding_kv_mb`.
     pub(super) fn cost(
@@ -486,24 +715,6 @@ impl KvCost {
         n_ctx
             .saturating_mul(self.bytes_per_token)
             .saturating_add(self.sliding_bytes)
-    }
-}
-
-/// A metadata value llama.cpp renders as `[a, b, ...]`, or a single value standing for every
-/// layer; `None` when any element does not parse.
-fn parse_meta_list<T>(value: &str, parse: impl Fn(&str) -> Option<T>) -> Option<Vec<T>> {
-    let value = value.trim();
-    match value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-        Some(items) => items.split(',').map(|item| parse(item.trim())).collect(),
-        None => parse(value).map(|one| vec![one]),
-    }
-}
-
-fn parse_meta_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
     }
 }
 
@@ -880,8 +1091,8 @@ mod tests {
             kv_heads: vec![2],
             key_length: 512,
             value_length: 512,
-            key_length_swa: 256,
-            value_length_swa: 256,
+            key_length_swa: Some(256),
+            value_length_swa: Some(256),
             sliding: None,
             n_swa: 512,
         }
@@ -898,8 +1109,8 @@ mod tests {
             kv_heads: vec![2],
             key_length: 512,
             value_length: 512,
-            key_length_swa: 256,
-            value_length_swa: 256,
+            key_length_swa: Some(256),
+            value_length_swa: Some(256),
             sliding: Some(
                 [true, true, true, true, true, false]
                     .iter()
@@ -1039,21 +1250,194 @@ mod tests {
         assert_eq!(short.full_k, 4 * 3 * 512);
     }
 
+    /// A header-only GGUF written with ggml's own writer: `u32` scalars, `bool` arrays and a
+    /// string, as `gguf_init_from_file` will read them back.
+    fn write_header(dir: &Path, entries: &[(&str, HeaderValue)]) -> PathBuf {
+        use llama_cpp_sys_2 as sys;
+        use std::ffi::CString;
+        let path = dir.join("header.gguf");
+        // SAFETY: a fresh context, filled with NUL-terminated keys and values that outlive each
+        // call, written once and freed once.
+        unsafe {
+            let ctx = sys::gguf_init_empty();
+            for (key, value) in entries {
+                let key = CString::new(*key).unwrap();
+                match value {
+                    HeaderValue::U32(v) => sys::gguf_set_val_u32(ctx, key.as_ptr(), *v),
+                    HeaderValue::F32(v) => sys::gguf_set_val_f32(ctx, key.as_ptr(), *v),
+                    HeaderValue::Str(v) => {
+                        let v = CString::new(*v).unwrap();
+                        sys::gguf_set_val_str(ctx, key.as_ptr(), v.as_ptr());
+                    }
+                    HeaderValue::Bools(v) => {
+                        let bytes: Vec<u8> = v.iter().map(|&b| u8::from(b)).collect();
+                        sys::gguf_set_arr_data(
+                            ctx,
+                            key.as_ptr(),
+                            sys::GGUF_TYPE_BOOL,
+                            bytes.as_ptr().cast(),
+                            bytes.len(),
+                        );
+                    }
+                    HeaderValue::U32s(v) => sys::gguf_set_arr_data(
+                        ctx,
+                        key.as_ptr(),
+                        sys::GGUF_TYPE_UINT32,
+                        v.as_ptr().cast(),
+                        v.len(),
+                    ),
+                }
+            }
+            let name = CString::new(path.to_str().unwrap()).unwrap();
+            assert!(sys::gguf_write_to_file(ctx, name.as_ptr(), true));
+            sys::gguf_free(ctx);
+        }
+        path
+    }
+
+    enum HeaderValue {
+        U32(u32),
+        F32(f32),
+        Str(&'static str),
+        Bools(Vec<bool>),
+        U32s(Vec<u32>),
+    }
+
+    /// The attention keys of the Orin's `gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf`, as read from the
+    /// file on 2026-11-02, with their stored types.
+    fn e4b_header() -> Vec<(&'static str, HeaderValue)> {
+        use HeaderValue::*;
+        vec![
+            ("general.architecture", Str("gemma4")),
+            ("gemma4.block_count", U32(42)),
+            ("gemma4.context_length", U32(131_072)),
+            ("gemma4.embedding_length", U32(2_560)),
+            ("gemma4.attention.head_count", U32(8)),
+            ("gemma4.attention.head_count_kv", U32(2)),
+            ("gemma4.attention.layer_norm_rms_epsilon", F32(1e-6)),
+            ("gemma4.attention.key_length", U32(512)),
+            ("gemma4.attention.value_length", U32(512)),
+            ("gemma4.attention.sliding_window", U32(512)),
+            ("gemma4.attention.shared_kv_layers", U32(18)),
+            (
+                "gemma4.attention.sliding_window_pattern",
+                Bools(
+                    [true, true, true, true, true, false]
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .take(42)
+                        .collect(),
+                ),
+            ),
+            ("gemma4.attention.key_length_swa", U32(256)),
+            ("gemma4.attention.value_length_swa", U32(256)),
+        ]
+    }
+
+    /// The array-valued pattern is what llama.cpp's model metadata drops; read from the file it
+    /// gives E4B's 4 full and 20 sliding KV layers.
     #[test]
-    fn metadata_lists_parse_as_llama_cpp_renders_them() {
+    fn the_real_header_is_read_from_the_file_with_its_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_header(dir.path(), &e4b_header());
+        let meta = KvMeta::read(&path).expect("reads");
+        assert_eq!(meta, e4b_meta());
+        assert_eq!(meta.missing_sliding_key(), None);
+        assert_eq!(meta.geometry(), Some(e4b()));
+    }
+
+    #[test]
+    fn a_header_without_the_pattern_names_the_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let header: Vec<_> = e4b_header()
+            .into_iter()
+            .filter(|(key, _)| *key != "gemma4.attention.sliding_window_pattern")
+            .collect();
+        let meta = KvMeta::read(&write_header(dir.path(), &header)).expect("reads");
+        assert_eq!(meta.sliding, None);
         assert_eq!(
-            parse_meta_list("[true, false, TRUE]", parse_meta_bool),
-            Some(vec![true, false, true])
+            meta.missing_sliding_key(),
+            Some("attention.sliding_window_pattern")
         );
+        assert_eq!(meta.geometry(), Some(all_full()));
+    }
+
+    #[test]
+    fn per_layer_kv_heads_and_a_dense_model_read_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let header: Vec<_> = e4b_header()
+            .into_iter()
+            .map(|(key, value)| match key {
+                "gemma4.attention.head_count_kv" => (key, HeaderValue::U32s(vec![1; 42])),
+                _ => (key, value),
+            })
+            .collect();
+        let meta = KvMeta::read(&write_header(dir.path(), &header)).expect("reads");
+        assert_eq!(meta.kv_heads, vec![1; 42]);
+        // A dense model declares no window and nothing sliding: nothing is missing.
+        use HeaderValue::*;
+        let dense = [
+            ("general.architecture", Str("llama")),
+            ("llama.block_count", U32(28)),
+            ("llama.embedding_length", U32(3_072)),
+            ("llama.attention.head_count", U32(24)),
+            ("llama.attention.head_count_kv", U32(8)),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let meta = KvMeta::read(&write_header(dir.path(), &dense)).expect("reads");
+        assert_eq!((meta.owning_layers, meta.key_length), (28, 128));
+        assert_eq!(meta.missing_sliding_key(), None);
+        let g = meta.geometry().expect("has KV");
+        assert_eq!((g.full_layers, g.sliding_layers), (28, 0));
+    }
+
+    #[test]
+    fn an_unreadable_header_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not.gguf");
+        std::fs::write(&path, b"not a gguf").unwrap();
+        assert!(KvMeta::read(&path).is_err());
+        assert!(KvMeta::read(&dir.path().join("absent.gguf")).is_err());
+    }
+
+    #[test]
+    fn only_a_model_that_slides_can_be_missing_a_sliding_key() {
+        let no_window = KvMeta {
+            n_swa: 0,
+            ..e4b_meta()
+        };
         assert_eq!(
-            parse_meta_list("[2, 4]", |v| v.parse::<u64>().ok()),
-            Some(vec![2, 4])
+            no_window.missing_sliding_key(),
+            Some("attention.sliding_window")
         );
+        let short = KvMeta {
+            sliding: Some(vec![true; 10]),
+            ..e4b_meta()
+        };
         assert_eq!(
-            parse_meta_list(" 2 ", |v| v.parse::<u64>().ok()),
-            Some(vec![2])
+            short.missing_sliding_key(),
+            Some("attention.sliding_window_pattern (shorter than the KV layers)")
         );
-        assert_eq!(parse_meta_list("[true, maybe]", parse_meta_bool), None);
+        let dense = KvMeta {
+            key_length_swa: None,
+            value_length_swa: None,
+            sliding: None,
+            n_swa: 0,
+            ..e4b_meta()
+        };
+        assert_eq!(dense.missing_sliding_key(), None);
+    }
+
+    /// Reads a real GGUF named by `GIAP_KV_GGUF`, e.g. the Orin's E4B.
+    #[test]
+    #[ignore = "needs a model file"]
+    fn a_real_model_file_reads_its_sliding_layers() {
+        let path = PathBuf::from(std::env::var("GIAP_KV_GGUF").expect("GIAP_KV_GGUF"));
+        let meta = KvMeta::read(&path).expect("reads");
+        assert_eq!(meta.missing_sliding_key(), None);
+        let g = meta.geometry().expect("has KV");
+        assert!(g.sliding_layers > 0, "{g:?}");
     }
 
     #[test]
