@@ -1,9 +1,9 @@
 //! A tool call the model wrote as text instead of in its native wrapper. llama.cpp's parser
 //! streams it as content, so the call never runs; Gemma 4 does this with thinking off, as
-//! `<NAME key="value" />` or as its own `NAME{key:value}` grammar behind a tag it makes up,
-//! such as `<call>`, `<tool_call>` or `<execute_tool>`. This reads such a call out of the
-//! visible content when it names a declared tool, and holds back only text that could still
-//! become one.
+//! `<NAME key="value" />`, or as its own `NAME{key:value}` grammar (or `NAME(key="value")`)
+//! behind a tag it makes up, such as `<call>`, `<tool_call>` or `<execute_tool>`, or inside
+//! `[...]`. This reads such a call out of the visible content when it names a declared tool,
+//! and holds back only text that could still become one.
 
 use serde_json::{Map, Value};
 
@@ -67,9 +67,15 @@ impl WrittenToolCalls {
         }
         self.held.push_str(text);
         let mut from = 0;
-        while let Some(offset) = self.held.get(from..).and_then(|rest| rest.find('<')) {
+        while let Some(offset) = self.held.get(from..).and_then(|rest| rest.find(['<', '['])) {
             let at = from + offset;
-            match self.read(self.held.get(at + 1..).unwrap_or_default(), at_end) {
+            let after = self.held.get(at + 1..).unwrap_or_default();
+            let read = if self.held.as_bytes().get(at) == Some(&b'[') {
+                self.read_fenced(after, None, at_end)
+            } else {
+                self.read(after, at_end)
+            };
+            match read {
                 Read::Call(call) => {
                     self.call = Some(call);
                     self.held.truncate(at);
@@ -98,13 +104,15 @@ impl WrittenToolCalls {
             return Read::NotACall;
         }
         match rest.strip_prefix('>') {
-            Some(body) => self.read_fenced(word, body, at_end),
+            Some(body) => self.read_fenced(body, Some(&format!("</{word}>")), at_end),
             None => self.read_tag(word, rest, at_end),
         }
     }
 
-    /// `NAME{key:value,...}`, optionally as `call:NAME{...}`, after `<FENCE>`.
-    fn read_fenced(&self, fence: &str, body: &str, at_end: bool) -> Read {
+    /// `NAME{key:value,...}` or `NAME(key="value",...)`, optionally after `call:`, behind
+    /// `<FENCE>` or `[`. Behind a fence a bare `NAME` up to `</FENCE>` is a call without
+    /// arguments; behind `[` it needs arguments, so `[NAME]` in prose stays prose.
+    fn read_fenced(&self, body: &str, closer: Option<&str>, at_end: bool) -> Read {
         let body = body.trim_start();
         let body = match body.strip_prefix("call:") {
             Some(rest) => rest,
@@ -130,8 +138,25 @@ impl WrittenToolCalls {
                 None => Read::NotACall,
             };
         }
-        let closer = format!("</{fence}>");
-        if at_end || rest.starts_with(&closer) {
+        if rest.starts_with('(') {
+            let block = match keyword_arguments_end(rest) {
+                Some(end) => rest.split_at(end).0,
+                None if at_end => rest,
+                None => return Read::Unfinished,
+            };
+            return match parse_keyword_arguments(block) {
+                Some(arguments) => Read::Call(WrittenCall { name, arguments }),
+                None => Read::NotACall,
+            };
+        }
+        let Some(closer) = closer else {
+            return if rest.is_empty() && !at_end {
+                Read::Unfinished
+            } else {
+                Read::NotACall
+            };
+        };
+        if at_end || rest.starts_with(closer) {
             Read::Call(WrittenCall {
                 name,
                 arguments: Map::new(),
@@ -216,6 +241,94 @@ fn unclosed_tag(name: String, arguments: Map<String, Value>, at_end: bool) -> Re
         (true, false) => Read::Call(WrittenCall { name, arguments }),
         (true, true) => Read::NotACall,
     }
+}
+
+/// Where a `(key="value",...)` block at the start of `text` closes, just past its `)`, or `None`
+/// while it is still open; a quoted string runs to its closing quote.
+fn keyword_arguments_end(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (Some(_), _) if escaped => escaped = false,
+            (Some(_), '\\') => escaped = true,
+            (Some(open), _) if c == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(at + 1);
+                }
+            }
+            (None, _) => {}
+        }
+    }
+    None
+}
+
+/// Reads `(key="value", count=2, flag=True)`, also when the generation cut it short.
+fn parse_keyword_arguments(block: &str) -> Option<Map<String, Value>> {
+    let mut rest = block.strip_prefix('(')?;
+    let mut arguments = Map::new();
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+        if rest.is_empty() || rest.starts_with(')') {
+            return Some(arguments);
+        }
+        let (key, after) = rest.split_at(word_len(rest));
+        if key.is_empty() {
+            return None;
+        }
+        let (value, after) =
+            keyword_value(after.trim_start().strip_prefix(['=', ':'])?.trim_start());
+        arguments.insert(key.to_string(), value);
+        rest = after;
+    }
+}
+
+/// One keyword argument's value, and the text after it.
+fn keyword_value(text: &str) -> (Value, &str) {
+    if let Some(quote) = text.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+        let body = text.get(1..).unwrap_or_default();
+        let mut escaped = false;
+        let close = body.char_indices().find_map(|(at, c)| match c {
+            _ if escaped => {
+                escaped = false;
+                None
+            }
+            '\\' => {
+                escaped = true;
+                None
+            }
+            _ if c == quote => Some(at),
+            _ => None,
+        });
+        let Some(close) = close else {
+            return (Value::String(body.trim_end_matches(')').to_string()), "");
+        };
+        let (inner, after) = body.split_at(close);
+        let value = if quote == '"' {
+            serde_json::from_str(text.get(..close + 2).unwrap_or_default())
+                .unwrap_or_else(|_| inner.to_string())
+        } else {
+            inner.replace("\\'", "'")
+        };
+        return (Value::String(value), after.get(1..).unwrap_or_default());
+    }
+    let (token, after) = text.split_at(text.find([',', ')']).unwrap_or(text.len()));
+    let token = token.trim();
+    let value = match token {
+        "True" | "true" => Value::Bool(true),
+        "False" | "false" => Value::Bool(false),
+        "None" | "null" => Value::Null,
+        _ => serde_json::from_str::<serde_json::Number>(token)
+            .map(Value::Number)
+            .unwrap_or_else(|_| Value::String(token.to_string())),
+    };
+    (value, after)
 }
 
 /// The length of a tool or attribute name at the start of `text`.
@@ -340,6 +453,48 @@ mod tests {
     }
 
     #[test]
+    fn reads_keyword_arguments_and_a_bracketed_call() {
+        let text = "I will use the web search tool to find the optimal steeping time for green tea and then answer Jerr.\n<execute_tool>\ngiap-knowledge__search_web(question=\"How long to steep green tea?\")\n</execute_tool>";
+        assert_eq!(
+            read(text),
+            (
+                "I will use the web search tool to find the optimal steeping time for green tea and then answer Jerr.\n".to_string(),
+                call(
+                    "giap-knowledge__search_web",
+                    json!({"question": "How long to steep green tea?"})
+                )
+            )
+        );
+        assert_eq!(
+            read("[knowledge__get_wikipedia_article{topic:<|\"|>onions make you cry when you cut them<|\"|>}]"),
+            (
+                String::new(),
+                call(
+                    "giap-knowledge__get_wikipedia_article",
+                    json!({"topic": "onions make you cry when you cut them"})
+                )
+            )
+        );
+        assert_eq!(
+            read("<call>giap-weather__search_web(query='it\\'s (rain)', days=2, hourly=True, note=None)</call>"),
+            (
+                String::new(),
+                call(
+                    "giap-weather__search_web",
+                    json!({"query": "it's (rain)", "days": 2, "hourly": true, "note": null})
+                )
+            )
+        );
+        assert_eq!(
+            read("<call>giap-weather__search_web(query=\"rain"),
+            (
+                String::new(),
+                call("giap-weather__search_web", json!({"query": "rain"}))
+            )
+        );
+    }
+
+    #[test]
     fn reads_a_call_the_generation_cut_short() {
         assert_eq!(
             read(r#"<call>giap-knowledge__get_wikipedia_article{topic:"crocodile vs"#),
@@ -441,6 +596,9 @@ mod tests {
             "<|\"|>quoted<|\"|>",
             "<turn_plan>\n1. Search the web.\n</turn_plan>\nSteep it for one minute.",
             "<response>\nBread rises because of yeast.",
+            "See [1] and [the guide](https://example.com/a_b) (page 2).",
+            "[giap-knowledge__search_web] is the tool, f(x) = 2",
+            "ends with [giap-knowledge__search_web",
         ] {
             assert_eq!(read(text), (text.to_string(), None), "{text}");
         }
