@@ -3025,6 +3025,7 @@ pub(super) mod tests {
         let roomy = MemoryFit {
             kv_bytes_per_token: per_token,
             free_bytes: 16_384 * per_token + reserves,
+            kv_type: None,
         };
         let tight = MemoryFit {
             free_bytes: 8_192 * per_token + reserves,
@@ -3050,6 +3051,7 @@ pub(super) mod tests {
         let tight = MemoryFit {
             kv_bytes_per_token: per_token,
             free_bytes: 8_192 * per_token + COMPUTE_RESERVE_BYTES + SAFETY_MARGIN_BYTES,
+            kv_type: None,
         };
         let admit = |prompt| {
             admit_prompt(

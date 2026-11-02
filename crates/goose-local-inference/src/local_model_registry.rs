@@ -44,6 +44,21 @@ pub enum ToolCallingMode {
     ForceEmulated,
 }
 
+/// How a model's KV cache element type is chosen when it loads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvCachePolicy {
+    /// [`ModelSettings::type_k`] and [`ModelSettings::type_v`] exactly as set.
+    #[default]
+    Fixed,
+    /// `type_k` and `type_v` as set, unless the memory free after the load would leave them a
+    /// window under 8,192 tokens and q8_0 for both would leave a wider one: then q8_0, about half
+    /// of f16's bytes per token. Applies only where the engine sizes the context to free memory
+    /// (unified memory, a Jetson), and only with `flash_attention`, without which llama.cpp
+    /// refuses a quantised V cache. Logged as `kind="kv_cache_type_chosen"`.
+    Q8WhenTight,
+}
+
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatTemplate {
@@ -101,6 +116,10 @@ pub struct ModelSettings {
     /// without `flash_attention` is rejected by llama.cpp at context creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_v: Option<String>,
+    /// Whether the memory free at load may trade `type_k` and `type_v` for q8_0. See
+    /// [`KvCachePolicy`].
+    #[serde(default)]
+    pub kv_cache_policy: KvCachePolicy,
     pub n_gpu_layers: Option<u32>,
     #[serde(default)]
     pub use_mlock: bool,
@@ -174,6 +193,7 @@ impl Default for ModelSettings {
             n_ubatch: None,
             type_k: None,
             type_v: None,
+            kv_cache_policy: KvCachePolicy::Fixed,
             n_gpu_layers: None,
             use_mlock: false,
             flash_attention: None,

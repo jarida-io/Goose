@@ -12,11 +12,14 @@
 //!
 //! The remedy here: release the model's file from the page cache as the load copies it and once
 //! it is done ([`release_files`], [`LoadProgressRelease`]), and size the context against
-//! `MemFree` measured after that release ([`MemoryFit`]).
+//! `MemFree` measured after that release ([`MemoryFit`]), in the KV cache type that memory
+//! affords ([`choose_kv_cache`]).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use super::super::load_error::{LoadStage, ModelLoadError};
+use crate::local_model_registry::ModelSettings;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -439,6 +442,9 @@ pub(super) struct MemoryFit {
     pub kv_bytes_per_token: u64,
     /// `MemFree` at load, less the picture encoder's weights when the model has one.
     pub free_bytes: u64,
+    /// The element type [`choose_kv_cache`] put both K and V in, in place of the settings' own;
+    /// `None` keeps the settings'. `kv_bytes_per_token` is this type's cost.
+    pub kv_type: Option<&'static str>,
 }
 
 impl MemoryFit {
@@ -451,6 +457,101 @@ impl MemoryFit {
 
     pub(super) fn fit(&self, requested: usize) -> ContextFit {
         fit_context(requested, self.kv_bytes_per_token, self.kv_budget())
+    }
+}
+
+/// `settings` with the KV cache type the fit chose at load, so every context a turn builds, the
+/// preamble snapshot's key and an allocation failure's estimate all agree with the window the fit
+/// sized. Borrowed unchanged when the fit kept the settings' types, or there is no fit.
+pub(super) fn with_fitted_kv_type(
+    settings: &ModelSettings,
+    fit: Option<MemoryFit>,
+) -> Cow<'_, ModelSettings> {
+    match fit.and_then(|f| f.kv_type) {
+        Some(kv_type) => Cow::Owned(ModelSettings {
+            type_k: Some(kv_type.to_string()),
+            type_v: Some(kv_type.to_string()),
+            ..settings.clone()
+        }),
+        None => Cow::Borrowed(settings),
+    }
+}
+
+// ── The KV cache type free memory affords ───────────────────────────────────
+
+/// The type [`KvCachePolicy::Q8WhenTight`](crate::local_model_registry::KvCachePolicy::Q8WhenTight)
+/// falls back to: 34 bytes per 32 elements against f16's 64, so about half the KV per token.
+pub(super) const TIGHT_KV_TYPE: &str = "q8_0";
+
+/// The narrowest window the settings' own KV types may be left before q8_0 is chosen instead.
+///
+/// The preamble alone (system text plus tool schemas) is ~3,300 tokens for Gemma 4 E4B on the
+/// Orin (~4,500 with every tool group, see [`CONTEXT_FLOOR`]), so 8,192 is the narrowest rung
+/// of [`CONTEXT_LADDER`] that leaves a turn about as much again for tool results and the answer:
+/// a scheduled briefing reads several tools before it writes. Below it the turn runs out of
+/// window, which fails the task; q8_0 costs 5-8% of decode speed at depth (llama-bench on the
+/// Orin, E4B QAT at depth 8,192: f16 18.1 tok/s, q8_0 16.7), which only slows it. At or above
+/// it f16 is kept for that speed.
+pub(super) const KV_TIGHT_WINDOW: usize = 8_192;
+
+/// The KV cache a load chose, and the window each candidate type would have had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KvChoice {
+    /// The fit in the chosen type.
+    pub fit: MemoryFit,
+    /// The window in the settings' own types.
+    pub preferred: ContextFit,
+    /// The window in [`TIGHT_KV_TYPE`]; `None` when it was no candidate.
+    pub quantized: Option<ContextFit>,
+}
+
+impl KvChoice {
+    /// Why the choice came out as it did, for `kind="kv_cache_type_chosen"`.
+    pub(super) fn reason(&self) -> &'static str {
+        match self.quantized {
+            None => "no_candidate",
+            Some(_) if self.fit.kv_type.is_some() => "tight",
+            Some(_) if self.preferred.n_ctx >= KV_TIGHT_WINDOW => "roomy",
+            Some(_) if self.preferred.reason == FitReason::Requested => "requested_fits",
+            Some(_) => "q8_no_wider",
+        }
+    }
+}
+
+/// Choose the KV cache type for a load with `free_bytes` free: the settings' own types
+/// (`preferred_bytes_per_token`), unless the window they leave for `requested` is under
+/// [`KV_TIGHT_WINDOW`] and [`TIGHT_KV_TYPE`] (`quantized_bytes_per_token`, `None` when it is no
+/// candidate) leaves a strictly wider one. Same window, the faster type is kept.
+pub(super) fn choose_kv_cache(
+    requested: usize,
+    free_bytes: u64,
+    preferred_bytes_per_token: u64,
+    quantized_bytes_per_token: Option<u64>,
+) -> KvChoice {
+    let preferred_fit = MemoryFit {
+        kv_bytes_per_token: preferred_bytes_per_token,
+        free_bytes,
+        kv_type: None,
+    };
+    let preferred = preferred_fit.fit(requested);
+    let candidate = quantized_bytes_per_token.map(|kv_bytes_per_token| MemoryFit {
+        kv_bytes_per_token,
+        free_bytes,
+        kv_type: Some(TIGHT_KV_TYPE),
+    });
+    let quantized = candidate.map(|fit| fit.fit(requested));
+    let fit = match (candidate, quantized) {
+        (Some(candidate), Some(q))
+            if preferred.n_ctx < KV_TIGHT_WINDOW && q.n_ctx > preferred.n_ctx =>
+        {
+            candidate
+        }
+        _ => preferred_fit,
+    };
+    KvChoice {
+        fit,
+        preferred,
+        quantized,
     }
 }
 
@@ -707,6 +808,7 @@ mod tests {
         let fit = MemoryFit {
             kv_bytes_per_token: per_token,
             free_bytes: exactly,
+            kv_type: None,
         };
         assert_eq!(fit.fit(16_384).reason, FitReason::Requested);
         let short = MemoryFit {
@@ -720,6 +822,119 @@ mod tests {
                 reason: FitReason::Reduced
             }
         );
+    }
+
+    /// Gemma 4 E4B's KV per token as the fit charges it: 24 owning layers, 2 KV heads, 512-wide
+    /// keys and values. 96 KiB in f16, as `kind="context_sized"` logs it on the Orin.
+    const E4B: KvGeometry = KvGeometry {
+        owning_layers: 24,
+        kv_heads: 2,
+        key_length: 512,
+        value_length: 512,
+    };
+
+    fn e4b_choice(free_mb: u64) -> KvChoice {
+        choose_kv_cache(
+            16_384,
+            free_mb * MIB,
+            E4B.bytes_per_token(Some("f16"), Some("f16")),
+            Some(E4B.bytes_per_token(Some(TIGHT_KV_TYPE), Some(TIGHT_KV_TYPE))),
+        )
+    }
+
+    #[test]
+    fn a_roomy_load_keeps_f16() {
+        let f16 = E4B.bytes_per_token(None, None);
+        assert_eq!(f16, 96 * 1024);
+        let free = (16_384 * f16 + COMPUTE_RESERVE_BYTES + SAFETY_MARGIN_BYTES) / MIB;
+        let choice = e4b_choice(free);
+        assert_eq!(choice.fit.kv_type, None);
+        assert_eq!(choice.fit.kv_bytes_per_token, f16);
+        assert_eq!(choice.preferred.n_ctx, 16_384);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(16_384));
+        assert_eq!(choice.reason(), "roomy");
+        // f16 at exactly the threshold is roomy too: 8,192 tokens is 768 MiB of KV.
+        let choice = e4b_choice(768 + 256 + 512);
+        assert_eq!(
+            (choice.preferred.n_ctx, choice.fit.kv_type, choice.reason()),
+            (8_192, None, "roomy")
+        );
+    }
+
+    /// 2026-10-28: 1,419 MB free after the load. f16 buys 6,144 tokens, q8_0 12,288.
+    #[test]
+    fn a_tight_load_takes_q8_0_and_the_wider_window() {
+        let choice = e4b_choice(1_419);
+        assert_eq!(choice.preferred.n_ctx, 6_144);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(12_288));
+        assert_eq!(choice.fit.kv_type, Some("q8_0"));
+        assert_eq!(
+            choice.fit.kv_bytes_per_token,
+            E4B.bytes_per_token(Some("q8_0"), Some("q8_0"))
+        );
+        assert_eq!(
+            choice.fit.fit(16_384).n_ctx,
+            12_288,
+            "the window the load keeps"
+        );
+        assert_eq!(choice.reason(), "tight");
+    }
+
+    /// 2026-11-02: 1,037 MB free (the encoder's 945 already taken off). f16 is at the floor,
+    /// and q8_0's ~5,400 tokens reach no rung above it: same window, so the faster type stays.
+    #[test]
+    fn q8_0_is_not_taken_for_a_window_no_wider() {
+        let choice = e4b_choice(1_037);
+        assert_eq!(choice.preferred.n_ctx, CONTEXT_FLOOR);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(CONTEXT_FLOOR));
+        assert_eq!(choice.fit.kv_type, None);
+        assert_eq!(choice.reason(), "q8_no_wider");
+    }
+
+    #[test]
+    fn a_window_that_fits_as_requested_or_no_candidate_keeps_the_settings_types() {
+        let f16 = E4B.bytes_per_token(None, None);
+        let q8 = E4B.bytes_per_token(Some("q8_0"), Some("q8_0"));
+        // A pin under the threshold that fits is not narrowed, so there is nothing to widen.
+        let small = choose_kv_cache(4_096, 1_419 * MIB, f16, Some(q8));
+        assert_eq!(small.preferred.reason, FitReason::Requested);
+        assert_eq!(
+            (small.fit.kv_type, small.reason()),
+            (None, "requested_fits")
+        );
+        // Policy fixed, or no flash attention: q8_0 is never weighed.
+        let fixed = choose_kv_cache(16_384, 1_419 * MIB, f16, None);
+        assert_eq!(fixed.preferred.n_ctx, 6_144);
+        assert_eq!(
+            (fixed.quantized, fixed.fit.kv_type, fixed.reason()),
+            (None, None, "no_candidate")
+        );
+    }
+
+    #[test]
+    fn the_fitted_type_replaces_both_settings_types_and_nothing_else() {
+        let settings = ModelSettings {
+            type_k: Some("f16".to_string()),
+            type_v: Some("f16".to_string()),
+            flash_attention: Some(true),
+            context_size: Some(16_384),
+            ..ModelSettings::default()
+        };
+        let tight = e4b_choice(1_419).fit;
+        let fitted = with_fitted_kv_type(&settings, Some(tight));
+        assert_eq!(fitted.type_k.as_deref(), Some("q8_0"));
+        assert_eq!(fitted.type_v.as_deref(), Some("q8_0"));
+        assert_eq!(fitted.context_size, Some(16_384));
+        assert_eq!(fitted.flash_attention, Some(true));
+        let roomy = e4b_choice(4_000).fit;
+        assert!(matches!(
+            with_fitted_kv_type(&settings, Some(roomy)),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            with_fitted_kv_type(&settings, None),
+            Cow::Borrowed(_)
+        ));
     }
 
     /// The figures of 2026-10-27: the context failed with 251 MB free, the weights with ~1 GB.

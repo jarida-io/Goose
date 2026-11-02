@@ -27,7 +27,7 @@ use self::memory::{
 };
 use crate::backend::{BackendLoadedModel, LocalGenerationRequest, LocalInferenceBackend};
 use crate::load_error::LoadStage;
-use crate::local_model_registry::{ChatTemplate, ModelSettings, ToolCallingMode};
+use crate::local_model_registry::{ChatTemplate, KvCachePolicy, ModelSettings, ToolCallingMode};
 use crate::multimodal::ExtractedImage;
 use crate::tool_parsing::compact_tools_json;
 use crate::{build_openai_messages_json, build_openai_text_messages_json, ResolvedModelPaths};
@@ -627,8 +627,10 @@ impl LlamaCppBackend {
         }
     }
 
-    /// The context budget a model just loaded may spend, logged as `kind="context_sized"`.
-    /// `None` off unified memory, or when the kernel or the model's header does not say.
+    /// The context budget a model just loaded may spend, in the KV cache type that budget
+    /// affords under the settings' [`KvCachePolicy`]: logged as `kind="kv_cache_type_chosen"`
+    /// when the policy lets the type move, and as `kind="context_sized"` always. `None` off
+    /// unified memory, or when the kernel or the model's header does not say.
     fn memory_fit(
         &self,
         model_id: &str,
@@ -640,20 +642,48 @@ impl LlamaCppBackend {
             return None;
         }
         let geometry = KvGeometry::of(model)?;
-        let type_v = settings
-            .type_v
-            .as_deref()
-            .filter(|_| settings.flash_attention == Some(true));
-        let fit = MemoryFit {
-            kv_bytes_per_token: geometry.bytes_per_token(settings.type_k.as_deref(), type_v),
-            // The picture encoder loads per picture turn, after this.
-            free_bytes: free_after_load?
-                .free
-                .saturating_sub(settings.mmproj_size_bytes),
-        };
+        let flash_attention = settings.flash_attention == Some(true);
+        let type_v = settings.type_v.as_deref().filter(|_| flash_attention);
+        // The picture encoder loads per picture turn, after this.
+        let free_bytes = free_after_load?
+            .free
+            .saturating_sub(settings.mmproj_size_bytes);
         let requested = settings
             .context_size
             .map_or(memory::CONTEXT_LADDER[0], |c| c as usize);
+        let adaptive = settings.kv_cache_policy == KvCachePolicy::Q8WhenTight;
+        // A quantised V cache needs flash attention, so without it q8_0 is no candidate.
+        let quantized_bytes_per_token = (adaptive && flash_attention).then(|| {
+            geometry.bytes_per_token(Some(memory::TIGHT_KV_TYPE), Some(memory::TIGHT_KV_TYPE))
+        });
+        let choice = memory::choose_kv_cache(
+            requested,
+            free_bytes,
+            geometry.bytes_per_token(settings.type_k.as_deref(), type_v),
+            quantized_bytes_per_token,
+        );
+        if adaptive {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "kv_cache_type_chosen",
+                model = model_id,
+                requested,
+                type_k = choice
+                    .fit
+                    .kv_type
+                    .or(settings.type_k.as_deref())
+                    .unwrap_or("f16"),
+                type_v = choice.fit.kv_type.or(type_v).unwrap_or("f16"),
+                reason = choice.reason(),
+                preferred_n_ctx = choice.preferred.n_ctx,
+                q8_n_ctx = choice.quantized.map(|q| q.n_ctx),
+                tight_below = memory::KV_TIGHT_WINDOW,
+                flash_attention,
+                free_mb = free_bytes / MIB,
+                "KV cache type chosen against the memory free after the load"
+            );
+        }
+        let fit = choice.fit;
         let chosen = fit.fit(requested);
         tracing::info!(
             target: "giap::trace",
@@ -949,6 +979,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             session_retained = loaded.session.is_some(),
             "generate: model slot identity"
         );
+        let kv_settings = memory::with_fitted_kv_type(request.settings, loaded.memory_fit);
         let mut gen_ctx = GenerationContext {
             draft: loaded.draft.as_ref(),
             model: &loaded.model,
@@ -959,7 +990,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             memory_fit: loaded.memory_fit,
             backend: self,
             template,
-            settings: request.settings,
+            settings: &kv_settings,
             context_limit: request.context_limit,
             model_name: request.model_name,
             message_id: request.message_id,
