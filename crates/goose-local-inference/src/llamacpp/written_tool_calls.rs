@@ -2,8 +2,9 @@
 //! streams it as content, so the call never runs; Gemma 4 does this with thinking off, as
 //! `<NAME key="value" />`, or as its own `NAME{key:value}` grammar (or `NAME(key="value")`)
 //! behind a tag it makes up, such as `<call>`, `<tool_call>` or `<execute_tool>`, or inside
-//! `[...]`. This reads such a call out of the visible content when it names a declared tool,
-//! and holds back only text that could still become one.
+//! `[...]`, or as `<NAME>text</NAME>` with the text as the tool's one text parameter. This reads
+//! such a call out of the visible content when it names a declared tool, and holds back only
+//! text that could still become one.
 
 use serde_json::{Map, Value};
 
@@ -19,9 +20,15 @@ pub(super) struct WrittenCall {
 }
 
 pub(super) struct WrittenToolCalls {
-    tools: Vec<String>,
+    tools: Vec<Declared>,
     held: String,
     call: Option<WrittenCall>,
+}
+
+struct Declared {
+    name: String,
+    /// The parameter `<NAME>text</NAME>` fills ([`text_parameter`]).
+    text_parameter: Option<String>,
 }
 
 enum Read {
@@ -31,9 +38,18 @@ enum Read {
 }
 
 impl WrittenToolCalls {
-    pub(super) fn new<'a>(declared: impl IntoIterator<Item = &'a str>) -> Self {
+    /// Each declared tool's name and input schema.
+    pub(super) fn new<'a>(
+        declared: impl IntoIterator<Item = (&'a str, &'a Map<String, Value>)>,
+    ) -> Self {
         Self {
-            tools: declared.into_iter().map(str::to_string).collect(),
+            tools: declared
+                .into_iter()
+                .map(|(name, schema)| Declared {
+                    name: name.to_string(),
+                    text_parameter: text_parameter(schema),
+                })
+                .collect(),
             held: String::new(),
             call: None,
         }
@@ -103,10 +119,60 @@ impl WrittenToolCalls {
         if word.is_empty() {
             return Read::NotACall;
         }
-        match rest.strip_prefix('>') {
-            Some(body) => self.read_fenced(body, Some(&format!("</{word}>")), at_end),
-            None => self.read_tag(word, rest, at_end),
+        let Some(body) = rest.strip_prefix('>') else {
+            return self.read_tag(word, rest, at_end);
+        };
+        let closer = format!("</{word}>");
+        match self.read_fenced(body, Some(&closer), at_end) {
+            Read::NotACall => self.read_body(word, body, &closer, at_end),
+            read => read,
         }
+    }
+
+    /// `<NAME>text</NAME>`, NAME also as the part after `__` alone: the text fills the tool's
+    /// one text parameter. Kept to one line, so a made-up tag around prose stays prose.
+    fn read_body(&self, word: &str, body: &str, closer: &str, at_end: bool) -> Read {
+        let Some(name) = self.resolve(word).or_else(|| self.resolve_short(word)) else {
+            return Read::NotACall;
+        };
+        let Some(parameter) = self
+            .tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.text_parameter.clone())
+        else {
+            return Read::NotACall;
+        };
+        let text = match body.find(closer) {
+            Some(end) => body.split_at(end).0,
+            None => {
+                // The part of the closing tag written so far is not the text.
+                let started = (1..closer.len())
+                    .rev()
+                    .find(|&len| closer.get(..len).is_some_and(|part| body.ends_with(part)))
+                    .unwrap_or(0);
+                let text = body.split_at(body.len() - started).0;
+                if !at_end {
+                    return if text.trim().contains('\n') {
+                        Read::NotACall
+                    } else {
+                        Read::Unfinished
+                    };
+                }
+                // Cut short: only a closing tag the model began says the text was a call.
+                if started < "</".len() {
+                    return Read::NotACall;
+                }
+                text
+            }
+        };
+        let text = text.trim();
+        if text.is_empty() || text.contains('\n') {
+            return Read::NotACall;
+        }
+        let mut arguments = Map::new();
+        arguments.insert(parameter, Value::String(text.to_string()));
+        Read::Call(WrittenCall { name, arguments })
     }
 
     /// `NAME{key:value,...}` or `NAME(key="value",...)`, optionally after `call:`, behind
@@ -221,16 +287,51 @@ impl WrittenToolCalls {
     /// The declared tool a written name means: itself, or the one tool whose name after `__`
     /// matches, since the model drops the extension's prefix.
     fn resolve(&self, written: &str) -> Option<String> {
-        if self.tools.iter().any(|tool| tool == written) {
+        if self.tools.iter().any(|tool| tool.name == written) {
             return Some(written.to_string());
         }
-        let (_, short) = written.split_once("__")?;
-        let mut matches = self
-            .tools
-            .iter()
-            .filter(|tool| tool.split_once("__").is_some_and(|(_, tail)| tail == short));
+        self.resolve_short(written.split_once("__")?.1)
+    }
+
+    /// The one declared tool whose name after `__` is `short`.
+    fn resolve_short(&self, short: &str) -> Option<String> {
+        let mut matches = self.tools.iter().filter(|tool| {
+            tool.name
+                .split_once("__")
+                .is_some_and(|(_, tail)| tail == short)
+        });
         let tool = matches.next()?;
-        matches.next().is_none().then(|| tool.clone())
+        matches.next().is_none().then(|| tool.name.clone())
+    }
+}
+
+/// The parameter a tool's text alone can fill: its one required parameter when that is a
+/// string, or, with none required, its only string parameter.
+fn text_parameter(schema: &Map<String, Value>) -> Option<String> {
+    let properties = schema.get("properties")?.as_object()?;
+    let is_text = |name: &str| {
+        properties
+            .get(name)
+            .and_then(|property| property.get("type"))
+            .is_some_and(|kind| match kind {
+                Value::String(kind) => kind == "string",
+                Value::Array(kinds) => kinds.iter().any(|kind| kind.as_str() == Some("string")),
+                _ => false,
+            })
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|required| required.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    match required.as_slice() {
+        [only] => is_text(only).then(|| only.to_string()),
+        [] => {
+            let mut texts = properties.keys().filter(|name| is_text(name));
+            let only = texts.next()?;
+            texts.next().is_none().then(|| only.clone())
+        }
+        _ => None,
     }
 }
 
@@ -345,16 +446,51 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const TOOLS: [&str; 4] = [
-        "giap-knowledge__search_web",
-        "giap-knowledge__get_wikipedia_article",
-        "giap-system__get_current_time",
-        "giap-weather__search_web",
-    ];
+    type Tools = Vec<(&'static str, Map<String, Value>)>;
+
+    fn schema(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap_or_default()
+    }
+
+    fn tools() -> Tools {
+        vec![
+            (
+                "giap-knowledge__search_web",
+                schema(json!({
+                    "type": "object",
+                    "properties": {"question": {"type": "string"}, "max_results": {"type": "integer"}},
+                    "required": ["question"]
+                })),
+            ),
+            (
+                "giap-knowledge__get_wikipedia_article",
+                schema(json!({
+                    "type": "object",
+                    "properties": {"topic": {"type": ["string", "null"]}, "limit": {"type": ["integer", "null"]}}
+                })),
+            ),
+            (
+                "giap-system__get_current_time",
+                schema(json!({"type": "object", "properties": {}})),
+            ),
+            (
+                "giap-weather__search_web",
+                schema(json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "days": {"type": "integer"}},
+                    "required": ["query", "days"]
+                })),
+            ),
+        ]
+    }
+
+    fn calls_for(tools: &Tools) -> WrittenToolCalls {
+        WrittenToolCalls::new(tools.iter().map(|(name, schema)| (*name, schema)))
+    }
 
     /// Feeds `pieces` in order and returns the shown text and the call read.
-    fn run(pieces: &[&str]) -> (String, Option<(String, Value)>) {
-        let mut calls = WrittenToolCalls::new(TOOLS);
+    fn run_with(tools: &Tools, pieces: &[&str]) -> (String, Option<(String, Value)>) {
+        let mut calls = calls_for(tools);
         let mut shown = String::new();
         for piece in pieces {
             shown.push_str(&calls.push(piece));
@@ -368,14 +504,18 @@ mod tests {
 
     /// Every split point, and one character at a time, gives what the whole text gives.
     fn read(text: &str) -> (String, Option<(String, Value)>) {
-        let whole = run(&[text]);
+        read_with(&tools(), text)
+    }
+
+    fn read_with(tools: &Tools, text: &str) -> (String, Option<(String, Value)>) {
+        let whole = run_with(tools, &[text]);
         for (at, _) in text.char_indices().skip(1) {
             let (head, tail) = text.split_at(at);
-            assert_eq!(run(&[head, tail]), whole, "split at {at}");
+            assert_eq!(run_with(tools, &[head, tail]), whole, "split at {at}");
         }
         let chars: Vec<String> = text.chars().map(String::from).collect();
         let chars: Vec<&str> = chars.iter().map(String::as_str).collect();
-        assert_eq!(run(&chars), whole, "one character at a time");
+        assert_eq!(run_with(tools, &chars), whole, "one character at a time");
         whole
     }
 
@@ -495,6 +635,86 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_text_of_a_tag_named_for_a_tool() {
+        let one_search: Tools = tools()
+            .into_iter()
+            .filter(|(name, _)| *name != "giap-weather__search_web")
+            .collect();
+        assert_eq!(
+            read_with(
+                &one_search,
+                "<search_web>What is the story of how the Great Rift Valley formed</search_web>"
+            ),
+            (
+                String::new(),
+                call(
+                    "giap-knowledge__search_web",
+                    json!({"question": "What is the story of how the Great Rift Valley formed"})
+                )
+            )
+        );
+        assert_eq!(
+            read(
+                "Let me look.\n<get_wikipedia_article>\nBread leavening\n</get_wikipedia_article>"
+            ),
+            (
+                "Let me look.\n".to_string(),
+                call(
+                    "giap-knowledge__get_wikipedia_article",
+                    json!({"topic": "Bread leavening"})
+                )
+            )
+        );
+        assert_eq!(
+            read("<knowledge__get_wikipedia_article>Bread lea</knowled"),
+            (
+                String::new(),
+                call(
+                    "giap-knowledge__get_wikipedia_article",
+                    json!({"topic": "Bread lea"})
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn leaves_a_tag_named_for_a_tool_alone_when_its_text_cannot_be_the_call() {
+        for text in [
+            // `search_web` names two tools.
+            "<search_web>rain tomorrow</search_web>",
+            // Two required parameters, or none that take text.
+            "<giap-weather__search_web>rain</giap-weather__search_web>",
+            "<get_current_time>now</get_current_time>",
+            // Prose over several lines inside the tag.
+            "<get_wikipedia_article>\nBread rises.\nYeast makes gas.\n</get_wikipedia_article>",
+            "<get_wikipedia_article></get_wikipedia_article>",
+            "<plan>Search the web.</plan>",
+        ] {
+            assert_eq!(read(text), (text.to_string(), None), "{text}");
+        }
+    }
+
+    #[test]
+    fn finds_the_parameter_text_fills() {
+        let parameters: Vec<(&str, Option<String>)> = tools()
+            .iter()
+            .map(|(name, schema)| (*name, text_parameter(schema)))
+            .collect();
+        assert_eq!(
+            parameters,
+            [
+                ("giap-knowledge__search_web", Some("question".to_string())),
+                (
+                    "giap-knowledge__get_wikipedia_article",
+                    Some("topic".to_string())
+                ),
+                ("giap-system__get_current_time", None),
+                ("giap-weather__search_web", None),
+            ]
+        );
+    }
+
+    #[test]
     fn reads_a_call_the_generation_cut_short() {
         assert_eq!(
             read(r#"<call>giap-knowledge__get_wikipedia_article{topic:"crocodile vs"#),
@@ -606,7 +826,7 @@ mod tests {
 
     #[test]
     fn streams_prose_before_a_possible_call_at_once() {
-        let mut calls = WrittenToolCalls::new(TOOLS);
+        let mut calls = calls_for(&tools());
         assert_eq!(calls.push("Let me check. <giap-know"), "Let me check. ");
         assert_eq!(calls.push("ledge__search_web question=\"ra"), "");
         assert_eq!(calls.push("in\" />and the rest"), "");
@@ -624,7 +844,7 @@ mod tests {
 
     #[test]
     fn releases_a_tag_as_soon_as_it_cannot_be_a_call() {
-        let mut calls = WrittenToolCalls::new(TOOLS);
+        let mut calls = calls_for(&tools());
         assert_eq!(calls.push("x <b"), "x ");
         assert_eq!(calls.push(">bold"), "");
         assert_eq!(calls.push(" text"), "<b>bold text");
@@ -634,7 +854,7 @@ mod tests {
 
     #[test]
     fn passes_everything_through_without_tools() {
-        let mut calls = WrittenToolCalls::new([]);
+        let mut calls = calls_for(&Vec::new());
         let text = r#"<giap-knowledge__search_web question="x" />"#;
         assert_eq!(calls.push(text), text);
         assert_eq!(calls.finish(), "");
@@ -643,7 +863,7 @@ mod tests {
 
     #[test]
     fn releases_held_text_past_the_cap() {
-        let mut calls = WrittenToolCalls::new(TOOLS);
+        let mut calls = calls_for(&tools());
         let open = "<call>giap-knowledge__search_web{question:\"";
         assert_eq!(calls.push(open), "");
         let long = "a".repeat(MAX_HELD_BYTES);
