@@ -28,12 +28,17 @@ const MIB: u64 = 1024 * 1024;
 /// model is released about a dozen times rather than once per tensor.
 pub(super) const RELEASE_STEP_BYTES: u64 = 256 * MIB;
 
+/// Default context window when settings.context_size is not specified.
+pub(super) const DEFAULT_CONTEXT: usize = 16_384;
+
 /// Context windows tried, widest first, when the requested one does not fit.
 ///
 /// 5,120 is there for a load just above the floor, where q8_0 can hold more than 4,096 tokens but
 /// not 6,144: without the rung that window rounded down to the floor, f16's window, and q8_0 had
 /// nothing to gain. For a ~3,300-token preamble it is ~1,800 tokens of turn rather than ~800.
-pub(super) const CONTEXT_LADDER: [usize; 6] = [16_384, 12_288, 8_192, 6_144, 5_120, 4_096];
+pub(super) const CONTEXT_LADDER: [usize; 8] = [
+    32_768, 24_576, 16_384, 12_288, 8_192, 6_144, 5_120, 4_096,
+];
 
 /// The narrowest window the fit hands out, whatever free memory says. Below it a Gemma 4 E4B
 /// turn (a ~4,500-token preamble) cannot run at all, so a context this small that then fails to
@@ -904,7 +909,9 @@ pub(super) fn choose_kv_cache(
     let quantized = candidate.map(|fit| fit.fit(requested));
     let fit = match (candidate, quantized) {
         (Some(candidate), Some(q))
-            if preferred.n_ctx < KV_TIGHT_WINDOW && q.n_ctx > preferred.n_ctx =>
+            if (preferred.n_ctx < KV_TIGHT_WINDOW
+                || (requested > 16_384 && preferred.n_ctx < requested))
+                && q.n_ctx > preferred.n_ctx =>
         {
             candidate
         }
@@ -1604,6 +1611,20 @@ mod tests {
         assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(CONTEXT_FLOOR));
         assert_eq!(choice.fit.kv_type, None);
         assert_eq!(choice.reason(), "q8_no_wider");
+    }
+
+    #[test]
+    fn requested_32k_takes_q8_0_when_f16_cannot_reach_it() {
+        let choice = choose_kv_cache(
+            32_768,
+            1_164 * MIB,
+            e4b().cost(Some("f16"), Some("f16"), Some(512)),
+            Some(e4b().cost(Some(TIGHT_KV_TYPE), Some(TIGHT_KV_TYPE), Some(512))),
+        );
+        assert_eq!(choice.preferred.n_ctx, 16_384);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(32_768));
+        assert_eq!(choice.fit.kv_type, Some("q8_0"));
+        assert_eq!(choice.fit.fit(32_768).n_ctx, 32_768);
     }
 
     #[test]

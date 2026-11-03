@@ -673,7 +673,7 @@ impl LlamaCppBackend {
             .saturating_sub(settings.mmproj_size_bytes);
         let requested = settings
             .context_size
-            .map_or(memory::CONTEXT_LADDER[0], |c| c as usize);
+            .map_or(memory::DEFAULT_CONTEXT, |c| c as usize);
         let adaptive = settings.kv_cache_policy == KvCachePolicy::Q8WhenTight;
         // A quantised V cache needs flash attention, so without it q8_0 is no candidate.
         let quantized = (adaptive && flash_attention).then(|| {
