@@ -669,7 +669,7 @@ impl LlamaCppBackend {
         let type_v = settings.type_v.as_deref().filter(|_| flash_attention);
         // The picture encoder loads per picture turn, after this.
         let free_bytes = free_after_load?
-            .free
+            .available
             .saturating_sub(settings.mmproj_size_bytes);
         let requested = settings
             .context_size
