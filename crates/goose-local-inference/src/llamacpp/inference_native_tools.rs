@@ -36,8 +36,11 @@ pub(super) fn generate_with_native_tools(
     let mut generated_text = String::new();
     let mut stop_trimmer = StopSuffixTrimmer::new(&template_result.additional_stops);
     let mut stop_string_emitted = false;
-    let mut written_calls =
-        WrittenToolCalls::new(declared_tools.iter().map(|tool| tool.name.as_ref()));
+    let mut written_calls = WrittenToolCalls::new(
+        declared_tools
+            .iter()
+            .map(|tool| (&*tool.name, &*tool.input_schema)),
+    );
 
     // Initialize streaming parser — handles thinking tokens, tool calls, etc.
     let t_parser = std::time::Instant::now();
