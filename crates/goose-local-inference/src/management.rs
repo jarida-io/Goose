@@ -4,8 +4,8 @@ use super::hf_models::{
 };
 use super::local_model_registry::{
     default_settings_for_model, featured_mmproj_spec, get_registry, model_id_from_repo,
-    ChatTemplate, LocalModelEntry, LocalModelStorage, ModelDownloadStatus, ModelSettings,
-    SamplingConfig, ToolCallingMode, FEATURED_MODELS,
+    ChatTemplate, KvCachePolicy, LocalModelEntry, LocalModelStorage, ModelDownloadStatus,
+    ModelSettings, SamplingConfig, ToolCallingMode, FEATURED_MODELS,
 };
 use super::{
     available_inference_memory_bytes, builtin_chat_template_names, recommend_local_model,
@@ -591,6 +591,8 @@ pub fn model_settings_from_dto(settings: LocalInferenceModelSettingsDto) -> Mode
         n_ubatch: settings.n_ubatch,
         type_k: settings.type_k.clone(),
         type_v: settings.type_v.clone(),
+        // Not in the DTO: a host sets it with the rest of its device settings, as with `litert`.
+        kv_cache_policy: KvCachePolicy::Fixed,
         n_gpu_layers: settings.n_gpu_layers,
         use_mlock: settings.use_mlock,
         flash_attention: settings.flash_attention,

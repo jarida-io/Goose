@@ -1,0 +1,1691 @@
+//! Unified memory on a Jetson: what loading a model leaves in the page cache, how much memory the
+//! GPU can really have, and how large a context that buys.
+//!
+//! On Tegra (Jetson Orin) the GPU allocates from system memory through nvmap, and nvmap fails a
+//! `cudaMalloc` when *free* memory runs low: it does not reclaim page cache to satisfy one.
+//! llama.cpp copies the GPU-resident weights out of the mmapped GGUF, so a load fills the page
+//! cache with the very bytes it has just copied. On 2026-10-27 Gemma 4 E4B's 2.2 GB of GPU weights
+//! loaded, the cache grew by 2.2 GB, 251 MB stayed free, and a 42 MiB allocation (the drafter's,
+//! by its place in the log) and the KV cache's 256 MiB both failed. llama.cpp reports
+//! `MemAvailable` as a UMA device's
+//! free memory, which counts that cache, so its own estimate cannot see the problem.
+//!
+//! The remedy here: release the model's file from the page cache as the load copies it and once
+//! it is done ([`release_files`], [`LoadProgressRelease`]), and size the context against
+//! `MemFree` measured after that release ([`MemoryFit`]), in the KV cache type that memory
+//! affords ([`choose_kv_cache`]).
+
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+
+use super::super::load_error::{LoadStage, ModelLoadError};
+use crate::local_model_registry::ModelSettings;
+
+const MIB: u64 = 1024 * 1024;
+
+/// How much of a load runs between two releases of its file from the page cache. Small enough
+/// that the cache never holds more than this of the copied weights, large enough that a 3 GB
+/// model is released about a dozen times rather than once per tensor.
+pub(super) const RELEASE_STEP_BYTES: u64 = 256 * MIB;
+
+/// Context windows tried, widest first, when the requested one does not fit.
+///
+/// 5,120 is there for a load just above the floor, where q8_0 can hold more than 4,096 tokens but
+/// not 6,144: without the rung that window rounded down to the floor, f16's window, and q8_0 had
+/// nothing to gain. For a ~3,300-token preamble it is ~1,800 tokens of turn rather than ~800.
+pub(super) const CONTEXT_LADDER: [usize; 6] = [16_384, 12_288, 8_192, 6_144, 5_120, 4_096];
+
+/// The narrowest window the fit hands out, whatever free memory says. Below it a Gemma 4 E4B
+/// turn (a ~4,500-token preamble) cannot run at all, so a context this small that then fails to
+/// allocate is reported as out of memory rather than shrunk further.
+pub(super) const CONTEXT_FLOOR: usize = 4_096;
+
+/// Free memory a context leaves untouched: the drafter's context (+48 MB measured on the Orin),
+/// a sacrificial side-call context, and nvmap's own slack (a 42 MiB allocation failed with
+/// 251 MB free on 2026-10-27).
+pub(super) const SAFETY_MARGIN_BYTES: u64 = 512 * MIB;
+
+/// llama.cpp's compute buffers for one context. NOT an Orin measurement with logits reserved
+/// for one output (`with_n_outputs_max`); the 522 MiB measured before that change was mostly a
+/// full vocabulary row per ubatch token. Replace with the `compute buffer size` llama.cpp logs on
+/// the Orin.
+pub(super) const COMPUTE_RESERVE_BYTES: u64 = 256 * MIB;
+
+fn mib(bytes: u64) -> u64 {
+    bytes / MIB
+}
+
+// ── /proc/meminfo ───────────────────────────────────────────────────────────
+
+/// The kernel's memory figures, bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MemInfo {
+    /// `MemFree`: what an nvmap allocation can actually get.
+    pub free: u64,
+    /// `Cached`: page cache, which nvmap does not reclaim.
+    pub cached: u64,
+    /// `MemAvailable`: free plus reclaimable, what `free -m` and llama.cpp report.
+    pub available: u64,
+}
+
+impl MemInfo {
+    /// Parse `/proc/meminfo`; `None` unless all three fields are present.
+    pub(super) fn parse(text: &str) -> Option<Self> {
+        let field = |name: &str| {
+            text.lines().find_map(|line| {
+                let value = line.strip_prefix(name)?.strip_prefix(':')?;
+                let kib = value
+                    .trim()
+                    .strip_suffix("kB")?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()?;
+                kib.checked_mul(1024)
+            })
+        };
+        Some(Self {
+            free: field("MemFree")?,
+            cached: field("Cached")?,
+            available: field("MemAvailable")?,
+        })
+    }
+
+    /// This machine's figures, or `None` where there is no `/proc/meminfo`.
+    pub(super) fn read() -> Option<Self> {
+        if cfg!(target_os = "linux") {
+            std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|text| Self::parse(&text))
+        } else {
+            None
+        }
+    }
+}
+
+// ── Releasing a file from the page cache ────────────────────────────────────
+
+/// Drops what the page cache holds of a file. A trait so the load path can be tested without a
+/// kernel that honours the advice.
+pub(super) trait PageCache: Send + Sync {
+    /// Release `path`, including the pages this process maps read-only. Never changes what a
+    /// mapping reads: a released page is read back from the file on its next access.
+    fn release(&self, path: &Path) -> std::io::Result<()>;
+}
+
+/// The kernel's page cache.
+///
+/// `posix_fadvise(POSIX_FADV_DONTNEED)` drops a file's cached pages, but skips every page a
+/// process has mapped, and llama.cpp maps the whole GGUF (`use_mmap`, kept for the reason in
+/// `LlamaCppBackend::load_model`): the weights it copied to the GPU were read through that
+/// mapping and stay mapped until the model is freed. So the file's read-only shared mappings in
+/// this process are first paged out with `madvise(MADV_PAGEOUT)` (Linux 5.4+), which never
+/// discards data on any mapping, and then the file is advised away.
+pub(super) struct SystemPageCache;
+
+#[cfg(target_os = "linux")]
+impl PageCache for SystemPageCache {
+    fn release(&self, path: &Path) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let file = std::fs::File::open(path)?;
+        let inode = file.metadata()?.ino();
+        let canonical = std::fs::canonicalize(path)?;
+        let maps = std::fs::read_to_string("/proc/self/maps")?;
+        for mapping in maps.lines().filter_map(Mapping::parse) {
+            if !mapping.is_read_only_view_of(inode, &canonical) {
+                continue;
+            }
+            // SAFETY: advice only. MADV_PAGEOUT reclaims the range's pages the way memory
+            // pressure would: a clean file page is dropped and read back from the file on its
+            // next access, an anonymous one is swapped. It cannot change what any mapping reads,
+            // so even a range unmapped and reused since `/proc/self/maps` was read is unharmed.
+            let rc = unsafe {
+                libc::madvise(
+                    mapping.start as *mut libc::c_void,
+                    mapping.end - mapping.start,
+                    libc::MADV_PAGEOUT,
+                )
+            };
+            if rc != 0 {
+                // EINVAL on a kernel older than 5.4: the advice below still drops what is not
+                // mapped, which is everything llama.cpp has unmapped after the load.
+                tracing::debug!(
+                    target: "giap::trace",
+                    file = %path.display(),
+                    error = %std::io::Error::last_os_error(),
+                    "madvise(MADV_PAGEOUT) refused; releasing the unmapped pages only"
+                );
+            }
+        }
+        // SAFETY: an advisory call on a descriptor this function owns for its whole duration.
+        let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PageCache for SystemPageCache {
+    fn release(&self, _path: &Path) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// One line of `/proc/self/maps`. Read only where the kernel has one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mapping {
+    start: usize,
+    end: usize,
+    writable: bool,
+    shared: bool,
+    inode: u64,
+    path: PathBuf,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl Mapping {
+    /// `start-end perms offset dev inode path`; the path may contain spaces, or be absent.
+    fn parse(line: &str) -> Option<Self> {
+        let mut rest = line;
+        let mut field = || {
+            rest = rest.trim_start();
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let (value, tail) = rest.split_at(end);
+            rest = tail;
+            (!value.is_empty()).then_some(value)
+        };
+        let (start, end) = field()?.split_once('-')?;
+        let perms = field()?.as_bytes();
+        let _offset = field()?;
+        let _device = field()?;
+        let inode = field()?.parse().ok()?;
+        let path = rest.trim();
+        if perms.len() < 4 || path.is_empty() {
+            return None;
+        }
+        Some(Self {
+            start: usize::from_str_radix(start, 16).ok()?,
+            end: usize::from_str_radix(end, 16).ok()?,
+            writable: perms[1] == b'w',
+            shared: perms[3] == b's',
+            inode,
+            path: PathBuf::from(path),
+        })
+    }
+
+    /// A read-only shared mapping of the file `(inode, path)`: how llama.cpp maps a GGUF.
+    fn is_read_only_view_of(&self, inode: u64, path: &Path) -> bool {
+        self.inode == inode
+            && self.path == path
+            && self.shared
+            && !self.writable
+            && self.end > self.start
+    }
+}
+
+/// Release `files` from the page cache and say what that freed, logged as
+/// `kind="page_cache_released"`. Returns the free memory after, when the kernel reports it.
+pub(super) fn release_files(
+    cache: &dyn PageCache,
+    files: &[&Path],
+    reason: &'static str,
+) -> Option<MemInfo> {
+    let before = MemInfo::read();
+    let mut released = 0usize;
+    for file in files {
+        match cache.release(file) {
+            Ok(()) => released += 1,
+            Err(e) => tracing::warn!(
+                target: "giap::trace",
+                kind = "page_cache_release_failed",
+                reason,
+                file = %file.display(),
+                error = %e,
+                "could not release a model file from the page cache"
+            ),
+        }
+    }
+    let after = MemInfo::read();
+    tracing::info!(
+        target: "giap::trace",
+        kind = "page_cache_released",
+        reason,
+        files = released,
+        free_mb_before = before.map(|m| mib(m.free)),
+        free_mb_after = after.map(|m| mib(m.free)),
+        cached_mb_before = before.map(|m| mib(m.cached)),
+        cached_mb_after = after.map(|m| mib(m.cached)),
+        "released model files from the page cache"
+    );
+    after
+}
+
+/// Releases a file while llama.cpp loads it, from the load's progress callback, so the cache never
+/// fills with the weights already copied to the GPU: once per [`RELEASE_STEP_BYTES`] of progress.
+pub(super) struct LoadProgressRelease {
+    cache: std::sync::Arc<dyn PageCache>,
+    path: PathBuf,
+    file_len: u64,
+    released_at: u64,
+    releases: u32,
+}
+
+impl LoadProgressRelease {
+    pub(super) fn new(cache: std::sync::Arc<dyn PageCache>, path: &Path) -> Self {
+        let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        Self {
+            cache,
+            path: path.to_path_buf(),
+            file_len,
+            released_at: 0,
+            releases: 0,
+        }
+    }
+
+    /// llama.cpp's progress, `0.0..=1.0` of the bytes loaded. Never aborts the load: a release
+    /// that fails is logged at debug and the load goes on, released or not.
+    pub(super) fn on_progress(&mut self, progress: f32) -> bool {
+        let loaded = (f64::from(progress.clamp(0.0, 1.0)) * self.file_len as f64) as u64;
+        let steps = loaded.saturating_sub(self.released_at) / RELEASE_STEP_BYTES;
+        if steps > 0 {
+            // On the step boundary, not at `loaded`, so coarse progress does not drift.
+            self.released_at += steps * RELEASE_STEP_BYTES;
+            self.releases += 1;
+            if let Err(e) = self.cache.release(&self.path) {
+                tracing::debug!(
+                    target: "giap::trace",
+                    file = %self.path.display(),
+                    error = %e,
+                    "page cache release during the load failed"
+                );
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn releases(&self) -> u32 {
+        self.releases
+    }
+}
+
+// ── The context free memory buys ────────────────────────────────────────────
+
+/// The narrowest physical batch a context of this engine is built with when it slides: llama.cpp's
+/// own default, and what a picture turn's prefill raises `n_ubatch` to. The sliding-window cache
+/// is sized by it, so charging at least this covers a picture turn's context too.
+const SLIDING_UBATCH_FLOOR: u32 = 512;
+
+/// The multiple of cells llama.cpp pads a sliding-window cache to (`llama_kv_cache_iswa`).
+const SLIDING_CELL_PAD: u64 = 256;
+
+/// The model's own KV metadata, as its GGUF header declares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KvMeta {
+    /// Layers that allocate KV: all of them less `<arch>.attention.shared_kv_layers`, which
+    /// reuse an earlier layer's cache.
+    pub owning_layers: usize,
+    /// `<arch>.attention.head_count_kv`: one value for every layer, or one per layer.
+    pub kv_heads: Vec<u64>,
+    /// K and V widths per head on a full-attention layer.
+    pub key_length: u64,
+    pub value_length: u64,
+    /// `<arch>.attention.key_length_swa` / `value_length_swa`: the widths on a sliding-window
+    /// layer; the full widths are used where the header does not say.
+    pub key_length_swa: Option<u64>,
+    pub value_length_swa: Option<u64>,
+    /// `<arch>.attention.sliding_window_pattern`, one flag per layer, `true` for a layer that
+    /// slides. `None` where the header has no per-layer pattern.
+    pub sliding: Option<Vec<bool>>,
+    /// `<arch>.attention.sliding_window`, positions a sliding layer attends to; 0 when none.
+    pub n_swa: u64,
+}
+
+impl KvMeta {
+    /// The layout the GGUF at `path` declares, read from its header with ggml's own reader and
+    /// no tensor data.
+    ///
+    /// From the file, not `LlamaModel::meta_val_str`: llama.cpp keeps only scalar metadata as
+    /// strings (`llama_model_base::load_hparams` skips every array), so the per-layer
+    /// `sliding_window_pattern`, and a per-layer `head_count_kv`, never reach the model's
+    /// metadata. Read that way on the Orin, Gemma 4 E4B had no pattern and was charged in full.
+    pub(super) fn read(path: &Path) -> Result<Self, String> {
+        let header = GgufHeader::open(path)?;
+        let arch = header
+            .string("general.architecture")
+            .ok_or("no general.architecture")?;
+        let key = |name: &str| format!("{arch}.{name}");
+        let required = |name: &str| {
+            header
+                .uint(&key(name))
+                .filter(|&n| n > 0)
+                .ok_or_else(|| format!("no {}", key(name)))
+        };
+        let layers = required("block_count")?;
+        let n_head = required("attention.head_count")?;
+        let head_dim = required("embedding_length")? / n_head;
+        let key_length = header
+            .uint(&key("attention.key_length"))
+            .unwrap_or(head_dim);
+        let value_length = header
+            .uint(&key("attention.value_length"))
+            .unwrap_or(head_dim);
+        let shared = header.uint(&key("attention.shared_kv_layers")).unwrap_or(0);
+        Ok(Self {
+            owning_layers: usize::try_from(layers.saturating_sub(shared))
+                .map_err(|e| e.to_string())?,
+            // llama.cpp's default when the header has none: one KV head per query head.
+            kv_heads: header
+                .uints(&key("attention.head_count_kv"))
+                .unwrap_or_else(|| vec![n_head]),
+            key_length,
+            value_length,
+            key_length_swa: header.uint(&key("attention.key_length_swa")),
+            value_length_swa: header.uint(&key("attention.value_length_swa")),
+            sliding: header.flags(&key("attention.sliding_window_pattern")),
+            n_swa: header.uint(&key("attention.sliding_window")).unwrap_or(0),
+        })
+    }
+
+    /// What `model` itself says, for a file whose header cannot be read: its scalar metadata
+    /// only, so never a sliding pattern. KV heads are layer 0's, as llama.cpp reports them, and
+    /// widths default to the head dimension. `None` when the model reports no layers or heads.
+    fn of_model(model: &llama_cpp_2::model::LlamaModel) -> Option<Self> {
+        let arch = model.meta_val_str("general.architecture").ok()?;
+        let number = |key: &str| {
+            model
+                .meta_val_str(&format!("{arch}.{key}"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        };
+        let layers = u64::from(model.n_layer());
+        let n_head = u64::from(model.n_head());
+        let n_embd = u64::try_from(model.n_embd()).ok()?;
+        if layers == 0 || n_head == 0 {
+            return None;
+        }
+        let head_dim = n_embd / n_head;
+        let shared = number("attention.shared_kv_layers").unwrap_or(0);
+        Some(Self {
+            owning_layers: usize::try_from(layers.saturating_sub(shared)).ok()?,
+            kv_heads: vec![u64::from(model.n_head_kv())],
+            key_length: number("attention.key_length").unwrap_or(head_dim),
+            value_length: number("attention.value_length").unwrap_or(head_dim),
+            key_length_swa: number("attention.key_length_swa"),
+            value_length_swa: number("attention.value_length_swa"),
+            sliding: None,
+            n_swa: number("attention.sliding_window").unwrap_or(0),
+        })
+    }
+
+    /// The header key whose absence leaves a model that slides charged in full: one that
+    /// declares a window, sliding widths or a pattern but not all that [`Self::geometry`]
+    /// needs. `None` when nothing slides or nothing is missing.
+    pub(super) fn missing_sliding_key(&self) -> Option<&'static str> {
+        let slides = self.n_swa > 0
+            || self.key_length_swa.is_some()
+            || self.value_length_swa.is_some()
+            || self.sliding.is_some();
+        match &self.sliding {
+            _ if !slides => None,
+            None => Some("attention.sliding_window_pattern"),
+            Some(_) if self.n_swa == 0 => Some("attention.sliding_window"),
+            Some(pattern) if pattern.len() < self.owning_layers => {
+                Some("attention.sliding_window_pattern (shorter than the KV layers)")
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// The geometry these figures give; `None` when no layer allocates any KV.
+    ///
+    /// A layer slides only when the header says so per layer and declares a window: without
+    /// the pattern every owning layer is charged as full attention, which is what llama.cpp
+    /// allocates at most. A `head_count_kv` list shorter than the layers is read at its largest.
+    pub(super) fn geometry(&self) -> Option<KvGeometry> {
+        let pattern = self
+            .sliding
+            .as_deref()
+            .filter(|p| self.n_swa > 0 && p.len() >= self.owning_layers);
+        let widest_heads = self.kv_heads.iter().copied().max().unwrap_or(0);
+        let key_length_swa = self.key_length_swa.unwrap_or(self.key_length);
+        let value_length_swa = self.value_length_swa.unwrap_or(self.value_length);
+        let mut geometry = KvGeometry {
+            full_k: 0,
+            full_v: 0,
+            sliding_k: 0,
+            sliding_v: 0,
+            full_layers: 0,
+            sliding_layers: 0,
+            n_swa: self.n_swa,
+        };
+        for layer in 0..self.owning_layers {
+            let heads = match self.kv_heads.as_slice() {
+                [one] => *one,
+                per_layer if per_layer.len() >= self.owning_layers => per_layer[layer],
+                _ => widest_heads,
+            };
+            if pattern.is_some_and(|p| p[layer]) {
+                geometry.sliding_k += heads * key_length_swa;
+                geometry.sliding_v += heads * value_length_swa;
+                geometry.sliding_layers += 1;
+            } else {
+                geometry.full_k += heads * self.key_length;
+                geometry.full_v += heads * self.value_length;
+                geometry.full_layers += 1;
+            }
+        }
+        if geometry.sliding_layers == 0 {
+            geometry.n_swa = 0;
+        }
+        (geometry.full_k + geometry.full_v + geometry.sliding_k + geometry.sliding_v > 0)
+            .then_some(geometry)
+    }
+}
+
+/// The KV layout of `model`, loaded from `path`, as the fit charges it: read from the file's
+/// header ([`KvMeta::read`]), else from the model's scalar metadata. A model that slides but
+/// whose layout says not which layers do is charged every layer the whole window, logged as
+/// `kind="kv_estimate_fallback"` with the key that was missing (or why the header was
+/// unreadable), since that bound can cost it most of its window.
+pub(super) fn kv_geometry(
+    model_id: &str,
+    model: &llama_cpp_2::model::LlamaModel,
+    path: &Path,
+) -> Option<KvGeometry> {
+    let meta = match KvMeta::read(path) {
+        Ok(meta) => meta,
+        Err(error) => {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "kv_estimate_fallback",
+                model = model_id,
+                file = %path.display(),
+                missing_key = "gguf header",
+                error = %error,
+                "could not read the model's KV layout from its file; using what the loaded model reports"
+            );
+            KvMeta::of_model(model)?
+        }
+    };
+    if let Some(missing_key) = meta.missing_sliding_key() {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "kv_estimate_fallback",
+            model = model_id,
+            file = %path.display(),
+            missing_key,
+            n_swa = meta.n_swa,
+            owning_layers = meta.owning_layers,
+            "the model slides but its header does not say which layers; charging every KV layer the whole window"
+        );
+    }
+    meta.geometry()
+}
+
+/// A GGUF file's metadata, read with ggml's own reader (`gguf_init_from_file` with no tensor
+/// data); freed on drop. Every getter checks the stored type first, since ggml aborts the
+/// process on a getter of the wrong type.
+struct GgufHeader(std::ptr::NonNull<llama_cpp_sys_2::gguf_context>);
+
+impl GgufHeader {
+    fn open(path: &Path) -> Result<Self, String> {
+        let name = path
+            .to_str()
+            .and_then(|p| std::ffi::CString::new(p).ok())
+            .ok_or_else(|| format!("{} is not a C path", path.display()))?;
+        let params = llama_cpp_sys_2::gguf_init_params {
+            no_alloc: true,
+            ctx: std::ptr::null_mut(),
+        };
+        // SAFETY: `name` is a NUL-terminated string that outlives the call; with `no_alloc` and
+        // no ggml context requested, ggml reads the header and allocates no tensor data.
+        let ctx = unsafe { llama_cpp_sys_2::gguf_init_from_file(name.as_ptr(), params) };
+        std::ptr::NonNull::new(ctx)
+            .map(Self)
+            .ok_or_else(|| format!("ggml could not read the GGUF header of {}", path.display()))
+    }
+
+    fn ctx(&self) -> *const llama_cpp_sys_2::gguf_context {
+        self.0.as_ptr()
+    }
+
+    /// The key's id and stored type, `None` when the header has no such key.
+    fn find(&self, key: &str) -> Option<(i64, llama_cpp_sys_2::gguf_type)> {
+        let key = std::ffi::CString::new(key).ok()?;
+        // SAFETY: a live context and a NUL-terminated key; an id is checked before use.
+        let id = unsafe { llama_cpp_sys_2::gguf_find_key(self.ctx(), key.as_ptr()) };
+        // SAFETY: `id` is a valid key id of this context.
+        (id >= 0).then(|| {
+            (id, unsafe {
+                llama_cpp_sys_2::gguf_get_kv_type(self.ctx(), id)
+            })
+        })
+    }
+
+    /// An unsigned or non-negative integer scalar.
+    fn uint(&self, key: &str) -> Option<u64> {
+        use llama_cpp_sys_2 as sys;
+        let (id, kind) = self.find(key)?;
+        let ctx = self.ctx();
+        // SAFETY: each getter is called only for the type the header stores under `id`.
+        unsafe {
+            match kind {
+                sys::GGUF_TYPE_UINT8 => Some(u64::from(sys::gguf_get_val_u8(ctx, id))),
+                sys::GGUF_TYPE_UINT16 => Some(u64::from(sys::gguf_get_val_u16(ctx, id))),
+                sys::GGUF_TYPE_UINT32 => Some(u64::from(sys::gguf_get_val_u32(ctx, id))),
+                sys::GGUF_TYPE_UINT64 => Some(sys::gguf_get_val_u64(ctx, id)),
+                sys::GGUF_TYPE_INT32 => u64::try_from(sys::gguf_get_val_i32(ctx, id)).ok(),
+                sys::GGUF_TYPE_INT64 => u64::try_from(sys::gguf_get_val_i64(ctx, id)).ok(),
+                _ => None,
+            }
+        }
+    }
+
+    fn string(&self, key: &str) -> Option<String> {
+        let (id, kind) = self.find(key)?;
+        (kind == llama_cpp_sys_2::GGUF_TYPE_STRING).then(|| {
+            // SAFETY: a string-typed key; ggml returns a NUL-terminated string the context owns.
+            unsafe { std::ffi::CStr::from_ptr(llama_cpp_sys_2::gguf_get_val_str(self.ctx(), id)) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    /// The elements of an array-typed key whose elements are `element`, each `width` bytes,
+    /// mapped through `read`.
+    fn array<T>(
+        &self,
+        id: i64,
+        element: llama_cpp_sys_2::gguf_type,
+        width: usize,
+        read: impl Fn(&[u8]) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        use llama_cpp_sys_2 as sys;
+        let ctx = self.ctx();
+        // SAFETY: `id` is an array-typed key of this context (checked by the callers).
+        if unsafe { sys::gguf_get_arr_type(ctx, id) } != element {
+            return None;
+        }
+        // SAFETY: as above; a non-string array's data is `n` packed elements of its type, owned
+        // by the context for its lifetime, which outlives this borrow.
+        let bytes = unsafe {
+            let n = sys::gguf_get_arr_n(ctx, id);
+            let data = sys::gguf_get_arr_data(ctx, id).cast::<u8>();
+            std::slice::from_raw_parts(data, n.checked_mul(width)?)
+        };
+        bytes.chunks_exact(width).map(read).collect()
+    }
+
+    /// An integer scalar as one value, or an array of unsigned 32-bit integers as one per layer.
+    fn uints(&self, key: &str) -> Option<Vec<u64>> {
+        let (id, kind) = self.find(key)?;
+        if kind != llama_cpp_sys_2::GGUF_TYPE_ARRAY {
+            return self.uint(key).map(|one| vec![one]);
+        }
+        self.array(id, llama_cpp_sys_2::GGUF_TYPE_UINT32, 4, |b| {
+            Some(u64::from(u32::from_le_bytes(b.try_into().ok()?)))
+        })
+    }
+
+    /// A bool scalar as one flag, or an array of bools as one per layer.
+    fn flags(&self, key: &str) -> Option<Vec<bool>> {
+        use llama_cpp_sys_2 as sys;
+        let (id, kind) = self.find(key)?;
+        match kind {
+            // SAFETY: a bool-typed scalar key.
+            sys::GGUF_TYPE_BOOL => Some(vec![unsafe { sys::gguf_get_val_bool(self.ctx(), id) }]),
+            sys::GGUF_TYPE_ARRAY => self.array(id, sys::GGUF_TYPE_BOOL, 1, |b| Some(b[0] != 0)),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for GgufHeader {
+    fn drop(&mut self) {
+        // SAFETY: the context `open` created, freed once.
+        unsafe { llama_cpp_sys_2::gguf_free(self.0.as_ptr()) }
+    }
+}
+
+/// What a KV cache costs: K and V elements per cached position, summed over the layers that
+/// keep every position and over the sliding-window layers, which under the windowed cache
+/// (`swa_full = false`) keep only their window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KvGeometry {
+    pub full_k: u64,
+    pub full_v: u64,
+    pub sliding_k: u64,
+    pub sliding_v: u64,
+    pub full_layers: u64,
+    pub sliding_layers: u64,
+    /// The sliding window; 0 when no layer slides.
+    pub n_swa: u64,
+}
+
+impl KvGeometry {
+    /// What a cache of these types costs, for contexts built with `n_ubatch` (`None`, llama.cpp's
+    /// default). Logged in `kind="context_sized"` as `kv_kib_per_token` and `sliding_kv_mb`.
+    pub(super) fn cost(
+        &self,
+        type_k: Option<&str>,
+        type_v: Option<&str>,
+        n_ubatch: Option<u32>,
+    ) -> KvCost {
+        let bytes =
+            |k: u64, v: u64| (k * bytes_per_32(type_k) + v * bytes_per_32(type_v)).div_ceil(32);
+        KvCost {
+            bytes_per_token: bytes(self.full_k, self.full_v),
+            sliding_bytes: bytes(self.sliding_k, self.sliding_v)
+                * sliding_cells(self.n_swa, n_ubatch),
+        }
+    }
+}
+
+/// The cells llama.cpp gives the sliding-window layers of one sequence (`llama_kv_cache_iswa`):
+/// `GGML_PAD(min(n_ctx, n_swa + n_ubatch), 256)`. Charged at its most, as though `n_ctx` were
+/// always the wider, and with `n_ubatch` at least [`SLIDING_UBATCH_FLOOR`]: an estimate that
+/// guards against running out of memory may be high, never low.
+pub(super) fn sliding_cells(n_swa: u64, n_ubatch: Option<u32>) -> u64 {
+    if n_swa == 0 {
+        return 0;
+    }
+    let ubatch = n_ubatch
+        .unwrap_or(SLIDING_UBATCH_FLOOR)
+        .max(SLIDING_UBATCH_FLOOR);
+    (n_swa + u64::from(ubatch)).next_multiple_of(SLIDING_CELL_PAD)
+}
+
+/// A KV cache's bytes: a part that grows with the window and a part fixed by the sliding window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KvCost {
+    /// Bytes per position of the window, on the full-attention layers.
+    pub bytes_per_token: u64,
+    /// Bytes of the sliding-window layers' cache, whatever the window.
+    pub sliding_bytes: u64,
+}
+
+impl KvCost {
+    /// The cache for a window of `n_ctx`.
+    pub(super) fn bytes(&self, n_ctx: u64) -> u64 {
+        n_ctx
+            .saturating_mul(self.bytes_per_token)
+            .saturating_add(self.sliding_bytes)
+    }
+}
+
+/// Bytes per 32 cache elements for a ggml KV type name; f16 when unset or unknown, which is
+/// what `build_context_params` falls back to.
+fn bytes_per_32(type_name: Option<&str>) -> u64 {
+    match type_name.map(str::to_ascii_lowercase).as_deref() {
+        Some("f32") => 128,
+        Some("q8_0") => 34,
+        Some("q5_1") => 24,
+        Some("q5_0") => 22,
+        Some("q4_1") => 20,
+        Some("q4_0") | Some("iq4_nl") => 18,
+        _ => 64,
+    }
+}
+
+/// Why a window came out the size it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FitReason {
+    /// The requested window fits.
+    Requested,
+    /// A narrower rung of [`CONTEXT_LADDER`] fits; the requested one does not.
+    Reduced,
+    /// Nothing at or above [`CONTEXT_FLOOR`] fits; the floor is handed out anyway.
+    Floor,
+}
+
+impl FitReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested_fits",
+            Self::Reduced => "reduced_to_fit",
+            Self::Floor => "floor",
+        }
+    }
+}
+
+/// A window and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ContextFit {
+    pub n_ctx: usize,
+    pub reason: FitReason,
+}
+
+/// The widest window, at most `requested`, whose KV cache fits `budget` bytes: `requested` itself,
+/// else the widest narrower rung of [`CONTEXT_LADDER`], else [`CONTEXT_FLOOR`] (or `requested`
+/// when that is smaller still). Never widens a window.
+pub(super) fn fit_context(requested: usize, kv_bytes_per_token: u64, budget: u64) -> ContextFit {
+    let fits = |n_ctx: usize| (n_ctx as u64).saturating_mul(kv_bytes_per_token) <= budget;
+    if fits(requested) {
+        return ContextFit {
+            n_ctx: requested,
+            reason: FitReason::Requested,
+        };
+    }
+    match CONTEXT_LADDER
+        .iter()
+        .copied()
+        .find(|&rung| rung < requested && rung >= CONTEXT_FLOOR && fits(rung))
+    {
+        Some(n_ctx) => ContextFit {
+            n_ctx,
+            reason: FitReason::Reduced,
+        },
+        None => ContextFit {
+            n_ctx: requested.min(CONTEXT_FLOOR),
+            reason: FitReason::Floor,
+        },
+    }
+}
+
+/// The memory one loaded model may spend on a context, fixed when it loads.
+///
+/// Measured once, after the weights and the drafter are in and their files released, so every
+/// request for the same window gets the same answer: a window that moved with free memory would
+/// rebuild the retained context and change the preamble snapshot's key turn by turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MemoryFit {
+    /// The KV cache's cost in the chosen types.
+    pub kv: KvCost,
+    /// `MemFree` at load, less the picture encoder's weights when the model has one.
+    pub free_bytes: u64,
+    /// The element type [`choose_kv_cache`] put both K and V in, in place of the settings' own;
+    /// `None` keeps the settings'. `kv` is this type's cost.
+    pub kv_type: Option<&'static str>,
+}
+
+impl MemoryFit {
+    /// Bytes a KV cache may take: free memory less the compute reserve and the safety margin.
+    pub(super) fn kv_budget(&self) -> u64 {
+        self.free_bytes
+            .saturating_sub(COMPUTE_RESERVE_BYTES)
+            .saturating_sub(SAFETY_MARGIN_BYTES)
+    }
+
+    pub(super) fn fit(&self, requested: usize) -> ContextFit {
+        // The sliding-window cache is the same size whatever the window, so it comes off the
+        // budget before the window is fitted to the rest.
+        fit_context(
+            requested,
+            self.kv.bytes_per_token,
+            self.kv_budget().saturating_sub(self.kv.sliding_bytes),
+        )
+    }
+}
+
+/// `settings` with the KV cache type the fit chose at load, so every context a turn builds, the
+/// preamble snapshot's key and an allocation failure's estimate all agree with the window the fit
+/// sized. Borrowed unchanged when the fit kept the settings' types, or there is no fit.
+pub(super) fn with_fitted_kv_type(
+    settings: &ModelSettings,
+    fit: Option<MemoryFit>,
+) -> Cow<'_, ModelSettings> {
+    match fit.and_then(|f| f.kv_type) {
+        Some(kv_type) => Cow::Owned(ModelSettings {
+            type_k: Some(kv_type.to_string()),
+            type_v: Some(kv_type.to_string()),
+            ..settings.clone()
+        }),
+        None => Cow::Borrowed(settings),
+    }
+}
+
+// ── The KV cache type free memory affords ───────────────────────────────────
+
+/// The type [`KvCachePolicy::Q8WhenTight`](crate::local_model_registry::KvCachePolicy::Q8WhenTight)
+/// falls back to: 34 bytes per 32 elements against f16's 64, so about half the KV per token.
+pub(super) const TIGHT_KV_TYPE: &str = "q8_0";
+
+/// The narrowest window the settings' own KV types may be left before q8_0 is chosen instead.
+///
+/// The preamble alone (system text plus tool schemas) is ~3,300 tokens for Gemma 4 E4B on the
+/// Orin (~4,500 with every tool group, see [`CONTEXT_FLOOR`]), so 8,192 is the narrowest rung
+/// of [`CONTEXT_LADDER`] that leaves a turn about as much again for tool results and the answer:
+/// a scheduled briefing reads several tools before it writes. Below it the turn runs out of
+/// window, which fails the task; q8_0 costs 5-8% of decode speed at depth (llama-bench on the
+/// Orin, E4B QAT at depth 8,192: f16 18.1 tok/s, q8_0 16.7), which only slows it. At or above
+/// it f16 is kept for that speed.
+pub(super) const KV_TIGHT_WINDOW: usize = 8_192;
+
+/// The KV cache a load chose, and the window each candidate type would have had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KvChoice {
+    /// The fit in the chosen type.
+    pub fit: MemoryFit,
+    /// The window in the settings' own types.
+    pub preferred: ContextFit,
+    /// The window in [`TIGHT_KV_TYPE`]; `None` when it was no candidate.
+    pub quantized: Option<ContextFit>,
+}
+
+impl KvChoice {
+    /// Why the choice came out as it did, for `kind="kv_cache_type_chosen"`.
+    pub(super) fn reason(&self) -> &'static str {
+        match self.quantized {
+            None => "no_candidate",
+            Some(_) if self.fit.kv_type.is_some() => "tight",
+            Some(_) if self.preferred.n_ctx >= KV_TIGHT_WINDOW => "roomy",
+            Some(_) if self.preferred.reason == FitReason::Requested => "requested_fits",
+            Some(_) => "q8_no_wider",
+        }
+    }
+}
+
+/// Choose the KV cache type for a load with `free_bytes` free: the settings' own types
+/// (`preferred`), unless the window they leave for `requested` is under [`KV_TIGHT_WINDOW`] and
+/// [`TIGHT_KV_TYPE`] (`quantized`, `None` when it is no candidate) leaves a strictly wider one.
+/// Same window, the faster type is kept.
+pub(super) fn choose_kv_cache(
+    requested: usize,
+    free_bytes: u64,
+    preferred: KvCost,
+    quantized: Option<KvCost>,
+) -> KvChoice {
+    let preferred_fit = MemoryFit {
+        kv: preferred,
+        free_bytes,
+        kv_type: None,
+    };
+    let candidate = quantized.map(|kv| MemoryFit {
+        kv,
+        free_bytes,
+        kv_type: Some(TIGHT_KV_TYPE),
+    });
+    let preferred = preferred_fit.fit(requested);
+    let quantized = candidate.map(|fit| fit.fit(requested));
+    let fit = match (candidate, quantized) {
+        (Some(candidate), Some(q))
+            if preferred.n_ctx < KV_TIGHT_WINDOW && q.n_ctx > preferred.n_ctx =>
+        {
+            candidate
+        }
+        _ => preferred_fit,
+    };
+    KvChoice {
+        fit,
+        preferred,
+        quantized,
+    }
+}
+
+/// Classify an allocation that failed: out of GPU memory when free memory, read now, is short of
+/// `needed_mb` plus the safety margin. `None` (some other failure) when free memory is plenty or
+/// cannot be read.
+pub(super) fn out_of_gpu_memory(
+    stage: LoadStage,
+    needed_mb: u64,
+    now: Option<MemInfo>,
+) -> Option<ModelLoadError> {
+    let free_mb = mib(now?.free);
+    (free_mb < needed_mb.saturating_add(mib(SAFETY_MARGIN_BYTES))).then_some(
+        ModelLoadError::OutOfGpuMemory {
+            stage,
+            needed_mb,
+            free_mb,
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    const ORIN_MEMINFO: &str = "MemTotal:        7802364 kB\n\
+                                MemFree:          257024 kB\n\
+                                MemAvailable:    4561920 kB\n\
+                                Buffers:           12340 kB\n\
+                                Cached:          4194304 kB\n\
+                                SwapCached:            0 kB\n";
+
+    #[test]
+    fn meminfo_reads_free_cached_and_available_in_bytes() {
+        let info = MemInfo::parse(ORIN_MEMINFO).expect("parses");
+        assert_eq!(info.free, 257_024 * 1024);
+        assert_eq!(info.cached, 4_194_304 * 1024, "Cached, not SwapCached");
+        assert_eq!(info.available, 4_561_920 * 1024);
+    }
+
+    #[test]
+    fn meminfo_without_a_field_is_unreadable() {
+        assert_eq!(
+            MemInfo::parse("MemTotal: 1 kB\nMemFree: 1 kB\nCached: 1 kB\n"),
+            None
+        );
+        assert_eq!(
+            MemInfo::parse("MemFree: lots\nCached: 1 kB\nMemAvailable: 1 kB\n"),
+            None
+        );
+        assert_eq!(MemInfo::parse(""), None);
+    }
+
+    #[test]
+    fn a_maps_line_names_the_file_and_its_permissions() {
+        let line = "ffff8a000000-ffff96000000 r--s 00000000 103:02 1234567    \
+                    /home/giap/models/gguf/gemma 4 E4B.gguf";
+        let mapping = Mapping::parse(line).expect("parses");
+        assert_eq!(mapping.start, 0xffff_8a00_0000);
+        assert_eq!(mapping.end, 0xffff_9600_0000);
+        assert!(mapping.shared && !mapping.writable);
+        assert_eq!(mapping.inode, 1_234_567);
+        assert_eq!(
+            mapping.path,
+            PathBuf::from("/home/giap/models/gguf/gemma 4 E4B.gguf")
+        );
+        let path = Path::new("/home/giap/models/gguf/gemma 4 E4B.gguf");
+        assert!(mapping.is_read_only_view_of(1_234_567, path));
+        assert!(
+            !mapping.is_read_only_view_of(7, path),
+            "another file at that path"
+        );
+    }
+
+    #[test]
+    fn only_a_read_only_shared_file_mapping_is_released() {
+        let path = Path::new("/m.gguf");
+        for (line, expected) in [
+            ("1000-2000 r--s 0 103:02 9 /m.gguf", true),
+            ("1000-2000 rw-s 0 103:02 9 /m.gguf", false),
+            ("1000-2000 r--p 0 103:02 9 /m.gguf", false),
+            ("1000-2000 r--s 0 103:02 9 /other.gguf", false),
+        ] {
+            let mapping = Mapping::parse(line).expect("parses");
+            assert_eq!(mapping.is_read_only_view_of(9, path), expected, "{line}");
+        }
+        assert_eq!(
+            Mapping::parse("1000-2000 rw-p 00000000 00:00 0"),
+            None,
+            "anonymous"
+        );
+        assert_eq!(Mapping::parse("garbage"), None);
+    }
+
+    /// Records each release instead of advising a kernel.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<PathBuf>>);
+
+    impl PageCache for Recording {
+        fn release(&self, path: &Path) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_model_file_is_released() {
+        let cache = Recording::default();
+        let (target, drafter) = (Path::new("/m/target.gguf"), Path::new("/m/drafter.gguf"));
+        release_files(&cache, &[target, drafter], "test");
+        assert_eq!(
+            *cache.0.lock().unwrap(),
+            vec![target.to_path_buf(), drafter.to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn a_load_is_released_once_per_step_of_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(3 * 1024 * MIB).unwrap();
+        let cache = Arc::new(Recording::default());
+        let mut release = LoadProgressRelease::new(cache.clone(), &path);
+        for i in 0..=1000 {
+            assert!(
+                release.on_progress(i as f32 / 1000.0),
+                "never aborts the load"
+            );
+        }
+        // 3 GiB in steps of 256 MiB.
+        assert_eq!(release.releases(), 12);
+        assert_eq!(cache.0.lock().unwrap().len(), 12);
+        assert!(cache.0.lock().unwrap().iter().all(|p| *p == path));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kernel_accepts_the_release_of_a_mapped_file() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&vec![7u8; 4 * MIB as usize]).unwrap();
+        file.flush().unwrap();
+        let len = 4 * MIB as usize;
+        // SAFETY: a read-only shared mapping of a file this test owns, unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        // SAFETY: within the mapping just made.
+        let before = unsafe { *(addr as *const u8).add(len - 1) };
+        SystemPageCache
+            .release(file.path())
+            .expect("fadvise and madvise accepted");
+        // SAFETY: as above; a released page reads back from the file.
+        let after = unsafe { *(addr as *const u8).add(len - 1) };
+        assert_eq!((before, after), (7, 7));
+        // SAFETY: the mapping made above, unmapped once.
+        unsafe { libc::munmap(addr, len) };
+    }
+
+    /// Every owning layer full attention: what a header without a sliding-window pattern gets.
+    fn all_full() -> KvGeometry {
+        KvMeta {
+            owning_layers: 24,
+            kv_heads: vec![2],
+            key_length: 512,
+            value_length: 512,
+            key_length_swa: Some(256),
+            value_length_swa: Some(256),
+            sliding: None,
+            n_swa: 512,
+        }
+        .geometry()
+        .expect("has KV")
+    }
+
+    /// Gemma 4 E4B's header (`gemma-4-E4B-it-Q4_K_M.gguf`): 42 layers, the last 18 sharing an
+    /// earlier layer's KV, 2 KV heads, 512-wide full-attention and 256-wide sliding heads, a
+    /// 512-position window, and five sliding layers to each full one.
+    fn e4b_meta() -> KvMeta {
+        KvMeta {
+            owning_layers: 42 - 18,
+            kv_heads: vec![2],
+            key_length: 512,
+            value_length: 512,
+            key_length_swa: Some(256),
+            value_length_swa: Some(256),
+            sliding: Some(
+                [true, true, true, true, true, false]
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(42)
+                    .collect(),
+            ),
+            n_swa: 512,
+        }
+    }
+
+    fn e4b() -> KvGeometry {
+        e4b_meta().geometry().expect("has KV")
+    }
+
+    #[test]
+    fn kv_cost_follows_the_cache_types() {
+        let f16 = all_full().cost(None, None, None);
+        assert_eq!(f16.bytes_per_token, 24 * 2 * (512 + 512) * 2);
+        assert_eq!(f16.sliding_bytes, 0, "nothing slides without a pattern");
+        assert_eq!(all_full().cost(Some("F16"), Some("f16"), None), f16);
+        assert_eq!(
+            all_full()
+                .cost(Some("q8_0"), Some("q8_0"), None)
+                .bytes_per_token,
+            f16.bytes_per_token * 34 / 64
+        );
+        assert_eq!(
+            all_full().cost(Some("f32"), None, None).bytes_per_token,
+            f16.bytes_per_token * 3 / 2
+        );
+        assert_eq!(
+            all_full().cost(Some("mystery"), None, None),
+            f16,
+            "unknown is f16"
+        );
+    }
+
+    #[test]
+    fn only_the_full_attention_layers_grow_with_the_window() {
+        let g = e4b();
+        assert_eq!((g.full_layers, g.sliding_layers, g.n_swa), (4, 20, 512));
+        let f16 = g.cost(None, None, Some(512));
+        assert_eq!(f16.bytes_per_token, 4 * 2 * (512 + 512) * 2);
+        // 20 layers x 2 heads x (256 + 256) x 2 bytes, over GGML_PAD(512 + 512, 256) cells.
+        assert_eq!(f16.sliding_bytes, 20 * 2 * (256 + 256) * 2 * 1_024);
+        assert_eq!(
+            f16.bytes(4_096) - f16.bytes(2_048),
+            2_048 * f16.bytes_per_token
+        );
+    }
+
+    /// The Orin's measurement, E4B at 16K with the windowed cache: 286 MiB in f16 and 152 in
+    /// q8_0, built with `n_ubatch` 256. llama.cpp's sizing reproduces both exactly; the estimate
+    /// charges the 512 a picture turn raises it to, a few percent over and never under.
+    #[test]
+    fn the_estimate_covers_the_measured_cache_by_a_few_percent() {
+        let g = e4b();
+        let measured_cells = (512 + 256_u64).next_multiple_of(256);
+        for (type_name, measured_mib) in [("f16", 286), ("q8_0", 152)] {
+            let cost = g.cost(Some(type_name), Some(type_name), Some(256));
+            let per_cell = cost.sliding_bytes / sliding_cells(512, Some(256));
+            let llama_cpp = 16_384 * cost.bytes_per_token + per_cell * measured_cells;
+            // llama.cpp logs MiB to two places; 151.94 is the 152 measured in q8_0.
+            assert_eq!(llama_cpp.div_ceil(MIB), measured_mib, "{type_name}");
+            let estimate = cost.bytes(16_384);
+            assert!(estimate >= measured_mib * MIB, "{type_name}: never under");
+            assert!(
+                estimate * 100 <= measured_mib * MIB * 104,
+                "{type_name}: {} MiB",
+                estimate / MIB
+            );
+        }
+        // The bound it replaces charged all 24 layers the whole window at the full width.
+        assert_eq!(all_full().cost(None, None, None).bytes(16_384) / MIB, 1_536);
+    }
+
+    #[test]
+    fn the_sliding_cache_is_sized_as_llama_cpp_sizes_it() {
+        assert_eq!(sliding_cells(512, Some(512)), 1_024);
+        assert_eq!(sliding_cells(512, Some(1_000)), 1_536, "padded to 256");
+        assert_eq!(
+            sliding_cells(512, Some(128)),
+            1_024,
+            "a picture turn's 512 at least"
+        );
+        assert_eq!(sliding_cells(512, None), 1_024, "llama.cpp's default batch");
+        assert_eq!(
+            sliding_cells(0, Some(512)),
+            0,
+            "no window, no sliding cache"
+        );
+    }
+
+    #[test]
+    fn a_header_that_does_not_say_which_layers_slide_is_charged_in_full() {
+        let without_window = KvMeta {
+            n_swa: 0,
+            ..e4b_meta()
+        };
+        let short_pattern = KvMeta {
+            sliding: Some(vec![true; 10]),
+            ..e4b_meta()
+        };
+        for meta in [without_window, short_pattern] {
+            let g = meta.geometry().expect("has KV");
+            assert_eq!((g.full_layers, g.sliding_layers, g.n_swa), (24, 0, 0));
+            assert_eq!(g, all_full());
+        }
+        let nothing = KvMeta {
+            owning_layers: 0,
+            ..e4b_meta()
+        };
+        assert_eq!(nothing.geometry(), None);
+    }
+
+    #[test]
+    fn kv_heads_may_be_given_per_layer() {
+        let per_layer = KvMeta {
+            kv_heads: (0..24)
+                .map(|layer| if layer % 6 == 5 { 4 } else { 1 })
+                .collect(),
+            ..e4b_meta()
+        }
+        .geometry()
+        .expect("has KV");
+        assert_eq!(per_layer.full_k, 4 * 4 * 512);
+        assert_eq!(per_layer.sliding_k, 20 * 256);
+        // A list that does not cover the layers is read at its widest.
+        let short = KvMeta {
+            kv_heads: vec![1, 3],
+            ..e4b_meta()
+        }
+        .geometry()
+        .expect("has KV");
+        assert_eq!(short.full_k, 4 * 3 * 512);
+    }
+
+    /// A header-only GGUF written with ggml's own writer: `u32` scalars, `bool` arrays and a
+    /// string, as `gguf_init_from_file` will read them back.
+    fn write_header(dir: &Path, entries: &[(&str, HeaderValue)]) -> PathBuf {
+        use llama_cpp_sys_2 as sys;
+        use std::ffi::CString;
+        let path = dir.join("header.gguf");
+        // SAFETY: a fresh context, filled with NUL-terminated keys and values that outlive each
+        // call, written once and freed once.
+        unsafe {
+            let ctx = sys::gguf_init_empty();
+            for (key, value) in entries {
+                let key = CString::new(*key).unwrap();
+                match value {
+                    HeaderValue::U32(v) => sys::gguf_set_val_u32(ctx, key.as_ptr(), *v),
+                    HeaderValue::F32(v) => sys::gguf_set_val_f32(ctx, key.as_ptr(), *v),
+                    HeaderValue::Str(v) => {
+                        let v = CString::new(*v).unwrap();
+                        sys::gguf_set_val_str(ctx, key.as_ptr(), v.as_ptr());
+                    }
+                    HeaderValue::Bools(v) => {
+                        let bytes: Vec<u8> = v.iter().map(|&b| u8::from(b)).collect();
+                        sys::gguf_set_arr_data(
+                            ctx,
+                            key.as_ptr(),
+                            sys::GGUF_TYPE_BOOL,
+                            bytes.as_ptr().cast(),
+                            bytes.len(),
+                        );
+                    }
+                    HeaderValue::U32s(v) => sys::gguf_set_arr_data(
+                        ctx,
+                        key.as_ptr(),
+                        sys::GGUF_TYPE_UINT32,
+                        v.as_ptr().cast(),
+                        v.len(),
+                    ),
+                }
+            }
+            let name = CString::new(path.to_str().unwrap()).unwrap();
+            assert!(sys::gguf_write_to_file(ctx, name.as_ptr(), true));
+            sys::gguf_free(ctx);
+        }
+        path
+    }
+
+    enum HeaderValue {
+        U32(u32),
+        F32(f32),
+        Str(&'static str),
+        Bools(Vec<bool>),
+        U32s(Vec<u32>),
+    }
+
+    /// The attention keys of the Orin's `gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf`, as read from the
+    /// file on 2026-11-02, with their stored types.
+    fn e4b_header() -> Vec<(&'static str, HeaderValue)> {
+        use HeaderValue::*;
+        vec![
+            ("general.architecture", Str("gemma4")),
+            ("gemma4.block_count", U32(42)),
+            ("gemma4.context_length", U32(131_072)),
+            ("gemma4.embedding_length", U32(2_560)),
+            ("gemma4.attention.head_count", U32(8)),
+            ("gemma4.attention.head_count_kv", U32(2)),
+            ("gemma4.attention.layer_norm_rms_epsilon", F32(1e-6)),
+            ("gemma4.attention.key_length", U32(512)),
+            ("gemma4.attention.value_length", U32(512)),
+            ("gemma4.attention.sliding_window", U32(512)),
+            ("gemma4.attention.shared_kv_layers", U32(18)),
+            (
+                "gemma4.attention.sliding_window_pattern",
+                Bools(
+                    [true, true, true, true, true, false]
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .take(42)
+                        .collect(),
+                ),
+            ),
+            ("gemma4.attention.key_length_swa", U32(256)),
+            ("gemma4.attention.value_length_swa", U32(256)),
+        ]
+    }
+
+    /// The array-valued pattern is what llama.cpp's model metadata drops; read from the file it
+    /// gives E4B's 4 full and 20 sliding KV layers.
+    #[test]
+    fn the_real_header_is_read_from_the_file_with_its_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_header(dir.path(), &e4b_header());
+        let meta = KvMeta::read(&path).expect("reads");
+        assert_eq!(meta, e4b_meta());
+        assert_eq!(meta.missing_sliding_key(), None);
+        assert_eq!(meta.geometry(), Some(e4b()));
+    }
+
+    #[test]
+    fn a_header_without_the_pattern_names_the_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let header: Vec<_> = e4b_header()
+            .into_iter()
+            .filter(|(key, _)| *key != "gemma4.attention.sliding_window_pattern")
+            .collect();
+        let meta = KvMeta::read(&write_header(dir.path(), &header)).expect("reads");
+        assert_eq!(meta.sliding, None);
+        assert_eq!(
+            meta.missing_sliding_key(),
+            Some("attention.sliding_window_pattern")
+        );
+        assert_eq!(meta.geometry(), Some(all_full()));
+    }
+
+    #[test]
+    fn per_layer_kv_heads_and_a_dense_model_read_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let header: Vec<_> = e4b_header()
+            .into_iter()
+            .map(|(key, value)| match key {
+                "gemma4.attention.head_count_kv" => (key, HeaderValue::U32s(vec![1; 42])),
+                _ => (key, value),
+            })
+            .collect();
+        let meta = KvMeta::read(&write_header(dir.path(), &header)).expect("reads");
+        assert_eq!(meta.kv_heads, vec![1; 42]);
+        // A dense model declares no window and nothing sliding: nothing is missing.
+        use HeaderValue::*;
+        let dense = [
+            ("general.architecture", Str("llama")),
+            ("llama.block_count", U32(28)),
+            ("llama.embedding_length", U32(3_072)),
+            ("llama.attention.head_count", U32(24)),
+            ("llama.attention.head_count_kv", U32(8)),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let meta = KvMeta::read(&write_header(dir.path(), &dense)).expect("reads");
+        assert_eq!((meta.owning_layers, meta.key_length), (28, 128));
+        assert_eq!(meta.missing_sliding_key(), None);
+        let g = meta.geometry().expect("has KV");
+        assert_eq!((g.full_layers, g.sliding_layers), (28, 0));
+    }
+
+    #[test]
+    fn an_unreadable_header_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not.gguf");
+        std::fs::write(&path, b"not a gguf").unwrap();
+        assert!(KvMeta::read(&path).is_err());
+        assert!(KvMeta::read(&dir.path().join("absent.gguf")).is_err());
+    }
+
+    #[test]
+    fn only_a_model_that_slides_can_be_missing_a_sliding_key() {
+        let no_window = KvMeta {
+            n_swa: 0,
+            ..e4b_meta()
+        };
+        assert_eq!(
+            no_window.missing_sliding_key(),
+            Some("attention.sliding_window")
+        );
+        let short = KvMeta {
+            sliding: Some(vec![true; 10]),
+            ..e4b_meta()
+        };
+        assert_eq!(
+            short.missing_sliding_key(),
+            Some("attention.sliding_window_pattern (shorter than the KV layers)")
+        );
+        let dense = KvMeta {
+            key_length_swa: None,
+            value_length_swa: None,
+            sliding: None,
+            n_swa: 0,
+            ..e4b_meta()
+        };
+        assert_eq!(dense.missing_sliding_key(), None);
+    }
+
+    /// Reads a real GGUF named by `GIAP_KV_GGUF`, e.g. the Orin's E4B.
+    #[test]
+    #[ignore = "needs a model file"]
+    fn a_real_model_file_reads_its_sliding_layers() {
+        let path = PathBuf::from(std::env::var("GIAP_KV_GGUF").expect("GIAP_KV_GGUF"));
+        let meta = KvMeta::read(&path).expect("reads");
+        assert_eq!(meta.missing_sliding_key(), None);
+        let g = meta.geometry().expect("has KV");
+        assert!(g.sliding_layers > 0, "{g:?}");
+    }
+
+    #[test]
+    fn the_requested_window_is_kept_when_it_fits() {
+        let per_token = all_full().cost(None, None, None).bytes_per_token;
+        let fit = fit_context(16_384, per_token, 16_384 * per_token);
+        assert_eq!(
+            fit,
+            ContextFit {
+                n_ctx: 16_384,
+                reason: FitReason::Requested
+            }
+        );
+        // Off the ladder, and above it, alike.
+        assert_eq!(fit_context(10_240, per_token, u64::MAX).n_ctx, 10_240);
+        assert_eq!(fit_context(131_072, per_token, u64::MAX).n_ctx, 131_072);
+    }
+
+    #[test]
+    fn a_window_that_does_not_fit_steps_down_the_ladder() {
+        let per_token = 100;
+        assert_eq!(
+            fit_context(16_384, per_token, 12_288 * per_token),
+            ContextFit {
+                n_ctx: 12_288,
+                reason: FitReason::Reduced
+            }
+        );
+        assert_eq!(
+            fit_context(16_384, per_token, 12_287 * per_token).n_ctx,
+            8_192
+        );
+        assert_eq!(
+            fit_context(10_240, per_token, 9_000 * per_token).n_ctx,
+            8_192
+        );
+        assert_eq!(
+            fit_context(16_384, per_token, 6_144 * per_token).n_ctx,
+            6_144
+        );
+        assert_eq!(
+            fit_context(16_384, per_token, 6_143 * per_token).n_ctx,
+            5_120
+        );
+    }
+
+    #[test]
+    fn the_floor_holds_whatever_free_memory_says() {
+        assert_eq!(
+            fit_context(16_384, 100, 0),
+            ContextFit {
+                n_ctx: CONTEXT_FLOOR,
+                reason: FitReason::Floor
+            }
+        );
+        assert_eq!(fit_context(16_384, 100, 4_095 * 100).n_ctx, CONTEXT_FLOOR);
+        // A window already under the floor is never widened to it.
+        assert_eq!(fit_context(2_048, 100, 0).n_ctx, 2_048);
+    }
+
+    #[test]
+    fn the_budget_keeps_the_compute_reserve_the_margin_and_the_sliding_cache() {
+        let kv = e4b().cost(None, None, None);
+        let exactly = kv.bytes(16_384) + COMPUTE_RESERVE_BYTES + SAFETY_MARGIN_BYTES;
+        let fit = MemoryFit {
+            kv,
+            free_bytes: exactly,
+            kv_type: None,
+        };
+        assert_eq!(fit.fit(16_384).reason, FitReason::Requested);
+        let short = MemoryFit {
+            free_bytes: exactly - 1,
+            ..fit
+        };
+        assert_eq!(
+            short.fit(16_384),
+            ContextFit {
+                n_ctx: 12_288,
+                reason: FitReason::Reduced
+            }
+        );
+    }
+
+    /// E4B as the Jetson stamps it (f16, `n_ubatch` 512), q8_0 the candidate.
+    fn e4b_choice(free_mb: u64) -> KvChoice {
+        choose_kv_cache(
+            16_384,
+            free_mb * MIB,
+            e4b().cost(Some("f16"), Some("f16"), Some(512)),
+            Some(e4b().cost(Some(TIGHT_KV_TYPE), Some(TIGHT_KV_TYPE), Some(512))),
+        )
+    }
+
+    /// 2026-11-02: 1,037 MB free (the encoder's 945 already taken off), a 269 MiB KV budget.
+    /// f16 at 16K needs 296 MiB, so it gets 12,288 (232 MiB), which is roomy: f16 stays.
+    #[test]
+    fn todays_load_keeps_f16_at_12288() {
+        let choice = e4b_choice(1_037);
+        assert_eq!(choice.fit.kv_budget() / MIB, 269);
+        assert_eq!(choice.preferred.n_ctx, 12_288);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(16_384));
+        assert_eq!(choice.fit.kv_type, None);
+        assert_eq!(choice.reason(), "roomy");
+    }
+
+    /// 2026-10-28: 1,419 MB free. f16 holds the whole 16,384.
+    #[test]
+    fn a_roomy_load_keeps_f16() {
+        let choice = e4b_choice(1_419);
+        assert_eq!(
+            (choice.preferred, choice.fit.kv_type, choice.reason()),
+            (
+                ContextFit {
+                    n_ctx: 16_384,
+                    reason: FitReason::Requested
+                },
+                None,
+                "roomy"
+            )
+        );
+        // f16 at exactly the threshold is roomy too: 8,192 tokens is 128 + 40 MiB.
+        let choice = e4b_choice(128 + 40 + 256 + 512);
+        assert_eq!(
+            (choice.preferred.n_ctx, choice.fit.kv_type, choice.reason()),
+            (8_192, None, "roomy")
+        );
+    }
+
+    /// A 160 MiB budget: f16 buys 6,144 tokens, q8_0 the whole 16,384.
+    #[test]
+    fn a_tight_load_takes_q8_0_and_the_wider_window() {
+        let choice = e4b_choice(160 + 768);
+        assert_eq!(choice.preferred.n_ctx, 6_144);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(16_384));
+        assert_eq!(choice.fit.kv_type, Some("q8_0"));
+        assert_eq!(
+            choice.fit.kv,
+            e4b().cost(Some("q8_0"), Some("q8_0"), Some(512))
+        );
+        assert_eq!(
+            choice.fit.fit(16_384).n_ctx,
+            16_384,
+            "the window the load keeps"
+        );
+        assert_eq!(choice.reason(), "tight");
+    }
+
+    /// A 70 MiB budget: f16 is under the floor, q8_0 reaches the 5,120 rung.
+    #[test]
+    fn a_load_at_the_floor_takes_q8_0_for_the_rung_above_it() {
+        let choice = e4b_choice(70 + 768);
+        assert_eq!(choice.preferred.n_ctx, CONTEXT_FLOOR);
+        assert_eq!(choice.preferred.reason, FitReason::Floor);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(5_120));
+        assert_eq!(choice.fit.kv_type, Some("q8_0"));
+        assert_eq!(choice.reason(), "tight");
+    }
+
+    /// Both types at the floor: same window, so the faster type stays.
+    #[test]
+    fn q8_0_is_not_taken_for_a_window_no_wider() {
+        let choice = e4b_choice(20 + 768);
+        assert_eq!(choice.preferred.n_ctx, CONTEXT_FLOOR);
+        assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(CONTEXT_FLOOR));
+        assert_eq!(choice.fit.kv_type, None);
+        assert_eq!(choice.reason(), "q8_no_wider");
+    }
+
+    #[test]
+    fn a_window_that_fits_as_requested_or_no_candidate_keeps_the_settings_types() {
+        let f16 = e4b().cost(None, None, Some(512));
+        let q8 = e4b().cost(Some("q8_0"), Some("q8_0"), Some(512));
+        // A pin under the threshold that fits is not narrowed, so there is nothing to widen.
+        let small = choose_kv_cache(4_096, 1_037 * MIB, f16, Some(q8));
+        assert_eq!(small.preferred.reason, FitReason::Requested);
+        assert_eq!(
+            (small.fit.kv_type, small.reason()),
+            (None, "requested_fits")
+        );
+        // Policy fixed, or no flash attention: q8_0 is never weighed.
+        let fixed = choose_kv_cache(16_384, (160 + 768) * MIB, f16, None);
+        assert_eq!(fixed.preferred.n_ctx, 6_144);
+        assert_eq!(
+            (fixed.quantized, fixed.fit.kv_type, fixed.reason()),
+            (None, None, "no_candidate")
+        );
+    }
+
+    #[test]
+    fn the_fitted_type_replaces_both_settings_types_and_nothing_else() {
+        let settings = ModelSettings {
+            type_k: Some("f16".to_string()),
+            type_v: Some("f16".to_string()),
+            flash_attention: Some(true),
+            context_size: Some(16_384),
+            ..ModelSettings::default()
+        };
+        let tight = e4b_choice(160 + 768).fit;
+        let fitted = with_fitted_kv_type(&settings, Some(tight));
+        assert_eq!(fitted.type_k.as_deref(), Some("q8_0"));
+        assert_eq!(fitted.type_v.as_deref(), Some("q8_0"));
+        assert_eq!(fitted.context_size, Some(16_384));
+        assert_eq!(fitted.flash_attention, Some(true));
+        let roomy = e4b_choice(4_000).fit;
+        assert!(matches!(
+            with_fitted_kv_type(&settings, Some(roomy)),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            with_fitted_kv_type(&settings, None),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// The figures of 2026-10-27: the context failed with 251 MB free, the weights with ~1 GB.
+    #[test]
+    fn a_failure_is_out_of_memory_only_when_free_memory_is_short() {
+        let now = |free_mb: u64| {
+            Some(MemInfo {
+                free: free_mb * MIB,
+                cached: 0,
+                available: free_mb * MIB,
+            })
+        };
+        assert_eq!(
+            out_of_gpu_memory(LoadStage::Context, 542, now(251)),
+            Some(ModelLoadError::OutOfGpuMemory {
+                stage: LoadStage::Context,
+                needed_mb: 542,
+                free_mb: 251
+            })
+        );
+        assert_eq!(
+            out_of_gpu_memory(LoadStage::Weights, 3_052, now(1_024)).map(|e| e.to_string()),
+            Some(
+                "out of GPU memory for the model weights: needs about 3052 MiB, 1024 MiB free"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            out_of_gpu_memory(LoadStage::Context, 542, now(4_700)),
+            None,
+            "plenty free"
+        );
+        assert_eq!(
+            out_of_gpu_memory(LoadStage::Context, 542, None),
+            None,
+            "unreadable"
+        );
+    }
+}
