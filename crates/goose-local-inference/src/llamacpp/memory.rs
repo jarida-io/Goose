@@ -36,9 +36,8 @@ pub(super) const DEFAULT_CONTEXT: usize = 16_384;
 /// 5,120 is there for a load just above the floor, where q8_0 can hold more than 4,096 tokens but
 /// not 6,144: without the rung that window rounded down to the floor, f16's window, and q8_0 had
 /// nothing to gain. For a ~3,300-token preamble it is ~1,800 tokens of turn rather than ~800.
-pub(super) const CONTEXT_LADDER: [usize; 8] = [
-    32_768, 24_576, 16_384, 12_288, 8_192, 6_144, 5_120, 4_096,
-];
+pub(super) const CONTEXT_LADDER: [usize; 8] =
+    [32_768, 24_576, 16_384, 12_288, 8_192, 6_144, 5_120, 4_096];
 
 /// The narrowest window the fit hands out, whatever free memory says. Below it a Gemma 4 E4B
 /// turn (a ~4,500-token preamble) cannot run at all, so a context this small that then fails to
