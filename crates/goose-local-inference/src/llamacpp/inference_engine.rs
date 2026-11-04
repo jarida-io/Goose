@@ -661,6 +661,9 @@ pub(super) struct RetainedPrefix<'a> {
     /// Whether a chat filled the cache, rather than one-shot work nothing
     /// resumes from.
     worth_protecting: bool,
+    /// Whether the incoming prompt is one-shot work that must run in a sacrificial
+    /// context rather than destroying this retained cache.
+    protect_from_side_call: bool,
 }
 
 impl<'a> RetainedPrefix<'a> {
@@ -673,6 +676,7 @@ impl<'a> RetainedPrefix<'a> {
             occupied: kv.occupied(),
             n_ctx: kv.n_ctx,
             worth_protecting: !kv.one_shot,
+            protect_from_side_call: false,
         }
     }
 
@@ -693,6 +697,7 @@ impl<'a> RetainedPrefix<'a> {
             occupied: kv.occupied(),
             n_ctx: kv.n_ctx,
             worth_protecting: !kv.one_shot,
+            protect_from_side_call: false,
         }
     }
 }
@@ -917,12 +922,12 @@ pub(super) fn prefill_plan(
     if resume >= REUSE_MIN_TOKENS && reusable < prompt.len() {
         return PrefillPlan::ReusePrefix(resume);
     }
-    // Only a cache a chat filled is worth protecting. One-shot work leaves a
-    // cache nothing resumes from: on a Jetson Orin, a compaction summary stopped
-    // halfway left 13K tokens of summary prompt, and a new conversation's turns
-    // then ran in throwaway contexts, each a full prefill (7-8 s to the first
-    // token), until the conversation outgrew half of it.
-    if cached.worth_protecting && is_sacrificial_prompt(prompt.len(), cached.occupied) {
+    // Only a cache a chat filled is worth protecting. One-shot work (side calls, chores)
+    // must never destroy a chat cache that is worth protecting; it runs as a sacrificial
+    // transient context so the conversational prefix remains resident for the returning user.
+    if cached.worth_protecting
+        && (cached.protect_from_side_call || is_sacrificial_prompt(prompt.len(), cached.occupied))
+    {
         return PrefillPlan::SacrificialContext;
     }
     PrefillPlan::FullPrefillInPlace
@@ -1956,6 +1961,7 @@ fn prefill_prompt(
             };
             retained.worth_protecting &=
                 retained_cache_protected(helper, !one_shot, kv.last_used.elapsed());
+            retained.protect_from_side_call = one_shot;
             retained
         }),
         prompt,
@@ -3087,6 +3093,7 @@ pub(super) mod tests {
             occupied: tokens.len(),
             n_ctx,
             worth_protecting: true,
+            protect_from_side_call: false,
         }
     }
 
@@ -3103,6 +3110,7 @@ pub(super) mod tests {
             occupied: media_pos + tokens.len(),
             n_ctx,
             worth_protecting: true,
+            protect_from_side_call: false,
         }
     }
 
@@ -4997,6 +5005,7 @@ pub(super) mod tests {
             occupied: 3000,
             n_ctx: 4096,
             worth_protecting: true,
+            protect_from_side_call: false,
         };
         let prompt = tokens(0..2000);
         assert_eq!(
@@ -5074,10 +5083,23 @@ pub(super) mod tests {
             occupied: 3000,
             n_ctx: 4096,
             worth_protecting: true,
+            protect_from_side_call: false,
         };
         let prompt = tokens(0..378);
         assert_eq!(
             prefill_plan(Some(opaque), &prompt, 4096),
+            PrefillPlan::SacrificialContext
+        );
+    }
+
+    #[test]
+    fn a_large_side_call_is_sacrificed_and_never_destroys_chat_cache() {
+        let chat_cache = tokens(0..1000);
+        let large_side_call = tokens(10_000..12_500);
+        let mut ret = retained(&chat_cache, 4096);
+        ret.protect_from_side_call = true;
+        assert_eq!(
+            prefill_plan(Some(ret), &large_side_call, 4096),
             PrefillPlan::SacrificialContext
         );
     }
