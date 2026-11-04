@@ -523,7 +523,7 @@ mod tests {
                 ),
             )
             .expect("context");
-        let filler = model.token_eos();
+        let filler = model.vocab().eos();
 
         let mut pos = 0i32;
         let mut cost = |n: usize, pos: &mut i32, reps: usize| -> f64 {

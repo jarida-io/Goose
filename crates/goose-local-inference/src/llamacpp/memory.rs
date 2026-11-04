@@ -1631,11 +1631,11 @@ mod tests {
     fn requested_100k_fits_with_q4_0_kv_cache() {
         let q4 = e4b().cost(Some("q4_0"), Some("q4_0"), Some(512));
         let q8 = e4b().cost(Some("q8_0"), Some("q8_0"), Some(512));
-        let fit = fit_context(100_000, q4.bytes_per_token, 350 * MIB);
+        let fit = fit_context(100_000, q4.bytes_per_token, 500 * MIB);
         assert_eq!(fit.n_ctx, 100_000);
         assert_eq!(fit.reason, FitReason::Requested);
 
-        let q8_fit = fit_context(100_000, q8.bytes_per_token, 350 * MIB);
+        let q8_fit = fit_context(100_000, q8.bytes_per_token, 500 * MIB);
         assert!(q8_fit.n_ctx < 100_000);
     }
 
