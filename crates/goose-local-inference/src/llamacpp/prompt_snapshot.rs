@@ -118,11 +118,11 @@ const LADDER_DEPTHS: &[usize] = &[256, 512, 1024, 2048, 4096, 8192, 16384];
 /// titling, the reviewer, the summariser. Six leaves room for a new caller
 /// without letting a runaway fill the disk — at 18 KiB/token a 4,000-token
 /// snapshot is ~70 MiB, so six is the difference between a cache and a problem.
-const MAX_SNAPSHOTS: usize = 6;
+const MAX_SNAPSHOTS: usize = 8;
 
 /// How many helper-role snapshots the same key may keep beside those, so a household's saved
-/// roles never evict its own chat shapes.
-const MAX_HELPER_SNAPSHOTS: usize = 6;
+/// roles never evict its own chat shapes or each other during prefill compilation.
+const MAX_HELPER_SNAPSHOTS: usize = 16;
 
 /// Which cap a snapshot counts against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

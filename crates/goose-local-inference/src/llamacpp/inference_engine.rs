@@ -1913,9 +1913,8 @@ fn prefill_prompt(
     }
     // Set when a compile found this shape's snapshot missing or bad: the cold path below writes it.
     let mut rebuild_preamble: Option<usize> = None;
+    let mut compile_fast_skip = false;
     if let Some(shape) = compile_prefill {
-        // Judged on the cold path a real turn would take, never on a chat's resident cache.
-        *session = None;
         if let Some(slot) = snapshot.as_mut() {
             if let Some(secs) = prefill_retention_secs {
                 slot.retire_idle_helpers(secs);
@@ -1932,6 +1931,13 @@ fn prefill_prompt(
                     | super::prompt_snapshot::PreambleHealth::Corrupt
             ) {
                 rebuild_preamble = preamble;
+                // Judged on the cold path a real turn would take, never on a chat's resident cache.
+                *session = None;
+            } else if matches!(health, super::prompt_snapshot::PreambleHealth::Unobserved) || helper
+            {
+                compile_fast_skip = true;
+            } else {
+                *session = None;
             }
             tracing::info!(
                 target: "giap::kv",
@@ -1942,7 +1948,27 @@ fn prefill_prompt(
                 prompt_tokens = prompt.len(),
                 "prefill compile checked this shape's snapshot; a bad one is rebuilt below"
             );
+        } else {
+            *session = None;
         }
+    }
+    if compile_fast_skip && !prompt.is_empty() {
+        let one = &prompt[..1];
+        if session.is_some() {
+            if let Ok(kv) = sacrificial_prefill(model, draft, backend, settings, one, 64) {
+                return Ok(PrefilledPrompt {
+                    reused_prefix_tokens: 0,
+                    transient: Some(kv),
+                    effective_ctx: 64,
+                });
+            }
+        }
+        full_prefill(session, draft, model, backend, settings, one, n_ctx)?;
+        return Ok(PrefilledPrompt {
+            reused_prefix_tokens: 0,
+            transient: None,
+            effective_ctx,
+        });
     }
 
     let class = if helper {
