@@ -2708,6 +2708,14 @@ pub(super) fn prepare_generation(
             t_validate_done.duration_since(t_tok_done).as_millis(),
             t_validate_done.elapsed().as_millis(),
         ));
+        let mut tokens = tokens;
+        let mut ptc = ptc;
+        if let Some(kv) = prefilled.transient.as_ref().or(ctx.session.as_ref()) {
+            if kv.tokens.len() < tokens.len() {
+                tokens.truncate(kv.tokens.len());
+                ptc = tokens.len();
+            }
+        }
         (ptc, prefilled, tokens)
     };
 

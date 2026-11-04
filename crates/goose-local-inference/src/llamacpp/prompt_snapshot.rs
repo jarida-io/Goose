@@ -830,6 +830,7 @@ impl SnapshotSlot {
 
     /// Judge the snapshot a real turn of `prompt`'s shape would restore, against the preamble two
     /// compile prompts share. A file that fails is retired and the shape reopened for a write.
+    #[cfg(test)]
     pub(super) fn preamble_health(&mut self, prompt: &[LlamaToken]) -> PreambleHealth {
         let Some(bucket) = Self::bucket_of(prompt) else {
             return PreambleHealth::TooShort;
