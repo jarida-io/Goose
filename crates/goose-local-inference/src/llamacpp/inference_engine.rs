@@ -1955,7 +1955,7 @@ fn prefill_prompt(
     if compile_fast_skip && !prompt.is_empty() {
         let one = &prompt[..1];
         if session.is_some() {
-            if let Ok(kv) = sacrificial_prefill(model, draft, backend, settings, one, 64) {
+            if let Ok(kv) = sacrificial_prefill(model, None, backend, settings, one, 64) {
                 return Ok(PrefilledPrompt {
                     reused_prefix_tokens: 0,
                     transient: Some(kv),
@@ -2158,6 +2158,7 @@ fn sacrificial_prefill(
 ) -> Result<SessionKv, ProviderError> {
     let mut kv = SessionKv::create(model, draft, backend, n_ctx, settings)?;
     decode_tokens(kv.ctx.ctx_mut(), prompt, 0)?;
+    kv.tokens.extend_from_slice(prompt);
     Ok(kv)
 }
 
