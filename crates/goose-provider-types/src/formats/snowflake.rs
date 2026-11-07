@@ -1,4 +1,4 @@
-use crate::conversation::message::{Message, MessageContentBlock};
+use crate::conversation::message::{Message, MessageContentBlock, AUDIO_NOT_SENT_NOTE};
 use crate::conversation::token_usage::Usage;
 use crate::errors::ProviderError;
 use crate::mcp_utils::extract_text_from_resource;
@@ -74,6 +74,12 @@ pub fn format_messages(messages: &[Message]) -> Vec<Value> {
                     // Skip redacted thinking for now
                 }
                 MessageContentBlock::Image(_) => continue, // Snowflake doesn't support image content yet
+                MessageContentBlock::Audio(_) => {
+                    if !text_content.is_empty() {
+                        text_content.push('\n');
+                    }
+                    text_content.push_str(AUDIO_NOT_SENT_NOTE);
+                }
                 MessageContentBlock::FrontendToolRequest(_tool_request) => {
                     // Skip frontend tool requests
                 }

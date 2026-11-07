@@ -1,6 +1,6 @@
 use crate::backend::LocalInferenceBackend;
 use crate::local_model_registry::ModelSettings;
-use crate::multimodal::ExtractedImage;
+use crate::multimodal::ExtractedMedia;
 use goose_provider_types::errors::ProviderError;
 use goose_provider_types::request_log::{LoggerHandleExt, RequestLogHandle};
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
@@ -101,7 +101,7 @@ pub(super) struct GenerationContext<'a> {
     pub message_id: &'a str,
     pub tx: &'a StreamSender,
     pub log: &'a mut Option<Box<dyn RequestLogHandle>>,
-    pub images: &'a [ExtractedImage],
+    pub media: &'a [ExtractedMedia],
     /// Cold-load time for this request's model, when the load happened in this
     /// request. None when the model was already resident.
     pub model_load_ms: Option<u64>,
@@ -259,8 +259,8 @@ pub(super) struct MediaHead {
     chunks: Vec<HeadChunk>,
     /// Positions the head occupies: `[0, n_pos)`.
     n_pos: usize,
-    /// Source bytes of every image in the request that built this head, in
-    /// order. Compared byte for byte rather than hashed — a hash collision here
+    /// Source bytes of every picture and sound in the request that built this
+    /// head, in order. Compared byte for byte rather than hashed — a hash collision here
     /// would silently answer about a different picture, and images are small
     /// enough next to a resident model that the copy is not worth the risk.
     images: Vec<Vec<u8>>,
@@ -278,7 +278,7 @@ impl MediaHead {
         &self,
         n_pos: usize,
         chunks: &[HeadChunk],
-        images: &[ExtractedImage],
+        images: &[ExtractedMedia],
     ) -> Option<HeadMismatch> {
         if self.images.len() != images.len() {
             return Some(HeadMismatch::ImageCount);
@@ -2176,9 +2176,9 @@ struct SplitChunks {
 /// Describe one chunk, or refuse it.
 ///
 /// `None` means "this chunk cannot be modelled position for position", which
-/// makes the whole cache ineligible for reuse. The refusal that fires on real
-/// input is the audio chunk, whose position model this code has never
-/// exercised. The text-chunk check below is a tripwire, not a live filter:
+/// makes the whole cache ineligible for reuse. An audio chunk is media like a
+/// picture: mtmd reports its positions, and its source bytes pin its contents.
+/// The text-chunk check below is a tripwire, not a live filter:
 /// mtmd returns the same value from `get_n_tokens` and `get_n_pos` for a text
 /// chunk, so `n_pos != n_tokens` is unreachable today and only earns its place
 /// if that ever stops being true.
@@ -2227,8 +2227,9 @@ fn describe_chunk(chunk: &MtmdInputChunk) -> Option<HeadChunk> {
             }
             Some(HeadChunk::Text(tokens.to_vec()))
         }
-        MtmdInputChunkType::Image => Some(HeadChunk::Media { n_tokens, n_pos }),
-        MtmdInputChunkType::Audio => None,
+        MtmdInputChunkType::Image | MtmdInputChunkType::Audio => {
+            Some(HeadChunk::Media { n_tokens, n_pos })
+        }
     }
 }
 
@@ -2286,7 +2287,7 @@ fn split_at_last_media(mut chunks: Vec<HeadChunk>) -> Option<SplitChunks> {
 fn reuse_media_head(
     session: &mut Option<SessionKv>,
     split: &SplitChunks,
-    images: &[ExtractedImage],
+    images: &[ExtractedMedia],
     n_ctx: u32,
 ) -> Option<usize> {
     let kv = session.as_mut()?;
@@ -2326,6 +2327,62 @@ fn reuse_media_head(
     }
 }
 
+/// mtmd's own sniffing decides picture or sound; a sound it reads as a picture is refused,
+/// since stb would otherwise decode a stray byte pattern into a picture of noise.
+fn decode_media(
+    mtmd_ctx: &MtmdContext,
+    item: &ExtractedMedia,
+) -> Result<MtmdBitmap, ProviderError> {
+    let what = if item.audio { "audio" } else { "image" };
+    let bitmap = MtmdBitmap::from_buffer(mtmd_ctx, &item.bytes, false)
+        .map_err(|e| ProviderError::ExecutionError(format!("Failed to decode {what}: {e}")))?;
+    if bitmap.is_audio() != item.audio {
+        return Err(ProviderError::ExecutionError(format!(
+            "Failed to decode {what}: the data is not a supported {what} file"
+        )));
+    }
+    Ok(bitmap)
+}
+
+/// Gemma 4's audio tower emits 25 tokens a second (10 ms mel hop, two stride-2 convs).
+const AUDIO_TOKENS_PER_SECOND: usize = 25;
+
+/// Tokens a media item will take, for choosing the tool-schema render before mtmd counts them.
+fn media_token_estimate(item: &ExtractedMedia, image_estimate: usize) -> usize {
+    if !item.audio {
+        return image_estimate;
+    }
+    match wav_duration_ms(&item.bytes) {
+        Some(ms) => (ms as usize * AUDIO_TOKENS_PER_SECOND).div_ceil(1000),
+        None => image_estimate,
+    }
+}
+
+/// A RIFF/WAVE file's length from its `fmt ` byte rate and `data` size; `None` if unreadable.
+fn wav_duration_ms(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut at = 12;
+    let mut byte_rate = None;
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
+        let body = at + 8;
+        if id == b"fmt " && size >= 12 && body + 12 <= bytes.len() {
+            byte_rate = Some(u32::from_le_bytes(
+                bytes[body + 8..body + 12].try_into().ok()?,
+            ));
+        } else if id == b"data" {
+            let rate = u64::from(byte_rate.filter(|r| *r > 0)?);
+            let len = size.min(bytes.len() - body) as u64;
+            return Some(len * 1000 / rate);
+        }
+        at = body + size + (size & 1);
+    }
+    None
+}
+
 /// Tokenize text + images via mtmd and prefill them.
 ///
 /// When the retained cache already holds this exact image list at these exact
@@ -2344,25 +2401,32 @@ fn prefill_multimodal(
     mtmd_ctx: Option<&MtmdContext>,
     backend: &LlamaCppBackend,
     prompt_text: &str,
-    images: &[ExtractedImage],
+    media: &[ExtractedMedia],
     context_limit: usize,
     settings: &ModelSettings,
     memory_fit: Option<MemoryFit>,
 ) -> Result<(usize, PrefilledPrompt), ProviderError> {
+    let has_audio = media.iter().any(|m| m.audio);
     let mtmd_ctx = mtmd_ctx.ok_or_else(|| {
-        ProviderError::ExecutionError(
+        ProviderError::ExecutionError(if has_audio {
+            "This model has no audio encoder loaded, so it cannot listen to this recording."
+                .to_string()
+        } else {
             "This model does not have vision support. Download the vision encoder from \
              Settings > Local Inference, or use a text-only message."
-                .to_string(),
-        )
-    })?;
-
-    let bitmaps: Vec<MtmdBitmap> = images
-        .iter()
-        .map(|img| {
-            MtmdBitmap::from_buffer(mtmd_ctx, &img.bytes, false)
-                .map_err(|e| ProviderError::ExecutionError(format!("Failed to decode image: {e}")))
+                .to_string()
         })
+    })?;
+    if has_audio && !mtmd_ctx.support_audio() {
+        return Err(ProviderError::ExecutionError(
+            "This model's encoder has no audio tower, so it cannot listen to this recording."
+                .to_string(),
+        ));
+    }
+
+    let bitmaps: Vec<MtmdBitmap> = media
+        .iter()
+        .map(|item| decode_media(mtmd_ctx, item))
         .collect::<Result<_, _>>()?;
 
     let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
@@ -2406,7 +2470,7 @@ fn prefill_multimodal(
     let min_generation_headroom = 512;
     if prompt_token_count + min_generation_headroom > effective_ctx {
         return Err(ProviderError::ContextLengthExceeded(format!(
-            "Multimodal prompt ({prompt_token_count} tokens including images) exceeds \
+            "Multimodal prompt ({prompt_token_count} tokens including media) exceeds \
              context limit ({effective_ctx} tokens)",
         )));
     }
@@ -2426,7 +2490,7 @@ fn prefill_multimodal(
     );
 
     if let Some(split) = split.as_ref() {
-        if let Some(resume) = reuse_media_head(session, split, images, n_ctx) {
+        if let Some(resume) = reuse_media_head(session, split, media, n_ctx) {
             return Ok((
                 prompt_token_count,
                 PrefilledPrompt {
@@ -2498,7 +2562,7 @@ fn prefill_multimodal(
     kv.head = Some(MediaHead {
         chunks: split.head,
         n_pos: split.head_pos,
-        images: images.iter().map(|img| img.bytes.clone()).collect(),
+        images: media.iter().map(|item| item.bytes.clone()).collect(),
     });
     kv.tokens = split.tail;
     *session = Some(kv);
@@ -2568,7 +2632,11 @@ pub(super) fn prepare_generation(
     );
     let token_budget = cap.saturating_sub(min_generation_headroom);
     let t_ctx_done = std::time::Instant::now();
-    let estimated_image_tokens = ctx.images.len() * ctx.settings.image_token_estimate;
+    let estimated_image_tokens: usize = ctx
+        .media
+        .iter()
+        .map(|item| media_token_estimate(item, ctx.settings.image_token_estimate))
+        .sum();
 
     let template_result = match apply_template(full_tools_json) {
         Ok(r) => {
@@ -2653,7 +2721,7 @@ pub(super) fn prepare_generation(
     // has no flat token vector to time the same way.
     let mut text_breakdown: Option<(u128, u128, u128)> = None;
 
-    let (prompt_token_count, mut prefilled, prompt_tokens) = if !ctx.images.is_empty() {
+    let (prompt_token_count, mut prefilled, prompt_tokens) = if !ctx.media.is_empty() {
         // The multimodal path prefills through mtmd chunks and never produces a
         // flat token vector, so a speculative draft has nothing to stand on --
         // which is consistent with the vision request bypassing KV retention too.
@@ -2663,7 +2731,7 @@ pub(super) fn prepare_generation(
             ctx.mtmd_ctx,
             ctx.backend,
             &template_result.prompt,
-            ctx.images,
+            ctx.media,
             ctx.context_limit,
             ctx.settings,
             ctx.memory_fit,
@@ -3157,9 +3225,10 @@ pub(super) mod tests {
         }
     }
 
-    fn image(bytes: &[u8]) -> ExtractedImage {
-        ExtractedImage {
+    fn image(bytes: &[u8]) -> ExtractedMedia {
+        ExtractedMedia {
             bytes: bytes.to_vec(),
+            audio: false,
         }
     }
 
@@ -4844,7 +4913,7 @@ pub(super) mod tests {
     fn mismatch(
         head: &MediaHead,
         chunks: &[HeadChunk],
-        images: &[ExtractedImage],
+        images: &[ExtractedMedia],
     ) -> Option<HeadMismatch> {
         head.mismatch(incoming_head_pos(chunks), chunks, images)
     }

@@ -4,16 +4,18 @@ use serde_json::Value;
 use goose_provider_types::conversation::message::{Message, MessageContent};
 use goose_provider_types::errors::ProviderError;
 
+/// One picture or sound for mtmd, in prompt order; mtmd tells them apart by their magic bytes.
 #[derive(Debug)]
-pub struct ExtractedImage {
+pub struct ExtractedMedia {
     pub bytes: Vec<u8>,
+    pub audio: bool,
 }
 
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct MultimodalMessages {
     pub messages_json: String,
-    pub images: Vec<ExtractedImage>,
+    pub images: Vec<ExtractedMedia>,
 }
 
 /// Walk the OpenAI-format messages JSON array. For each content part with
@@ -62,7 +64,10 @@ pub fn extract_images_from_messages_json(
                 ProviderError::ExecutionError(format!("Failed to decode base64 image: {e}"))
             })?;
 
-            images.push(ExtractedImage { bytes });
+            images.push(ExtractedMedia {
+                bytes,
+                audio: false,
+            });
 
             *part = serde_json::json!({
                 "type": "text",
@@ -80,13 +85,13 @@ pub fn extract_images_from_messages_json(
     })
 }
 
-/// Scan messages for `MessageContent::Image` entries. Return the extracted image
-/// bytes and a new message list with images replaced by text marker placeholders.
-pub fn extract_images_from_messages(
+/// Scan messages for image and audio entries. Return their bytes in prompt order and a new
+/// message list with each replaced by the text marker mtmd splices its embeddings into.
+pub fn extract_media_from_messages(
     messages: &[Message],
     marker: &str,
-) -> (Vec<ExtractedImage>, Vec<Message>) {
-    let mut images = Vec::new();
+) -> (Vec<ExtractedMedia>, Vec<Message>) {
+    let mut media = Vec::new();
     let mut new_messages = Vec::with_capacity(messages.len());
 
     for msg in messages {
@@ -95,11 +100,24 @@ pub fn extract_images_from_messages(
             match content {
                 MessageContent::Image(img) => {
                     if let Ok(bytes) = BASE64_STANDARD.decode(&img.data) {
-                        images.push(ExtractedImage { bytes });
+                        media.push(ExtractedMedia {
+                            bytes,
+                            audio: false,
+                        });
                         new_content.push(MessageContent::text(marker));
                     } else {
                         new_content.push(MessageContent::text(
                             "[Image attached — failed to decode image data]",
+                        ));
+                    }
+                }
+                MessageContent::Audio(audio) => {
+                    if let Ok(bytes) = BASE64_STANDARD.decode(&audio.data) {
+                        media.push(ExtractedMedia { bytes, audio: true });
+                        new_content.push(MessageContent::text(marker));
+                    } else {
+                        new_content.push(MessageContent::text(
+                            "[Audio attached — failed to decode audio data]",
                         ));
                     }
                 }
@@ -113,7 +131,7 @@ pub fn extract_images_from_messages(
         });
     }
 
-    (images, new_messages)
+    (media, new_messages)
 }
 
 #[cfg(test)]
@@ -259,14 +277,14 @@ mod tests {
         assert_eq!(content1[0]["text"], "It looks like a red pixel.");
     }
 
-    // --- Tests for extract_images_from_messages (Message-based) ---
+    // --- Tests for extract_media_from_messages (Message-based) ---
 
     #[test]
     fn test_messages_extract_replaces_image_with_marker() {
         let b64 = tiny_png_base64();
         let messages = vec![Message::user().with_image(b64, "image/png")];
 
-        let (images, new_msgs) = extract_images_from_messages(&messages, "<__media__>");
+        let (images, new_msgs) = extract_media_from_messages(&messages, "<__media__>");
         assert_eq!(images.len(), 1);
         assert!(!images[0].bytes.is_empty());
         assert_eq!(new_msgs.len(), 1);
@@ -277,7 +295,7 @@ mod tests {
     fn test_messages_extract_preserves_text() {
         let messages = vec![Message::user().with_text("Hello world")];
 
-        let (images, new_msgs) = extract_images_from_messages(&messages, "<__media__>");
+        let (images, new_msgs) = extract_media_from_messages(&messages, "<__media__>");
         assert!(images.is_empty());
         assert_eq!(new_msgs[0].as_concat_text(), "Hello world");
     }
@@ -290,7 +308,7 @@ mod tests {
             .with_text("describe both")
             .with_image(b64, "image/png")];
 
-        let (images, new_msgs) = extract_images_from_messages(&messages, "<__media__>");
+        let (images, new_msgs) = extract_media_from_messages(&messages, "<__media__>");
         assert_eq!(images.len(), 2);
         assert_eq!(new_msgs[0].content.len(), 3);
         assert_eq!(
@@ -303,7 +321,7 @@ mod tests {
     fn test_messages_extract_no_images() {
         let messages = vec![Message::user().with_text("just text")];
 
-        let (images, new_msgs) = extract_images_from_messages(&messages, "<__media__>");
+        let (images, new_msgs) = extract_media_from_messages(&messages, "<__media__>");
         assert!(images.is_empty());
         assert_eq!(new_msgs[0].as_concat_text(), "just text");
     }
@@ -312,7 +330,7 @@ mod tests {
     fn test_messages_extract_invalid_base64() {
         let messages = vec![Message::user().with_image("not-valid-base64!!!", "image/png")];
 
-        let (images, new_msgs) = extract_images_from_messages(&messages, "<__media__>");
+        let (images, new_msgs) = extract_media_from_messages(&messages, "<__media__>");
         assert!(images.is_empty());
         assert!(new_msgs[0].as_concat_text().contains("failed to decode"));
     }
@@ -327,10 +345,39 @@ mod tests {
             Message::assistant().with_text("It looks like a red pixel."),
         ];
 
-        let (images, new_msgs) = extract_images_from_messages(&messages, "<__media__>");
+        let (images, new_msgs) = extract_media_from_messages(&messages, "<__media__>");
         assert_eq!(images.len(), 1);
         assert_eq!(new_msgs.len(), 2);
         assert_eq!(new_msgs[0].as_concat_text(), "What is this?\n<__media__>");
         assert_eq!(new_msgs[1].as_concat_text(), "It looks like a red pixel.");
+    }
+
+    #[test]
+    fn audio_and_images_share_one_ordered_media_list() {
+        let png = tiny_png_base64();
+        let wav = BASE64_STANDARD.encode(b"RIFF\x24\x00\x00\x00WAVEfmt ");
+        let messages = vec![Message::user()
+            .with_image(png, "image/png")
+            .with_text("and this")
+            .with_audio(wav, "audio/wav")];
+
+        let (media, new_msgs) = extract_media_from_messages(&messages, "<__media__>");
+        assert_eq!(media.len(), 2);
+        assert!(!media[0].audio);
+        assert!(media[1].audio);
+        assert!(media[1].bytes.starts_with(b"RIFF"));
+        assert_eq!(
+            new_msgs[0].as_concat_text(),
+            "<__media__>\nand this\n<__media__>"
+        );
+    }
+
+    #[test]
+    fn undecodable_audio_becomes_a_note_not_a_marker() {
+        let messages = vec![Message::user().with_audio("not-valid-base64!!!", "audio/wav")];
+
+        let (media, new_msgs) = extract_media_from_messages(&messages, "<__media__>");
+        assert!(media.is_empty());
+        assert!(!new_msgs[0].as_concat_text().contains("<__media__>"));
     }
 }

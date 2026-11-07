@@ -592,6 +592,11 @@ fn extract_text_content(msg: &Message) -> String {
                         .to_string(),
                 );
             }
+            MessageContent::Audio(_) => {
+                parts.push(
+                    goose_provider_types::conversation::message::AUDIO_NOT_SENT_NOTE.to_string(),
+                );
+            }
             _ => {}
         }
     }
