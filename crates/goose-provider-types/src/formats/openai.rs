@@ -1,4 +1,6 @@
-use crate::conversation::message::{Message, MessageContentBlock, ProviderMetadata};
+use crate::conversation::message::{
+    Message, MessageContentBlock, ProviderMetadata, AUDIO_NOT_SENT_NOTE,
+};
 use crate::conversation::token_usage::{CostSource, ProviderUsage, Usage};
 use crate::errors::ProviderError;
 use crate::images::{convert_image, detect_image_path, load_image_file, ImageFormat};
@@ -393,6 +395,9 @@ pub fn format_messages_with_options(
                             "text": "[Image content removed - not supported in assistant messages]"
                         }));
                     }
+                }
+                MessageContentBlock::Audio(_) => {
+                    content_array.push(json!({"type": "text", "text": AUDIO_NOT_SENT_NOTE}));
                 }
                 MessageContentBlock::FrontendToolRequest(request) => match &request.tool_call {
                     Ok(tool_call) => {

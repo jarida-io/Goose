@@ -1,4 +1,4 @@
-use crate::conversation::message::{Message, MessageContentBlock};
+use crate::conversation::message::{Message, MessageContentBlock, AUDIO_NOT_SENT_NOTE};
 use crate::formats::anthropic::{
     adaptive_output_effort, model_supports_temperature, thinking_budget_tokens,
     thinking_type_for_provider, ThinkingType,
@@ -217,6 +217,9 @@ fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<Data
                 }
                 MessageContentBlock::Image(image) => {
                     content_array.push(convert_image(image, image_format));
+                }
+                MessageContentBlock::Audio(_) => {
+                    content_array.push(json!({"type": "text", "text": AUDIO_NOT_SENT_NOTE}));
                 }
                 MessageContentBlock::FrontendToolRequest(req) => {
                     let text = match &req.tool_call {

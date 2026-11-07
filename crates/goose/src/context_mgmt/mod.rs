@@ -436,6 +436,7 @@ pub fn format_message_for_compacting(msg: &Message) -> String {
         .filter_map(|content| match content {
             MessageContent::Text(text) => Some(text.text.clone()),
             MessageContent::Image(img) => Some(format!("[image: {}]", img.mime_type)),
+            MessageContent::Audio(audio) => Some(format!("[audio: {}]", audio.mime_type)),
             MessageContent::ToolRequest(req) => {
                 if let Ok(call) = &req.tool_call {
                     Some(format!(

@@ -1,6 +1,6 @@
 use crate::canonical::maybe_get_canonical_model;
 use crate::canonical::ThinkingMode;
-use crate::conversation::message::{Message, MessageContentBlock};
+use crate::conversation::message::{Message, MessageContentBlock, AUDIO_NOT_SENT_NOTE};
 use crate::conversation::token_usage::{CostSource, ProviderUsage, Usage};
 use crate::errors::ProviderError;
 use crate::images::{convert_image, ImageFormat};
@@ -289,6 +289,12 @@ fn format_messages_with_options(
                 }
                 MessageContentBlock::Image(image) => {
                     content.push(convert_image(image, &ImageFormat::Anthropic));
+                }
+                MessageContentBlock::Audio(_) => {
+                    content.push(json!({
+                        TYPE_FIELD: TEXT_TYPE,
+                        TEXT_TYPE: AUDIO_NOT_SENT_NOTE
+                    }));
                 }
                 MessageContentBlock::FrontendToolRequest(tool_request) => {
                     if let Ok(tool_call) = &tool_request.tool_call {

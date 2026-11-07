@@ -4,8 +4,8 @@ use crate::mcp_utils::extract_text_from_resource;
 use crate::utils::sanitize_unicode_tags;
 use chrono::Utc;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ElicitationAction, ImageContent,
-    JsonObject, PromptMessage, Role, TextContent,
+    AudioContent, CallToolRequestParams, CallToolResult, ContentBlock, ElicitationAction,
+    ImageContent, JsonObject, PromptMessage, Role, TextContent,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
@@ -205,12 +205,18 @@ pub struct SystemNotificationContent {
 
 pub type MessageContent = MessageContentBlock;
 
+/// What a provider that cannot carry audio sends instead, so the model knows a recording was there.
+pub const AUDIO_NOT_SENT_NOTE: &str =
+    "[A voice recording was attached here, but it could not be sent to this model]";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// Content passed inside a message, which can be both simple content and tool content
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum MessageContentBlock {
     Text(TextContent),
     Image(ImageContent),
+    /// Base64 audio for an engine whose encoder hears it; every other path replaces it with text.
+    Audio(AudioContent),
     ToolRequest(ToolRequest),
     ToolResponse(ToolResponse),
     ToolConfirmationRequest(ToolConfirmationRequest),
@@ -226,6 +232,7 @@ impl fmt::Display for MessageContentBlock {
         match self {
             MessageContentBlock::Text(t) => write!(f, "{}", t.text),
             MessageContentBlock::Image(i) => write!(f, "[Image: {}]", i.mime_type),
+            MessageContentBlock::Audio(a) => write!(f, "[Audio: {}]", a.mime_type),
             MessageContentBlock::ToolRequest(r) => {
                 write!(f, "[ToolRequest: {}]", r.to_readable_string())
             }
@@ -308,6 +315,19 @@ impl MessageContentBlock {
                     None
                 }
             }
+            MessageContentBlock::Audio(audio) => {
+                if audio
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.audience.as_ref())
+                    .map(|roles| roles.contains(&audience))
+                    .unwrap_or(true)
+                {
+                    Some(self.clone())
+                } else {
+                    None
+                }
+            }
             MessageContentBlock::ToolResponse(res) => {
                 let Ok(result) = &res.tool_result else {
                     return Some(self.clone());
@@ -349,6 +369,7 @@ impl MessageContentBlock {
         match self {
             MessageContentBlock::Text(_)
             | MessageContentBlock::Image(_)
+            | MessageContentBlock::Audio(_)
             | MessageContentBlock::ToolResponse(_) => self.filter_for_audience(Role::User),
             _ => Some(self.clone()),
         }
@@ -356,6 +377,10 @@ impl MessageContentBlock {
 
     pub fn image<S: Into<String>, T: Into<String>>(data: S, mime_type: T) -> Self {
         MessageContentBlock::Image(ImageContent::new(data, mime_type))
+    }
+
+    pub fn audio<S: Into<String>, T: Into<String>>(data: S, mime_type: T) -> Self {
+        MessageContentBlock::Audio(AudioContent::new(data, mime_type))
     }
 
     pub fn tool_request<S: Into<String>>(
@@ -876,6 +901,11 @@ impl Message {
     /// Add image content to the message
     pub fn with_image<S: Into<String>, T: Into<String>>(self, data: S, mime_type: T) -> Self {
         self.with_content(MessageContentBlock::image(data, mime_type))
+    }
+
+    /// Add base64 audio (a WAV, say) to the message
+    pub fn with_audio<S: Into<String>, T: Into<String>>(self, data: S, mime_type: T) -> Self {
+        self.with_content(MessageContentBlock::audio(data, mime_type))
     }
 
     /// Add a tool request to the message
@@ -1429,6 +1459,25 @@ mod tests {
             panic!("Expected Text content");
         };
         assert_eq!(text.text, "still here");
+    }
+
+    #[test]
+    fn audio_content_round_trips_through_stored_json() {
+        let message = Message::user()
+            .with_text("listen")
+            .with_audio("UklGRg==", "audio/wav");
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            json["content"][1],
+            serde_json::json!({"type": "audio", "data": "UklGRg==", "mimeType": "audio/wav"})
+        );
+
+        let back: Message = serde_json::from_value(json).unwrap();
+        let MessageContentBlock::Audio(audio) = &back.content[1] else {
+            panic!("Expected Audio content");
+        };
+        assert_eq!(audio.data, "UklGRg==");
+        assert_eq!(audio.mime_type, "audio/wav");
     }
 
     #[test]
