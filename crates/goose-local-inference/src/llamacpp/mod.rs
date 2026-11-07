@@ -1,3 +1,4 @@
+mod encoder_backend;
 mod inference_emulated_tools;
 mod inference_engine;
 mod inference_native_tools;
@@ -778,8 +779,28 @@ impl LlamaCppBackend {
             ..MtmdContextParams::default()
         };
 
-        match MtmdContext::init_from_file(mmproj_path.to_str().unwrap_or_default(), model, &params)
-        {
+        let (loaded, said) = encoder_backend::caught_while(|| {
+            MtmdContext::init_from_file(mmproj_path.to_str().unwrap_or_default(), model, &params)
+        });
+        let backend = encoder_backend::EncoderBackend::from_lines(&said.concat());
+        tracing::info!(
+            target: "giap::trace",
+            kind = "encoder_backend",
+            backend = %backend.backends.join(","),
+            flash_attention = %backend.flash_attention.join(","),
+            cpu_ops = %backend.cpu_ops.join(","),
+            "where the multimodal encoder runs"
+        );
+        if loaded.is_ok() && !backend.fully_accelerated() {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "encoder_not_accelerated",
+                backend = %backend.backends.join(","),
+                cpu_ops = %backend.cpu_ops.join(","),
+                "part of the multimodal encoder runs on the CPU"
+            );
+        }
+        match loaded {
             Ok(ctx) => {
                 tracing::info!(
                     vision = ctx.support_vision(),
