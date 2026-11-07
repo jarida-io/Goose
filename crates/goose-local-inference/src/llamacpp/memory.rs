@@ -36,8 +36,9 @@ pub(super) const DEFAULT_CONTEXT: usize = 16_384;
 /// 5,120 is there for a load just above the floor, where q8_0 can hold more than 4,096 tokens but
 /// not 6,144: without the rung that window rounded down to the floor, f16's window, and q8_0 had
 /// nothing to gain. For a ~3,300-token preamble it is ~1,800 tokens of turn rather than ~800.
-pub(super) const CONTEXT_LADDER: [usize; 8] =
-    [32_768, 24_576, 16_384, 12_288, 8_192, 6_144, 5_120, 4_096];
+pub(super) const CONTEXT_LADDER: [usize; 12] = [
+    131_072, 102_400, 100_000, 65_536, 32_768, 24_576, 16_384, 12_288, 8_192, 6_144, 5_120, 4_096,
+];
 
 /// The narrowest window the fit hands out, whatever free memory says. Below it a Gemma 4 E4B
 /// turn (a ~4,500-token preamble) cannot run at all, so a context this small that then fails to
@@ -1624,6 +1625,18 @@ mod tests {
         assert_eq!(choice.quantized.map(|q| q.n_ctx), Some(32_768));
         assert_eq!(choice.fit.kv_type, Some("q8_0"));
         assert_eq!(choice.fit.fit(32_768).n_ctx, 32_768);
+    }
+
+    #[test]
+    fn requested_100k_fits_with_q4_0_kv_cache() {
+        let q4 = e4b().cost(Some("q4_0"), Some("q4_0"), Some(512));
+        let q8 = e4b().cost(Some("q8_0"), Some("q8_0"), Some(512));
+        let fit = fit_context(100_000, q4.bytes_per_token, 500 * MIB);
+        assert_eq!(fit.n_ctx, 100_000);
+        assert_eq!(fit.reason, FitReason::Requested);
+
+        let q8_fit = fit_context(100_000, q8.bytes_per_token, 500 * MIB);
+        assert!(q8_fit.n_ctx < 100_000);
     }
 
     #[test]

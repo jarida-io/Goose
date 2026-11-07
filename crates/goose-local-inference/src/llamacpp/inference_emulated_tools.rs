@@ -473,9 +473,12 @@ pub(super) fn generate_with_emulated_tools(
                 content
             };
             for action in emulator_parser.process_chunk(&content) {
-                if send_emulator_action(&action, message_id, tx).is_err() {
-                    send_failed = true;
-                    break;
+                match send_emulator_action(&action, message_id, tx) {
+                    Ok(is_tool) => tool_call_emitted |= is_tool,
+                    Err(()) => {
+                        send_failed = true;
+                        break;
+                    }
                 }
             }
         }
@@ -483,8 +486,9 @@ pub(super) fn generate_with_emulated_tools(
 
     if !send_failed {
         for action in emulator_parser.flush() {
-            if send_emulator_action(&action, message_id, tx).is_err() {
-                break;
+            match send_emulator_action(&action, message_id, tx) {
+                Ok(is_tool) => tool_call_emitted |= is_tool,
+                Err(()) => break,
             }
         }
     }
@@ -510,6 +514,7 @@ pub(super) fn generate_with_emulated_tools(
         None,
     );
     let _ = ctx.tx.blocking_send(Ok((None, Some(provider_usage))));
+    ctx.tool_call_emitted = tool_call_emitted;
     Ok(())
 }
 

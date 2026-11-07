@@ -87,7 +87,7 @@ impl WrittenToolCalls {
             let at = from + offset;
             let after = self.held.get(at + 1..).unwrap_or_default();
             let read = if self.held.as_bytes().get(at) == Some(&b'[') {
-                self.read_fenced(after, None, at_end)
+                self.read_fenced(after, &[], at_end)
             } else {
                 self.read(after, at_end)
             };
@@ -108,6 +108,34 @@ impl WrittenToolCalls {
 
     /// Reads what follows a `<`.
     fn read(&self, text: &str, at_end: bool) -> Read {
+        if let Some(pipe_rest) = text.strip_prefix('|') {
+            let (word, rest) = pipe_rest.split_at(word_len(pipe_rest));
+            if rest.is_empty() {
+                return if at_end {
+                    Read::NotACall
+                } else {
+                    Read::Unfinished
+                };
+            }
+            if word.is_empty() {
+                return Read::NotACall;
+            }
+            let Some(body) = rest.strip_prefix('>') else {
+                return Read::NotACall;
+            };
+            let closer1 = format!("<{word}|>");
+            let closer2 = format!("</|{word}>");
+            let closer3 = format!("</{word}>");
+            let closers = [
+                closer1.as_str(),
+                closer2.as_str(),
+                closer3.as_str(),
+                "<tool_call|>",
+                "<channel|>",
+            ];
+            return self.read_fenced(body, &closers, at_end);
+        }
+
         let (word, rest) = text.split_at(word_len(text));
         if rest.is_empty() {
             return if at_end {
@@ -123,7 +151,7 @@ impl WrittenToolCalls {
             return self.read_tag(word, rest, at_end);
         };
         let closer = format!("</{word}>");
-        match self.read_fenced(body, Some(&closer), at_end) {
+        match self.read_fenced(body, &[&closer], at_end) {
             Read::NotACall => self.read_body(word, body, &closer, at_end),
             read => read,
         }
@@ -178,7 +206,7 @@ impl WrittenToolCalls {
     /// `NAME{key:value,...}` or `NAME(key="value",...)`, optionally after `call:`, behind
     /// `<FENCE>` or `[`. Behind a fence a bare `NAME` up to `</FENCE>` is a call without
     /// arguments; behind `[` it needs arguments, so `[NAME]` in prose stays prose.
-    fn read_fenced(&self, body: &str, closer: Option<&str>, at_end: bool) -> Read {
+    fn read_fenced(&self, body: &str, closers: &[&str], at_end: bool) -> Read {
         let body = body.trim_start();
         let body = match body.strip_prefix("call:") {
             Some(rest) => rest,
@@ -215,19 +243,19 @@ impl WrittenToolCalls {
                 None => Read::NotACall,
             };
         }
-        let Some(closer) = closer else {
+        if closers.is_empty() {
             return if rest.is_empty() && !at_end {
                 Read::Unfinished
             } else {
                 Read::NotACall
             };
-        };
-        if at_end || rest.starts_with(closer) {
+        }
+        if at_end || closers.iter().any(|c| rest.starts_with(c)) {
             Read::Call(WrittenCall {
                 name,
                 arguments: Map::new(),
             })
-        } else if closer.starts_with(rest) {
+        } else if closers.iter().any(|c| c.starts_with(rest)) {
             Read::Unfinished
         } else {
             Read::NotACall
@@ -769,6 +797,50 @@ mod tests {
                     "giap-weather__search_web",
                     json!({"query": "rain", "days": 2})
                 )
+            )
+        );
+        assert_eq!(
+            read("<|tool_call>call:giap-weather__search_web{query:<|\"|>rain<|\"|>,days:2}<tool_call|>"),
+            (
+                String::new(),
+                call(
+                    "giap-weather__search_web",
+                    json!({"query": "rain", "days": 2})
+                )
+            )
+        );
+        assert_eq!(
+            read("Jerr, here is the weather:\n\n<|tool_call>call:giap-weather__search_web{query:<|\"|>Nairobi<|\"|>,days:3}<tool_call|>"),
+            (
+                "Jerr, here is the weather:\n\n".to_string(),
+                call(
+                    "giap-weather__search_web",
+                    json!({"query": "Nairobi", "days": 3})
+                )
+            )
+        );
+        assert_eq!(
+            read("<|channel>thought\nThinking step...<channel|><|tool_call>call:giap-knowledge__search_web{question:<|\"|>Infamous games<|\"|>}<tool_call|>"),
+            (
+                "<|channel>thought\nThinking step...<channel|>".to_string(),
+                call(
+                    "giap-knowledge__search_web",
+                    json!({"question": "Infamous games"})
+                )
+            )
+        );
+        assert_eq!(
+            read("<|tool_call>call:giap-system__get_current_time<tool_call|>"),
+            (
+                String::new(),
+                call("giap-system__get_current_time", json!({}))
+            )
+        );
+        assert_eq!(
+            read("<|tool_call>call:giap-system__get_current_time{}<tool_call|>"),
+            (
+                String::new(),
+                call("giap-system__get_current_time", json!({}))
             )
         );
         assert_eq!(

@@ -29,7 +29,7 @@ use self::memory::{
 use crate::backend::{BackendLoadedModel, LocalGenerationRequest, LocalInferenceBackend};
 use crate::load_error::LoadStage;
 use crate::local_model_registry::{ChatTemplate, KvCachePolicy, ModelSettings, ToolCallingMode};
-use crate::multimodal::ExtractedImage;
+use crate::multimodal::ExtractedMedia;
 use crate::tool_parsing::compact_tools_json;
 use crate::{build_openai_messages_json, build_openai_text_messages_json, ResolvedModelPaths};
 use goose_provider_types::errors::ProviderError;
@@ -38,6 +38,10 @@ use goose_provider_types::formats::openai::format_tools;
 pub(super) const LLAMACPP_BACKEND_ID: &str = "llamacpp";
 
 const MIB: u64 = 1024 * 1024;
+
+/// Free memory, with the encoder loaded, above which it stays between turns rather than reloading
+/// (about 3.5 s for the 1 GB Gemma 4 file on an Orin). A Jetson sits far below it; a desktop above.
+const ENCODER_IDLE_FREE_BYTES: u64 = 4 * 1024 * MIB;
 
 const CODE_EXECUTION_TOOL: &str = "code_execution__execute_typescript";
 
@@ -739,6 +743,12 @@ impl LlamaCppBackend {
         &self.backend
     }
 
+    /// Whether a loaded encoder may stay between turns: only with room to spare beyond it, since
+    /// on a Jetson the same memory holds the next turn's KV cache.
+    fn encoder_may_idle(&self) -> bool {
+        self.available_memory_bytes() >= ENCODER_IDLE_FREE_BYTES
+    }
+
     fn init_mtmd_context(
         model: &LlamaModel,
         mmproj_path: &Option<PathBuf>,
@@ -881,17 +891,17 @@ impl LocalInferenceBackend for LlamaCppBackend {
             }
         }
 
-        let has_vision = request.resolved_model.mmproj_path.is_some();
+        let has_encoder = request.resolved_model.mmproj_path.is_some();
         let marker = llama_cpp_2::mtmd::mtmd_default_marker();
-        let (images, vision_messages): (Vec<ExtractedImage>, Option<Vec<_>>) = if has_vision {
-            let (imgs, msgs) =
-                super::multimodal::extract_images_from_messages(request.messages, marker);
-            (imgs, Some(msgs))
+        let (media, media_messages): (Vec<ExtractedMedia>, Option<Vec<_>>) = if has_encoder {
+            let (found, msgs) =
+                super::multimodal::extract_media_from_messages(request.messages, marker);
+            (found, Some(msgs))
         } else {
             (Vec::new(), None)
         };
-        let has_media = !images.is_empty();
-        let effective_messages = vision_messages.as_deref().unwrap_or(request.messages);
+        let has_media = !media.is_empty();
+        let effective_messages = media_messages.as_deref().unwrap_or(request.messages);
 
         let code_mode_enabled = request.tools.iter().any(|t| t.name == CODE_EXECUTION_TOOL);
         let (full_tools_json, compact_tools) = if !request.tools.is_empty() {
@@ -986,7 +996,12 @@ impl LocalInferenceBackend for LlamaCppBackend {
             )
         };
 
-        if !images.is_empty() && loaded.mtmd_ctx.is_none() {
+        // Kept from an earlier media call; a text call frees it unless the device has room to spare.
+        if !has_media && loaded.mtmd_ctx.is_some() && !self.encoder_may_idle() {
+            loaded.mtmd_ctx = None;
+            tracing::debug!("released the multimodal encoder before a text-only call");
+        }
+        if has_media && loaded.mtmd_ctx.is_none() {
             loaded.mtmd_ctx = Self::init_mtmd_context(
                 &loaded.model,
                 &request.resolved_model.mmproj_path,
@@ -1020,7 +1035,12 @@ impl LocalInferenceBackend for LlamaCppBackend {
         let mut gen_ctx = GenerationContext {
             draft: loaded.draft.as_ref(),
             model: &loaded.model,
-            mtmd_ctx: loaded.mtmd_ctx.as_ref(),
+            // A text call never sees a kept encoder, so its context sizing does not move with it.
+            mtmd_ctx: if has_media {
+                loaded.mtmd_ctx.as_ref()
+            } else {
+                None
+            },
             session: &mut loaded.session,
             snapshot: &mut loaded.snapshot,
             model_path: &loaded.model_path,
@@ -1033,7 +1053,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             message_id: request.message_id,
             tx: request.tx,
             log: request.log,
-            images: &images,
+            media: &media,
             model_load_ms: request.model_load_ms,
             one_shot: request.tools.is_empty(),
             tool_calls_only: request.tool_calls_only,
@@ -1043,6 +1063,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             compile_prefill: request.compile_prefill,
             prefill_retention_secs: request.prefill_retention_secs,
             rebuild_prefill: request.rebuild_prefill,
+            tool_call_emitted: false,
         };
 
         let result = if use_emulator {
@@ -1056,7 +1077,9 @@ impl LocalInferenceBackend for LlamaCppBackend {
                 request.tools,
             )
         };
-        if !images.is_empty() {
+        // A tool call means the agent calls again within this turn, with the same media.
+        let calls_again = gen_ctx.tool_call_emitted;
+        if has_media && !calls_again && !self.encoder_may_idle() {
             loaded.mtmd_ctx = None;
         }
         result

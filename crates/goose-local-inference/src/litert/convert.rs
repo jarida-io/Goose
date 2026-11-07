@@ -215,6 +215,9 @@ impl Builder {
                     texts.push(text.text.clone());
                 }
                 MessageContent::Image(_) => texts.push(IMAGE_NOT_SUPPORTED.to_string()),
+                MessageContent::Audio(_) => texts.push(
+                    goose_provider_types::conversation::message::AUDIO_NOT_SENT_NOTE.to_string(),
+                ),
                 MessageContent::ToolResponse(response) => {
                     let name = tool_names.get(response.id.as_str()).copied();
                     self.push(tool_message(name, response), None);
