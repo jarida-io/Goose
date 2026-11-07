@@ -72,4 +72,7 @@ pub(super) trait LocalInferenceBackend: Send + Sync {
     ) -> Result<(), ProviderError>;
 
     fn available_memory_bytes(&self) -> u64;
+
+    /// Let go of what an idle model holds beyond its weights.
+    fn release_idle_parts(&self, _loaded: &mut dyn BackendLoadedModel) {}
 }

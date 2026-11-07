@@ -151,6 +151,8 @@ pub fn builtin_chat_template_names() -> Vec<String> {
 /// released by [`evict_model`], never by provider churn.
 static RUNTIME: StdMutex<Option<Arc<InferenceRuntime>>> = StdMutex::new(None);
 
+const IDLE_PARTS_CHECKED_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn current_runtime() -> Option<Arc<InferenceRuntime>> {
     RUNTIME.lock().expect("runtime lock poisoned").clone()
 }
@@ -174,7 +176,45 @@ impl InferenceRuntime {
             backends,
         });
         *guard = Some(runtime.clone());
+        Self::release_idle_parts_every(Arc::downgrade(&runtime), IDLE_PARTS_CHECKED_EVERY);
         Ok(runtime)
+    }
+
+    /// Between calls nothing else reaches a loaded model, so an idle part would otherwise stay.
+    fn release_idle_parts_every(runtime: std::sync::Weak<Self>, every: std::time::Duration) {
+        let spawned = std::thread::Builder::new()
+            .name("local-inference-idle".into())
+            .spawn(move || loop {
+                std::thread::sleep(every);
+                let Some(runtime) = runtime.upgrade() else {
+                    return;
+                };
+                runtime.release_idle_parts();
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "idle parts of loaded models will not be released");
+        }
+    }
+
+    fn release_idle_parts(&self) {
+        let slots = {
+            let map = self.models.lock().expect("model cache lock poisoned");
+            map.iter()
+                .map(|(key, slot)| (key.backend_id, slot.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (backend_id, slot) in slots {
+            let Some(backend) = self.backends.get(backend_id) else {
+                continue;
+            };
+            // A slot someone holds is generating or loading, so nothing in it is idle.
+            let Ok(mut state) = slot.state.try_lock() else {
+                continue;
+            };
+            if let ModelSlotState::Loaded(loaded) = &mut *state {
+                backend.release_idle_parts(loaded.as_mut());
+            }
+        }
     }
 
     fn default_backend(&self) -> &dyn LocalInferenceBackend {

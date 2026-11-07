@@ -137,6 +137,8 @@ pub(super) struct LoadedModel {
     pub templates: LoadedChatTemplates,
     /// Multimodal context for vision models. None for text-only models.
     pub mtmd_ctx: Option<MtmdContext>,
+    /// When a media call last ended, for releasing an encoder nobody is using.
+    pub encoder_used: std::time::Instant,
     /// Generation context retained between requests for prompt prefix reuse.
     /// Dropped with the rest of the model when the slot is evicted.
     pub session: Option<SessionKv>,

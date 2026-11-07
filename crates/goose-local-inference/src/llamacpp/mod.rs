@@ -45,6 +45,14 @@ const MIB: u64 = 1024 * 1024;
 /// NVMe, the rest on the GPU), and with ~600 MB available the file cannot stay in the page cache.
 const ENCODER_RELEASE_BELOW_FREE_BYTES: u64 = 128 * MIB;
 
+/// An encoder unused this long is released whatever memory is free: a spoken conversation's next
+/// heard turn comes well inside it, and on a Jetson its 945 MB beside the speech engines ran out.
+const ENCODER_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A text call releases an encoder unused this long. A conversation's own calls all carry its
+/// media, so a text call after a quiet spell is other work, such as a background job, and needs the room.
+const ENCODER_IDLE_BEFORE_TEXT: std::time::Duration = std::time::Duration::from_secs(15);
+
 const CODE_EXECUTION_TOOL: &str = "code_execution__execute_typescript";
 
 pub(super) fn builtin_chat_template_names() -> Vec<String> {
@@ -756,9 +764,10 @@ impl LlamaCppBackend {
             target: "giap::trace",
             kind = "encoder_released",
             before,
+            idle_s = loaded.encoder_used.elapsed().as_secs(),
             free_mb = self.available_memory_bytes() / MIB,
             floor_mb = ENCODER_RELEASE_BELOW_FREE_BYTES / MIB,
-            "released the multimodal encoder: free memory fell below its floor"
+            "released the multimodal encoder"
         );
     }
 
@@ -880,6 +889,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             draft_tried: resolved.draft_model_path.clone(),
             templates,
             mtmd_ctx,
+            encoder_used: std::time::Instant::now(),
             session: None,
             snapshot: None,
             suspended: None,
@@ -1029,7 +1039,11 @@ impl LocalInferenceBackend for LlamaCppBackend {
             )
         };
 
-        if !has_media && loaded.mtmd_ctx.is_some() && !self.encoder_may_stay() {
+        if !has_media
+            && loaded.mtmd_ctx.is_some()
+            && (!self.encoder_may_stay()
+                || loaded.encoder_used.elapsed() >= ENCODER_IDLE_BEFORE_TEXT)
+        {
             self.release_encoder(loaded, "text_call");
         }
         if has_media && loaded.mtmd_ctx.is_none() {
@@ -1120,10 +1134,22 @@ impl LocalInferenceBackend for LlamaCppBackend {
         };
         // A tool call means the agent calls again within this turn, with the same media.
         let calls_again = gen_ctx.tool_call_emitted;
+        if has_media {
+            loaded.encoder_used = std::time::Instant::now();
+        }
         if has_media && !calls_again && !self.encoder_may_stay() {
             self.release_encoder(loaded, "after_media_call");
         }
         result
+    }
+
+    fn release_idle_parts(&self, loaded: &mut dyn BackendLoadedModel) {
+        let Some(loaded) = loaded.as_any_mut().downcast_mut::<LoadedModel>() else {
+            return;
+        };
+        if loaded.mtmd_ctx.is_some() && loaded.encoder_used.elapsed() >= ENCODER_IDLE {
+            self.release_encoder(loaded, "idle");
+        }
     }
 
     fn available_memory_bytes(&self) -> u64 {
