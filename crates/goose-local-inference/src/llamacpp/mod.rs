@@ -39,6 +39,10 @@ pub(super) const LLAMACPP_BACKEND_ID: &str = "llamacpp";
 
 const MIB: u64 = 1024 * 1024;
 
+/// Free memory, with the encoder loaded, above which it stays between turns rather than reloading
+/// (about 3.5 s for the 1 GB Gemma 4 file on an Orin). A Jetson sits far below it; a desktop above.
+const ENCODER_IDLE_FREE_BYTES: u64 = 4 * 1024 * MIB;
+
 const CODE_EXECUTION_TOOL: &str = "code_execution__execute_typescript";
 
 pub(super) fn builtin_chat_template_names() -> Vec<String> {
@@ -739,6 +743,12 @@ impl LlamaCppBackend {
         &self.backend
     }
 
+    /// Whether a loaded encoder may stay between turns: only with room to spare beyond it, since
+    /// on a Jetson the same memory holds the next turn's KV cache.
+    fn encoder_may_idle(&self) -> bool {
+        self.available_memory_bytes() >= ENCODER_IDLE_FREE_BYTES
+    }
+
     fn init_mtmd_context(
         model: &LlamaModel,
         mmproj_path: &Option<PathBuf>,
@@ -986,6 +996,11 @@ impl LocalInferenceBackend for LlamaCppBackend {
             )
         };
 
+        // Kept from an earlier media call; a text call frees it unless the device has room to spare.
+        if !has_media && loaded.mtmd_ctx.is_some() && !self.encoder_may_idle() {
+            loaded.mtmd_ctx = None;
+            tracing::debug!("released the multimodal encoder before a text-only call");
+        }
         if has_media && loaded.mtmd_ctx.is_none() {
             loaded.mtmd_ctx = Self::init_mtmd_context(
                 &loaded.model,
@@ -1020,7 +1035,12 @@ impl LocalInferenceBackend for LlamaCppBackend {
         let mut gen_ctx = GenerationContext {
             draft: loaded.draft.as_ref(),
             model: &loaded.model,
-            mtmd_ctx: loaded.mtmd_ctx.as_ref(),
+            // A text call never sees a kept encoder, so its context sizing does not move with it.
+            mtmd_ctx: if has_media {
+                loaded.mtmd_ctx.as_ref()
+            } else {
+                None
+            },
             session: &mut loaded.session,
             snapshot: &mut loaded.snapshot,
             model_path: &loaded.model_path,
@@ -1043,6 +1063,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             compile_prefill: request.compile_prefill,
             prefill_retention_secs: request.prefill_retention_secs,
             rebuild_prefill: request.rebuild_prefill,
+            tool_call_emitted: false,
         };
 
         let result = if use_emulator {
@@ -1056,7 +1077,9 @@ impl LocalInferenceBackend for LlamaCppBackend {
                 request.tools,
             )
         };
-        if has_media {
+        // A tool call means the agent calls again within this turn, with the same media.
+        let calls_again = gen_ctx.tool_call_emitted;
+        if has_media && !calls_again && !self.encoder_may_idle() {
             loaded.mtmd_ctx = None;
         }
         result

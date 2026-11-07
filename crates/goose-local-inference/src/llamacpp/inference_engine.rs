@@ -122,6 +122,8 @@ pub(super) struct GenerationContext<'a> {
     pub prefill_retention_secs: Option<u64>,
     /// The compile rebuilds even a valid snapshot (`LocalGenerationRequest::rebuild_prefill`).
     pub rebuild_prefill: bool,
+    /// Set when the reply ends in a tool call, so the agent will call again within this turn.
+    pub tool_call_emitted: bool,
 }
 
 pub(super) struct LoadedModel {
@@ -267,6 +269,14 @@ pub(super) struct MediaHead {
 }
 
 impl MediaHead {
+    /// The tokens at positions `[0, n)`, ahead of the head's first media chunk.
+    fn leading_text(&self) -> Option<&[LlamaToken]> {
+        match self.chunks.first() {
+            Some(HeadChunk::Text(tokens)) => Some(tokens),
+            _ => None,
+        }
+    }
+
     /// `None` when `(chunks, images)` reproduce this head exactly.
     ///
     /// Ordered narrowest cause first — see [`HeadMismatch`]. The byte compare
@@ -1976,23 +1986,43 @@ fn prefill_prompt(
     } else {
         super::prompt_snapshot::SnapshotClass::Shared
     };
-    let plan = prefill_plan(
-        session.as_ref().map(|kv| {
-            // A text-only prompt carries no media, so it can never reproduce a
-            // retained media head and nothing behind that head is resumable.
-            let mut retained = if kv.head.is_some() {
-                RetainedPrefix::opaque(kv)
-            } else {
-                RetainedPrefix::resumable(kv)
-            };
-            retained.worth_protecting &=
-                retained_cache_protected(helper, !one_shot, kv.last_used.elapsed());
-            retained.protect_from_side_call = one_shot;
-            retained
-        }),
+    fn retained_of(kv: &SessionKv, helper: bool, one_shot: bool) -> RetainedPrefix<'_> {
+        // A text-only prompt carries no media, so it can never reproduce a
+        // retained media head and nothing behind that head is resumable.
+        let mut retained = if kv.head.is_some() {
+            RetainedPrefix::opaque(kv)
+        } else {
+            RetainedPrefix::resumable(kv)
+        };
+        retained.worth_protecting &=
+            retained_cache_protected(helper, !one_shot, kv.last_used.elapsed());
+        retained.protect_from_side_call = one_shot;
+        retained
+    }
+    let mut plan = prefill_plan(
+        session.as_ref().map(|kv| retained_of(kv, helper, one_shot)),
         prompt,
         n_ctx,
     );
+    // About to be thrown away anyway: a cache behind a media head still holds this prompt's
+    // leading text, since the media that followed it is no longer in the conversation.
+    if matches!(
+        plan,
+        PrefillPlan::CreateContext | PrefillPlan::FullPrefillInPlace
+    ) && session
+        .as_mut()
+        .is_some_and(|kv| kv.head.is_some() && read_as_leading_text(kv))
+    {
+        plan = prefill_plan(
+            session.as_ref().map(|kv| retained_of(kv, helper, one_shot)),
+            prompt,
+            n_ctx,
+        );
+        tracing::debug!(
+            ?plan,
+            "a cache behind a media head, read as its leading text"
+        );
+    }
     tracing::debug!(
         ?plan,
         cached_tokens = session.as_ref().map(|kv| kv.tokens.len()),
@@ -2327,6 +2357,153 @@ fn reuse_media_head(
     }
 }
 
+/// The text tokens ahead of the first media chunk, and that chunk's index.
+fn leading_text(chunks: &MtmdInputChunks) -> Option<(Vec<LlamaToken>, usize)> {
+    let mut lead = Vec::new();
+    for index in 0..chunks.len() {
+        let chunk = chunks.get(index)?;
+        match chunk.chunk_type() {
+            MtmdInputChunkType::Text => lead.extend_from_slice(chunk.text_tokens()?),
+            MtmdInputChunkType::Image | MtmdInputChunkType::Audio => return Some((lead, index)),
+        }
+    }
+    None
+}
+
+/// Read a cache behind a media head as its leading text chunk: positions `[0, n)` hold exactly
+/// those tokens, and what follows is trailing KV every resume trims. False for a head that opens
+/// with media, which leaves no text to read.
+fn read_as_leading_text(kv: &mut SessionKv) -> bool {
+    let Some(head) = kv.head.as_ref() else {
+        return true;
+    };
+    let Some(tokens) = head.leading_text() else {
+        return false;
+    };
+    kv.tokens = tokens.to_vec();
+    kv.head = None;
+    true
+}
+
+/// Evaluate every chunk from `first_media` on, starting at `n_past`; logits for the last only.
+fn eval_from_first_media(
+    kv: &mut SessionKv,
+    chunks: &MtmdInputChunks,
+    mtmd_ctx: &MtmdContext,
+    first_media: usize,
+    mut n_past: i32,
+) -> Result<i32, String> {
+    let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
+    let last = chunks.len() - 1;
+    for index in first_media..chunks.len() {
+        let chunk = chunks
+            .get(index)
+            .ok_or_else(|| format!("chunk {index} is missing"))?;
+        n_past = chunk
+            .eval(mtmd_ctx, kv.ctx.ctx(), n_past, 0, n_batch, index == last)
+            .map_err(|e| format!("chunk {index}: {e}"))?;
+    }
+    Ok(n_past)
+}
+
+/// Serve a media prompt from the retained cache's plain-token prefix: keep the KV for the text
+/// ahead of the first picture or recording, then evaluate only the chunks from there.
+///
+/// A voice note or picture sits at the end of the prompt, behind a system prompt and history the
+/// cache already holds, so this skips nearly all of the prefill a rebuild would redo. A cache
+/// behind an older media head is read as its leading text chunk: an earlier turn's picture or
+/// recording no longer sits at that position in this prompt. `None` leaves the rebuild to the
+/// caller, with the session dropped whenever the attempt changed it.
+fn resume_behind_text(
+    session: &mut Option<SessionKv>,
+    chunks: &MtmdInputChunks,
+    mtmd_ctx: &MtmdContext,
+    split: &SplitChunks,
+    media: &[ExtractedMedia],
+    n_ctx: u32,
+) -> Option<usize> {
+    let kv = session.as_mut()?;
+    // A drafter's cache would fall behind the media decoded into its target.
+    if kv.ctx.mtp_mut().is_some() {
+        return None;
+    }
+    let (lead, first_media) = leading_text(chunks)?;
+    if mtmd_ctx.decode_use_non_causal() {
+        // A non-causal chunk must fit one micro-batch, which the rebuild sizes for and a
+        // retained cache may not be.
+        let widest = (first_media..chunks.len())
+            .filter_map(|i| chunks.get(i))
+            .filter(|c| c.chunk_type() != MtmdInputChunkType::Text)
+            .map(|c| c.n_tokens())
+            .max()
+            .unwrap_or(0);
+        if (kv.ctx.ctx().n_ubatch() as usize) < widest {
+            return None;
+        }
+    }
+    if !read_as_leading_text(kv) {
+        *session = None;
+        return None;
+    }
+    let plan = prefill_plan(Some(RetainedPrefix::resumable(kv)), &lead, n_ctx);
+    let PrefillPlan::ReusePrefix(resume) = plan else {
+        tracing::debug!(
+            ?plan,
+            shared = common_prefix_len(&kv.tokens, &lead),
+            lead_tokens = lead.len(),
+            cached_tokens = kv.tokens.len(),
+            lead_head = ?&lead[..lead.len().min(4)],
+            cached_head = ?&kv.tokens[..kv.tokens.len().min(4)],
+            "media prompt cannot resume behind the cached text"
+        );
+        return None;
+    };
+    let resumed = match reuse_prefix(kv, &lead, resume) {
+        Ok(resumed) => resumed,
+        Err(PrefixReuseError::Refused) => return None,
+        Err(PrefixReuseError::Poisoned(e)) => {
+            tracing::warn!(error = %e, "text decode ahead of the media failed; rebuilding");
+            *session = None;
+            return None;
+        }
+    };
+
+    let start = i32::try_from(lead.len()).ok()?;
+    let n_past = match eval_from_first_media(kv, chunks, mtmd_ctx, first_media, start) {
+        Ok(n_past) => n_past,
+        Err(e) => {
+            tracing::warn!(error = %e, "media decode behind a reused prefix failed; rebuilding");
+            *session = None;
+            return None;
+        }
+    };
+    if i32::try_from(split.head_pos + split.tail.len()).ok() != Some(n_past) {
+        tracing::debug!(
+            n_past,
+            "resumed media cache disagrees with its chunks; rebuilding"
+        );
+        *session = None;
+        return None;
+    }
+
+    kv.head = Some(MediaHead {
+        chunks: split.head.clone(),
+        n_pos: split.head_pos,
+        images: media.iter().map(|item| item.bytes.clone()).collect(),
+    });
+    kv.tokens = split.tail.clone();
+    tracing::info!(
+        target: "giap::kv",
+        kind = "media_prefix_reused",
+        reused = resumed,
+        lead_tokens = lead.len(),
+        media_chunks = chunks.len() - first_media,
+        n_past,
+        "media prompt resumed behind the cached text prefix"
+    );
+    Some(resumed)
+}
+
 /// mtmd's own sniffing decides picture or sound; a sound it reads as a picture is refused,
 /// since stb would otherwise decode a stray byte pattern into a picture of noise.
 fn decode_media(
@@ -2431,9 +2608,11 @@ fn prefill_multimodal(
 
     let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
 
+    // Tokenized exactly as the text path tokenizes a prompt (`AddBos::Never`), or no cached text
+    // prefix could ever match: mtmd would put a BOS ahead of it.
     let input_text = MtmdInputText {
         text: prompt_text.to_string(),
-        add_special: true,
+        add_special: false,
         parse_special: true,
     };
     let chunks = mtmd_ctx.tokenize(input_text, &bitmap_refs).map_err(|e| {
@@ -2500,6 +2679,16 @@ fn prefill_multimodal(
                 },
             ));
         }
+        if let Some(resume) = resume_behind_text(session, &chunks, mtmd_ctx, split, media, n_ctx) {
+            return Ok((
+                prompt_token_count,
+                PrefilledPrompt {
+                    reused_prefix_tokens: resume,
+                    transient: None,
+                    effective_ctx,
+                },
+            ));
+        }
     }
 
     // Release the retained cache before allocating its replacement so the two
@@ -2512,10 +2701,24 @@ fn prefill_multimodal(
     }
     let mut kv = SessionKv::create(model, None, backend, n_ctx, &mm_settings)?;
 
-    let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
-    let n_past = chunks
-        .eval_chunks(mtmd_ctx, kv.ctx.ctx(), 0, 0, n_batch, true)
-        .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
+    // The text ahead of the first media is decoded as text, so its window checkpoints let a later
+    // turn resume behind it (`resume_behind_text`, and the text path once the media is gone).
+    let n_past = match leading_text(&chunks).filter(|(lead, _)| !lead.is_empty()) {
+        Some((lead, first_media)) => {
+            decode_checkpointed(&mut kv, &lead, 0)?;
+            let start = i32::try_from(lead.len()).map_err(|_| {
+                ProviderError::ExecutionError("Multimodal prompt is too long".to_string())
+            })?;
+            eval_from_first_media(&mut kv, &chunks, mtmd_ctx, first_media, start)
+        }
+        None => {
+            let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
+            chunks
+                .eval_chunks(mtmd_ctx, kv.ctx.ctx(), 0, 0, n_batch, true)
+                .map_err(|e| e.to_string())
+        }
+    }
+    .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
 
     // Retain the cache only when the chunk list was describable AND the position
     // model it produced is addressable.
@@ -3230,6 +3433,53 @@ pub(super) mod tests {
             bytes: bytes.to_vec(),
             audio: false,
         }
+    }
+
+    #[test]
+    fn a_media_head_reads_as_the_text_ahead_of_its_first_media() {
+        let lead: Vec<LlamaToken> = (0..300).map(LlamaToken::new).collect();
+        let head = media_head(
+            vec![
+                HeadChunk::Text(lead.clone()),
+                HeadChunk::Media {
+                    n_tokens: 176,
+                    n_pos: 176,
+                },
+                HeadChunk::Text(vec![LlamaToken::new(9)]),
+            ],
+            &[b"RIFF"],
+        );
+        assert_eq!(head.leading_text(), Some(lead.as_slice()));
+
+        let opens_with_media = media_head(
+            vec![HeadChunk::Media {
+                n_tokens: 4,
+                n_pos: 4,
+            }],
+            &[b"x"],
+        );
+        assert_eq!(opens_with_media.leading_text(), None);
+    }
+
+    #[test]
+    fn the_next_turns_lead_resumes_just_short_of_the_old_media() {
+        // The old lead ended at a recording; the new prompt carries a note in its place, and
+        // tokenizes the boundary a little differently.
+        let old_lead: Vec<LlamaToken> = (0..2_000).map(LlamaToken::new).collect();
+        let mut new_lead = old_lead[..1_998].to_vec();
+        new_lead.extend((7_000..7_040).map(LlamaToken::new));
+        let retained = RetainedPrefix {
+            media_pos: 0,
+            tokens: &old_lead,
+            occupied: old_lead.len() + 500,
+            n_ctx: 32_768,
+            worth_protecting: true,
+            protect_from_side_call: false,
+        };
+        assert_eq!(
+            prefill_plan(Some(retained), &new_lead, 32_768),
+            PrefillPlan::ReusePrefix(1_998)
+        );
     }
 
     fn media_head(chunks: Vec<HeadChunk>, images: &[&[u8]]) -> MediaHead {

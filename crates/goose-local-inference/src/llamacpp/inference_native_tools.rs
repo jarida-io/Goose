@@ -282,6 +282,7 @@ pub(super) fn generate_with_native_tools(
         ));
     }
     if !tool_call_contents.is_empty() {
+        ctx.tool_call_emitted = true;
         let mut contents: Vec<MessageContent> = Vec::new();
         if !output_filter.accumulated_thinking().is_empty() {
             contents.push(MessageContent::thinking(
