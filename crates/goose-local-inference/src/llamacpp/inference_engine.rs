@@ -147,8 +147,8 @@ pub(super) struct LoadedModel {
     /// every request.
     pub draft_tried: Option<std::path::PathBuf>,
     pub templates: LoadedChatTemplates,
-    /// Multimodal context for vision models. None for text-only models.
-    pub mtmd_ctx: Option<MtmdContext>,
+    /// The multimodal encoder, loaded by the first turn that brings media.
+    pub encoder: Option<super::Encoder>,
     /// Generation context retained between requests for prompt prefix reuse.
     /// Dropped with the rest of the model when the slot is evicted.
     pub session: Option<SessionKv>,
@@ -2588,6 +2588,7 @@ fn wav_duration_ms(bytes: &[u8]) -> Option<u64> {
 #[allow(clippy::too_many_arguments)]
 fn prefill_multimodal(
     session: &mut Option<SessionKv>,
+    snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
     model: &Arc<LlamaModel>,
     mtmd_ctx: Option<&MtmdContext>,
     backend: &LlamaCppBackend,
@@ -2718,9 +2719,19 @@ fn prefill_multimodal(
     // The text ahead of the first media is decoded as text, so its window checkpoints let a later
     // turn resume behind it (`resume_behind_text`, and the text path once the media is gone).
     let eval_started = std::time::Instant::now();
+    let mut restored = 0;
     let n_past = match leading_text(&chunks).filter(|(lead, _)| !lead.is_empty()) {
         Some((lead, first_media)) => {
-            decode_checkpointed(&mut kv, &lead, 0)?;
+            // The preamble the text path saved stands in for decoding it: after a text turn with a
+            // drafter, which this cache cannot resume behind, that is most of the prompt.
+            restored = snapshot
+                .as_mut()
+                .and_then(|slot| slot.load(kv.context_mut(), &lead))
+                .unwrap_or(0);
+            if restored > 0 {
+                kv.checkpoint_window(&lead[..restored]);
+            }
+            decode_checkpointed(&mut kv, &lead, restored)?;
             let start = i32::try_from(lead.len()).map_err(|_| {
                 ProviderError::ExecutionError("Multimodal prompt is too long".to_string())
             })?;
@@ -2738,6 +2749,7 @@ fn prefill_multimodal(
         target: "giap::kv",
         kind = "media_prompt_rebuilt",
         prompt_tokens = prompt_token_count,
+        restored_tokens = restored,
         n_past,
         eval_ms = eval_started.elapsed().as_millis() as u64,
         "media prompt evaluated into a fresh cache"
@@ -2777,7 +2789,7 @@ fn prefill_multimodal(
         return Ok((
             prompt_token_count,
             PrefilledPrompt {
-                reused_prefix_tokens: 0,
+                reused_prefix_tokens: restored,
                 transient: Some(kv),
                 effective_ctx,
             },
@@ -2796,7 +2808,7 @@ fn prefill_multimodal(
     Ok((
         prompt_token_count,
         PrefilledPrompt {
-            reused_prefix_tokens: 0,
+            reused_prefix_tokens: restored,
             transient: None,
             effective_ctx,
         },
@@ -2953,6 +2965,7 @@ pub(super) fn prepare_generation(
         // which is consistent with the vision request bypassing KV retention too.
         let (ptc, prefilled) = prefill_multimodal(
             ctx.session,
+            ctx.snapshot,
             ctx.model,
             ctx.mtmd_ctx,
             ctx.backend,
