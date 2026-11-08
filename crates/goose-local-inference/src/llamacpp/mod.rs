@@ -47,10 +47,9 @@ const MIB: u64 = 1024 * 1024;
 /// NVMe, the rest on the GPU), and with ~600 MB available the file cannot stay in the page cache.
 const ENCODER_RELEASE_BELOW_FREE_BYTES: u64 = 128 * MIB;
 
-/// Left available when an encoder loads on unified memory. The reply after it is spoken, and
-/// Kokoro took 150-300 MB a unit beside the encoder on the Orin, which ran out of memory when an
-/// encoder had loaded into less.
-const ENCODER_LOAD_RESERVE_BYTES: u64 = 384 * MIB;
+/// Left available when an encoder loads on unified memory, for the reply spoken after it. Kokoro
+/// hands back each unit's 150-480 MB, so swap covers a unit's peak and the recording is heard.
+const ENCODER_LOAD_RESERVE_BYTES: u64 = 256 * MIB;
 
 /// Whether this machine's GPU shares system memory; unset until the backend has looked.
 static UNIFIED_MEMORY: OnceLock<bool> = OnceLock::new();
