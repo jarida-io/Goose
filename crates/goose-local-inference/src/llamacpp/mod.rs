@@ -1,3 +1,4 @@
+mod encoder_backend;
 mod inference_emulated_tools;
 mod inference_engine;
 mod inference_native_tools;
@@ -39,9 +40,10 @@ pub(super) const LLAMACPP_BACKEND_ID: &str = "llamacpp";
 
 const MIB: u64 = 1024 * 1024;
 
-/// Free memory, with the encoder loaded, above which it stays between turns rather than reloading
-/// (about 3.5 s for the 1 GB Gemma 4 file on an Orin). A Jetson sits far below it; a desktop above.
-const ENCODER_IDLE_FREE_BYTES: u64 = 4 * 1024 * MIB;
+/// Free memory below which a loaded encoder is released instead of kept for the next picture or
+/// voice note. Kept otherwise: on an Orin a reload costs about 3.2 s (1.5 s reading 945 MB from
+/// NVMe, the rest on the GPU), and with ~600 MB available the file cannot stay in the page cache.
+const ENCODER_RELEASE_BELOW_FREE_BYTES: u64 = 128 * MIB;
 
 const CODE_EXECUTION_TOOL: &str = "code_execution__execute_typescript";
 
@@ -743,10 +745,21 @@ impl LlamaCppBackend {
         &self.backend
     }
 
-    /// Whether a loaded encoder may stay between turns: only with room to spare beyond it, since
-    /// on a Jetson the same memory holds the next turn's KV cache.
-    fn encoder_may_idle(&self) -> bool {
-        self.available_memory_bytes() >= ENCODER_IDLE_FREE_BYTES
+    /// Whether a loaded encoder may stay loaded: always, short of the safety floor.
+    fn encoder_may_stay(&self) -> bool {
+        self.available_memory_bytes() >= ENCODER_RELEASE_BELOW_FREE_BYTES
+    }
+
+    fn release_encoder(&self, loaded: &mut LoadedModel, before: &'static str) {
+        loaded.mtmd_ctx = None;
+        tracing::info!(
+            target: "giap::trace",
+            kind = "encoder_released",
+            before,
+            free_mb = self.available_memory_bytes() / MIB,
+            floor_mb = ENCODER_RELEASE_BELOW_FREE_BYTES / MIB,
+            "released the multimodal encoder: free memory fell below its floor"
+        );
     }
 
     fn init_mtmd_context(
@@ -766,8 +779,28 @@ impl LlamaCppBackend {
             ..MtmdContextParams::default()
         };
 
-        match MtmdContext::init_from_file(mmproj_path.to_str().unwrap_or_default(), model, &params)
-        {
+        let (loaded, said) = encoder_backend::caught_while(|| {
+            MtmdContext::init_from_file(mmproj_path.to_str().unwrap_or_default(), model, &params)
+        });
+        let backend = encoder_backend::EncoderBackend::from_lines(&said.concat());
+        tracing::info!(
+            target: "giap::trace",
+            kind = "encoder_backend",
+            backend = %backend.backends.join(","),
+            flash_attention = %backend.flash_attention.join(","),
+            cpu_ops = %backend.cpu_ops.join(","),
+            "where the multimodal encoder runs"
+        );
+        if loaded.is_ok() && !backend.fully_accelerated() {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "encoder_not_accelerated",
+                backend = %backend.backends.join(","),
+                cpu_ops = %backend.cpu_ops.join(","),
+                "part of the multimodal encoder runs on the CPU"
+            );
+        }
+        match loaded {
             Ok(ctx) => {
                 tracing::info!(
                     vision = ctx.support_vision(),
@@ -996,17 +1029,25 @@ impl LocalInferenceBackend for LlamaCppBackend {
             )
         };
 
-        // Kept from an earlier media call; a text call frees it unless the device has room to spare.
-        if !has_media && loaded.mtmd_ctx.is_some() && !self.encoder_may_idle() {
-            loaded.mtmd_ctx = None;
-            tracing::debug!("released the multimodal encoder before a text-only call");
+        if !has_media && loaded.mtmd_ctx.is_some() && !self.encoder_may_stay() {
+            self.release_encoder(loaded, "text_call");
         }
         if has_media && loaded.mtmd_ctx.is_none() {
+            let started = std::time::Instant::now();
             loaded.mtmd_ctx = Self::init_mtmd_context(
                 &loaded.model,
                 &request.resolved_model.mmproj_path,
                 request.settings,
             );
+            if loaded.mtmd_ctx.is_some() {
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "encoder_loaded",
+                    load_ms = started.elapsed().as_millis() as u64,
+                    free_mb = self.available_memory_bytes() / MIB,
+                    "multimodal encoder loaded; it stays loaded above its memory floor"
+                );
+            }
             // The encoder reads its file whole onto the GPU, and this turn's context is
             // allocated next, against what that read left free.
             if let (Some(_), Some(mmproj)) = (
@@ -1064,6 +1105,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             prefill_retention_secs: request.prefill_retention_secs,
             rebuild_prefill: request.rebuild_prefill,
             tool_call_emitted: false,
+            stop_when: request.stop_when,
         };
 
         let result = if use_emulator {
@@ -1079,8 +1121,8 @@ impl LocalInferenceBackend for LlamaCppBackend {
         };
         // A tool call means the agent calls again within this turn, with the same media.
         let calls_again = gen_ctx.tool_call_emitted;
-        if has_media && !calls_again && !self.encoder_may_idle() {
-            loaded.mtmd_ctx = None;
+        if has_media && !calls_again && !self.encoder_may_stay() {
+            self.release_encoder(loaded, "after_media_call");
         }
         result
     }

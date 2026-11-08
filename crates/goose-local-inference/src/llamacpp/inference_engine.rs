@@ -124,6 +124,18 @@ pub(super) struct GenerationContext<'a> {
     pub rebuild_prefill: bool,
     /// Set when the reply ends in a tool call, so the agent will call again within this turn.
     pub tool_call_emitted: bool,
+    /// Ends the generation at its next token (`LocalGenerationRequest::stop_when`).
+    pub stop_when: Option<goose_provider_types::request_context::StopWhen>,
+}
+
+impl<'a> GenerationContext<'a> {
+    /// Asked on every generated token, not only on those that send: a reply buffering a tool
+    /// call or thinking sends nothing for a long stretch, and would otherwise run to its end.
+    pub fn wanted_elsewhere(&self) -> impl Fn() -> bool + 'a {
+        let tx = self.tx;
+        let stop = self.stop_when.clone();
+        move || tx.is_closed() || stop.as_ref().is_some_and(|stop| stop())
+    }
 }
 
 pub(super) struct LoadedModel {
@@ -2469,6 +2481,7 @@ fn resume_behind_text(
     };
 
     let start = i32::try_from(lead.len()).ok()?;
+    let eval_started = std::time::Instant::now();
     let n_past = match eval_from_first_media(kv, chunks, mtmd_ctx, first_media, start) {
         Ok(n_past) => n_past,
         Err(e) => {
@@ -2499,6 +2512,7 @@ fn resume_behind_text(
         lead_tokens = lead.len(),
         media_chunks = chunks.len() - first_media,
         n_past,
+        eval_ms = eval_started.elapsed().as_millis() as u64,
         "media prompt resumed behind the cached text prefix"
     );
     Some(resumed)
@@ -2703,6 +2717,7 @@ fn prefill_multimodal(
 
     // The text ahead of the first media is decoded as text, so its window checkpoints let a later
     // turn resume behind it (`resume_behind_text`, and the text path once the media is gone).
+    let eval_started = std::time::Instant::now();
     let n_past = match leading_text(&chunks).filter(|(lead, _)| !lead.is_empty()) {
         Some((lead, first_media)) => {
             decode_checkpointed(&mut kv, &lead, 0)?;
@@ -2719,6 +2734,14 @@ fn prefill_multimodal(
         }
     }
     .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
+    tracing::info!(
+        target: "giap::kv",
+        kind = "media_prompt_rebuilt",
+        prompt_tokens = prompt_token_count,
+        n_past,
+        eval_ms = eval_started.elapsed().as_millis() as u64,
+        "media prompt evaluated into a fresh cache"
+    );
 
     // Retain the cache only when the chunk list was describable AND the position
     // model it produced is addressable.

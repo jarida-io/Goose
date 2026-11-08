@@ -53,6 +53,9 @@ pub(super) struct LocalGenerationRequest<'a> {
     pub prefill_retention_secs: Option<u64>,
     /// The compile rebuilds even a valid snapshot (see `request_context::rebuilding_prefill`).
     pub rebuild_prefill: bool,
+    /// Ends the generation at its next token once true (see `request_context::stopping_when`).
+    /// LiteRT-LM ignores it.
+    pub stop_when: Option<goose_provider_types::request_context::StopWhen>,
 }
 
 pub(super) trait LocalInferenceBackend: Send + Sync {

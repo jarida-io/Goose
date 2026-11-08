@@ -783,6 +783,7 @@ impl Provider for LocalInferenceProvider {
         let prefill_retention_secs =
             goose_provider_types::request_context::prefill_retention_secs();
         let rebuild_prefill = goose_provider_types::request_context::is_rebuilding_prefill();
+        let stop_when = goose_provider_types::request_context::stop_when();
         let temperature = model_config.temperature;
         let max_tokens = model_config.max_tokens;
         let context_limit = model_context_limit;
@@ -956,6 +957,16 @@ impl Provider for LocalInferenceProvider {
                 }
 
                 let mut model_guard = model_arc.state.blocking_lock();
+                // A caller that wanted the model back while this call waited gets nothing decoded.
+                if stop_when.as_ref().is_some_and(|stop| stop()) {
+                    tracing::info!(
+                        target: "giap::trace",
+                        kind = "generation_stopped",
+                        at = "before_prefill",
+                        "a call was stopped before it took the model"
+                    );
+                    return;
+                }
                 let loaded = match &mut *model_guard {
                     ModelSlotState::Loaded(loaded) => loaded.as_mut(),
                     ModelSlotState::Empty | ModelSlotState::Loading => {
@@ -990,6 +1001,7 @@ impl Provider for LocalInferenceProvider {
                     compile_prefill,
                     prefill_retention_secs,
                     rebuild_prefill,
+                    stop_when,
                 };
 
                 let result = backend.generate(loaded, request);
