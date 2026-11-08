@@ -32,6 +32,8 @@ pub(super) fn generate_with_native_tools(
     let message_id = ctx.message_id;
     let tx = ctx.tx;
     let tool_calls_only = ctx.tool_calls_only;
+    let wanted_elsewhere = ctx.wanted_elsewhere();
+    let mut stopped_for_another = false;
     let mut stopped_at_prose = false;
     let mut generated_text = String::new();
     let mut stop_trimmer = StopSuffixTrimmer::new(&template_result.additional_stops);
@@ -88,6 +90,10 @@ pub(super) fn generate_with_native_tools(
         effective_ctx,
         &mut decoded_tokens,
         |piece| {
+            if wanted_elsewhere() {
+                stopped_for_another = true;
+                return Ok(TokenAction::Stop);
+            }
             first_piece_at.get_or_insert_with(std::time::Instant::now);
             generated_text.push_str(piece);
             let mut stop_seen = false;
@@ -203,6 +209,18 @@ pub(super) fn generate_with_native_tools(
     // than at end of scope, so it overlaps the retained one for as short a time
     // as possible.
     drop(transient_session);
+
+    // A cut reply is not finished: its partial tool call must not reach the agent.
+    if stopped_for_another {
+        tracing::info!(
+            target: "giap::trace",
+            kind = "generation_stopped",
+            at = "decode",
+            output_tokens = output_token_count,
+            "a call was stopped at a token; the cache keeps what it decoded"
+        );
+        return Ok(());
+    }
 
     // Finalize the streaming parser with is_partial=false
     if let Ok(final_deltas) = stream_parser.update("", false) {

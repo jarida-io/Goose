@@ -1,6 +1,9 @@
 //! What a provider call is for, carried from the caller to the provider on the same task, as
 //! goose's `session_context` carries the session id.
 
+/// Asked between tokens; true once the caller wants the model back for a stronger claim.
+pub type StopWhen = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 tokio::task_local! {
     static REPLACES_HISTORY: bool;
     static SESSION: Option<String>;
@@ -10,6 +13,19 @@ tokio::task_local! {
     static COMPILING_PREFILL: Option<String>;
     static PREFILL_RETENTION_SECS: Option<u64>;
     static PREFILL_REBUILD: bool;
+    static STOP_WHEN: Option<StopWhen>;
+}
+
+/// Runs `f` as a call that ends at its next token once `stop` says so. The stream just ends: the
+/// caller asked, so it knows the answer is cut, and a provider keeps what the cache holds.
+pub async fn stopping_when<F: std::future::Future>(stop: StopWhen, f: F) -> F::Output {
+    STOP_WHEN.scope(Some(stop), f).await
+}
+
+/// The stop the current call carries; `None` outside [`stopping_when`]. Read it before handing
+/// work to another task.
+pub fn stop_when() -> Option<StopWhen> {
+    STOP_WHEN.try_with(|stop| stop.clone()).ok().flatten()
 }
 
 /// Runs `f` as a call whose answer replaces the history of the conversation it is about, as a
@@ -201,6 +217,26 @@ mod tests {
             "a rebuild is a compile that does not keep a valid snapshot"
         );
         assert_eq!(prefill_retention_secs(), None);
+    }
+
+    #[tokio::test]
+    async fn only_a_call_made_inside_the_scope_carries_a_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        assert!(stop_when().is_none());
+        let wanted = Arc::new(AtomicBool::new(false));
+        let flag = wanted.clone();
+        let stop: StopWhen = Arc::new(move || flag.load(Ordering::Relaxed));
+        let (before, after) = stopping_when(stop, async {
+            let carried = stop_when().expect("inside the scope");
+            let before = carried();
+            wanted.store(true, Ordering::Relaxed);
+            (before, carried())
+        })
+        .await;
+        assert_eq!((before, after), (false, true), "it is asked, not copied");
+        assert!(stop_when().is_none(), "the scope ends with its future");
     }
 
     #[tokio::test]

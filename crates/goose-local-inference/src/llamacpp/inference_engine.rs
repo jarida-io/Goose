@@ -124,6 +124,18 @@ pub(super) struct GenerationContext<'a> {
     pub rebuild_prefill: bool,
     /// Set when the reply ends in a tool call, so the agent will call again within this turn.
     pub tool_call_emitted: bool,
+    /// Ends the generation at its next token (`LocalGenerationRequest::stop_when`).
+    pub stop_when: Option<goose_provider_types::request_context::StopWhen>,
+}
+
+impl<'a> GenerationContext<'a> {
+    /// Asked on every generated token, not only on those that send: a reply buffering a tool
+    /// call or thinking sends nothing for a long stretch, and would otherwise run to its end.
+    pub fn wanted_elsewhere(&self) -> impl Fn() -> bool + 'a {
+        let tx = self.tx;
+        let stop = self.stop_when.clone();
+        move || tx.is_closed() || stop.as_ref().is_some_and(|stop| stop())
+    }
 }
 
 pub(super) struct LoadedModel {

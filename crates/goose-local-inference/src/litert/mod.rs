@@ -1855,6 +1855,7 @@ mod tests {
                         compile_prefill: None,
                         prefill_retention_secs: None,
                         rebuild_prefill: false,
+                        stop_when: None,
                     },
                 )
             });

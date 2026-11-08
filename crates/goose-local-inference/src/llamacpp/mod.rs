@@ -1105,6 +1105,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             prefill_retention_secs: request.prefill_retention_secs,
             rebuild_prefill: request.rebuild_prefill,
             tool_call_emitted: false,
+            stop_when: request.stop_when,
         };
 
         let result = if use_emulator {
