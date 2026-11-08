@@ -1,4 +1,5 @@
 mod encoder_backend;
+mod encoder_towers;
 mod inference_emulated_tools;
 mod inference_engine;
 mod inference_native_tools;
@@ -10,7 +11,7 @@ mod written_tool_calls;
 use std::any::Any;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Result;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -19,6 +20,7 @@ use llama_cpp_2::model::{ChatTemplateResult, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::{list_llama_ggml_backend_devices, LlamaBackendDeviceType, LogOptions};
 
+use self::encoder_towers::Tower;
 use self::inference_emulated_tools::{
     build_emulator_tool_description, generate_with_emulated_tools,
 };
@@ -44,6 +46,88 @@ const MIB: u64 = 1024 * 1024;
 /// voice note. Kept otherwise: on an Orin a reload costs about 3.2 s (1.5 s reading 945 MB from
 /// NVMe, the rest on the GPU), and with ~600 MB available the file cannot stay in the page cache.
 const ENCODER_RELEASE_BELOW_FREE_BYTES: u64 = 128 * MIB;
+
+/// Left available when an encoder loads on unified memory. The reply after it is spoken, and
+/// Kokoro took 150-300 MB a unit beside the encoder on the Orin, which ran out of memory when an
+/// encoder had loaded into less.
+const ENCODER_LOAD_RESERVE_BYTES: u64 = 384 * MIB;
+
+/// Whether this machine's GPU shares system memory; unset until the backend has looked.
+static UNIFIED_MEMORY: OnceLock<bool> = OnceLock::new();
+
+/// The loaded encoder, if any: whether it hears, and the bytes its file put on the GPU.
+static RESIDENT_ENCODER: Mutex<Option<(bool, u64)>> = Mutex::new(None);
+
+/// A loaded multimodal encoder, from the projector or one of its single-tower copies.
+pub(super) struct Encoder {
+    pub ctx: llama_cpp_2::mtmd::MtmdContext,
+    bytes: u64,
+}
+
+impl Encoder {
+    fn new(ctx: llama_cpp_2::mtmd::MtmdContext, bytes: u64) -> Self {
+        *RESIDENT_ENCODER.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((ctx.support_audio(), bytes));
+        Self { ctx, bytes }
+    }
+
+    fn holds(&self, media: &[ExtractedMedia]) -> bool {
+        media.iter().all(|m| {
+            if m.audio {
+                self.ctx.support_audio()
+            } else {
+                self.ctx.support_vision()
+            }
+        })
+    }
+
+    fn towers(&self) -> &'static str {
+        match (self.ctx.support_audio(), self.ctx.support_vision()) {
+            (true, true) => "audio+vision",
+            (true, false) => "audio",
+            (false, true) => "vision",
+            (false, false) => "none",
+        }
+    }
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        *RESIDENT_ENCODER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Whether `bytes` of encoder may load with `available` free, `freed` of it by the encoder it
+/// replaces.
+fn encoder_fits(available: u64, bytes: u64, freed: u64) -> bool {
+    available.saturating_add(freed) >= bytes.saturating_add(ENCODER_LOAD_RESERVE_BYTES)
+}
+
+/// See [`crate::hearing_room`].
+pub(crate) fn hearing_room(mmproj: &Path) -> crate::HearingRoom {
+    use crate::HearingRoom;
+    let resident = *RESIDENT_ENCODER.lock().unwrap_or_else(|e| e.into_inner());
+    if resident.is_some_and(|(hears, _)| hears) {
+        return HearingRoom::Loaded;
+    }
+    if UNIFIED_MEMORY.get() != Some(&true) {
+        return HearingRoom::Unknown;
+    }
+    let (Some(info), Ok(bytes)) = (
+        MemInfo::read(),
+        encoder_towers::tower_bytes(mmproj, Tower::Audio),
+    ) else {
+        return HearingRoom::Unknown;
+    };
+    let freed = resident.map_or(0, |(_, bytes)| bytes);
+    let available = info.available.saturating_add(freed);
+    let needed = bytes.saturating_add(ENCODER_LOAD_RESERVE_BYTES);
+    if encoder_fits(info.available, bytes, freed) {
+        HearingRoom::Fits { available, needed }
+    } else {
+        HearingRoom::Short { available, needed }
+    }
+}
 
 const CODE_EXECUTION_TOOL: &str = "code_execution__execute_typescript";
 
@@ -493,6 +577,7 @@ impl LlamaCppBackend {
         llama_cpp_2::send_logs_to_tracing(LogOptions::default());
         log_inference_backend_devices();
         let memory = MemoryPolicy::detect();
+        let _ = UNIFIED_MEMORY.set(memory.unified_memory);
         tracing::info!(
             target: "giap::trace",
             kind = "inference_memory_policy",
@@ -750,26 +835,142 @@ impl LlamaCppBackend {
         self.available_memory_bytes() >= ENCODER_RELEASE_BELOW_FREE_BYTES
     }
 
-    fn release_encoder(&self, loaded: &mut LoadedModel, before: &'static str) {
-        loaded.mtmd_ctx = None;
+    /// `reason`: "memory_floor", or "other_towers" when a turn needs a tower it lacks.
+    fn release_encoder(
+        &self,
+        loaded: &mut LoadedModel,
+        before: &'static str,
+        reason: &'static str,
+    ) {
+        loaded.encoder = None;
         tracing::info!(
             target: "giap::trace",
             kind = "encoder_released",
             before,
+            reason,
             free_mb = self.available_memory_bytes() / MIB,
             floor_mb = ENCODER_RELEASE_BELOW_FREE_BYTES / MIB,
-            "released the multimodal encoder: free memory fell below its floor"
+            "released the multimodal encoder"
         );
+    }
+
+    /// The copy of `mmproj` holding only `keep`, written if need be; `None` when there is no
+    /// other tower to leave out or the copy could not be written.
+    fn tower_copy(&self, mmproj: &Path, keep: Tower) -> Option<PathBuf> {
+        let started = std::time::Instant::now();
+        match encoder_towers::ensure_copy(mmproj, keep) {
+            Ok(Some(copy)) => {
+                if copy.written {
+                    tracing::info!(
+                        target: "giap::trace",
+                        kind = "encoder_copy_written",
+                        tower = keep.name(),
+                        file = %copy.path.display(),
+                        encoder_mb = std::fs::metadata(&copy.path).map_or(0, |m| m.len()) / MIB,
+                        write_ms = started.elapsed().as_millis() as u64,
+                        "wrote a copy of the multimodal encoder with one tower"
+                    );
+                }
+                self.remember_model_file(mmproj);
+                self.remember_model_file(&copy.path);
+                Some(copy.path)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "encoder_copy_failed",
+                    tower = keep.name(),
+                    error = %e,
+                    "no single-tower copy of the multimodal encoder; loading all of it"
+                );
+                None
+            }
+        }
+    }
+
+    /// The file a turn's media loads. On unified memory, the single-tower copy when the media
+    /// needs one tower: a tower nobody uses is memory the rest of the board runs short of.
+    fn encoder_file(&self, mmproj: &Path, media: &[ExtractedMedia]) -> PathBuf {
+        let keep = match (
+            media.iter().any(|m| m.audio),
+            media.iter().any(|m| !m.audio),
+        ) {
+            (true, false) => Tower::Audio,
+            (false, true) => Tower::Vision,
+            _ => return mmproj.to_path_buf(),
+        };
+        if !self.memory.unified_memory {
+            return mmproj.to_path_buf();
+        }
+        self.tower_copy(mmproj, keep)
+            .unwrap_or_else(|| mmproj.to_path_buf())
+    }
+
+    /// Loads the encoder `media` needs, in place of one lacking a tower it uses. On unified
+    /// memory a load that would leave less than [`ENCODER_LOAD_RESERVE_BYTES`] is refused.
+    fn load_encoder(
+        &self,
+        loaded: &mut LoadedModel,
+        mmproj: &Path,
+        media: &[ExtractedMedia],
+        settings: &ModelSettings,
+    ) -> Result<(), ProviderError> {
+        let file = self.encoder_file(mmproj, media);
+        let bytes = std::fs::metadata(&file).map_or(0, |m| m.len());
+        let freed = loaded.encoder.as_ref().map_or(0, |e| e.bytes);
+        if let Some(info) = MemInfo::read().filter(|_| self.memory.unified_memory) {
+            if !encoder_fits(info.available, bytes, freed) {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "encoder_load_refused",
+                    available_mb = info.available.saturating_add(freed) / MIB,
+                    needed_mb = bytes.saturating_add(ENCODER_LOAD_RESERVE_BYTES) / MIB,
+                    file = %file.display(),
+                    "too little memory is available to load the multimodal encoder"
+                );
+                return Err(ProviderError::ExecutionError(
+                    "Too little memory is free right now to take in this message's recording or \
+                     picture. Try again in a moment."
+                        .to_string(),
+                ));
+            }
+        }
+        if loaded.encoder.is_some() {
+            self.release_encoder(loaded, "media_call", "other_towers");
+        }
+        let started = std::time::Instant::now();
+        let Some(ctx) = Self::init_mtmd_context(&loaded.model, &file, settings) else {
+            return Ok(());
+        };
+        let encoder = Encoder::new(ctx, bytes);
+        tracing::info!(
+            target: "giap::trace",
+            kind = "encoder_loaded",
+            towers = encoder.towers(),
+            encoder_mb = bytes / MIB,
+            load_ms = started.elapsed().as_millis() as u64,
+            free_mb = self.available_memory_bytes() / MIB,
+            "multimodal encoder loaded; it stays loaded above its memory floor"
+        );
+        loaded.encoder = Some(encoder);
+        // The encoder reads its file whole onto the GPU, and this turn's context is allocated
+        // next, against what that read left free.
+        self.remember_model_file(&file);
+        self.release_model_files("encoder_loaded");
+        Ok(())
     }
 
     fn init_mtmd_context(
         model: &LlamaModel,
-        mmproj_path: &Option<PathBuf>,
+        mmproj_path: &Path,
         settings: &crate::local_model_registry::ModelSettings,
     ) -> Option<llama_cpp_2::mtmd::MtmdContext> {
         use llama_cpp_2::mtmd::{MtmdContext, MtmdContextParams};
 
-        let mmproj_path = mmproj_path.as_ref().filter(|p| p.exists())?;
+        if !mmproj_path.exists() {
+            return None;
+        }
 
         let params = MtmdContextParams {
             use_gpu: true,
@@ -845,6 +1046,15 @@ impl LocalInferenceBackend for LlamaCppBackend {
             model_path.display()
         );
 
+        // Written before the weights take the memory, so no heard turn waits on it.
+        if let Some(mmproj) = resolved
+            .mmproj_path
+            .as_deref()
+            .filter(|_| self.memory.unified_memory)
+        {
+            self.tower_copy(mmproj, Tower::Audio);
+        }
+
         let model = Arc::new(self.load_weights(model_path, settings)?);
         // Read before the release below, which drops the header's pages along with the rest.
         if self.memory.unified_memory {
@@ -865,9 +1075,6 @@ impl LocalInferenceBackend for LlamaCppBackend {
 
         let templates = load_chat_templates(&model, settings)?;
 
-        // Vision encoder is loaded on-demand per turn rather than holding ~1 GB resident in VRAM.
-        let mtmd_ctx = None;
-
         tracing::info!(
             backend = self.id(),
             model_id = model_id,
@@ -879,7 +1086,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             draft: draft_model,
             draft_tried: resolved.draft_model_path.clone(),
             templates,
-            mtmd_ctx,
+            encoder: None,
             session: None,
             snapshot: None,
             suspended: None,
@@ -1029,33 +1236,17 @@ impl LocalInferenceBackend for LlamaCppBackend {
             )
         };
 
-        if !has_media && loaded.mtmd_ctx.is_some() && !self.encoder_may_stay() {
-            self.release_encoder(loaded, "text_call");
+        if !has_media && loaded.encoder.is_some() && !self.encoder_may_stay() {
+            self.release_encoder(loaded, "text_call", "memory_floor");
         }
-        if has_media && loaded.mtmd_ctx.is_none() {
-            let started = std::time::Instant::now();
-            loaded.mtmd_ctx = Self::init_mtmd_context(
-                &loaded.model,
-                &request.resolved_model.mmproj_path,
-                request.settings,
-            );
-            if loaded.mtmd_ctx.is_some() {
-                tracing::info!(
-                    target: "giap::trace",
-                    kind = "encoder_loaded",
-                    load_ms = started.elapsed().as_millis() as u64,
-                    free_mb = self.available_memory_bytes() / MIB,
-                    "multimodal encoder loaded; it stays loaded above its memory floor"
-                );
-            }
-            // The encoder reads its file whole onto the GPU, and this turn's context is
-            // allocated next, against what that read left free.
-            if let (Some(_), Some(mmproj)) = (
-                loaded.mtmd_ctx.as_ref(),
-                request.resolved_model.mmproj_path.as_ref(),
-            ) {
-                self.remember_model_file(mmproj);
-                self.release_model_files("encoder_loaded");
+        if let Some(mmproj) = request
+            .resolved_model
+            .mmproj_path
+            .as_deref()
+            .filter(|_| has_media)
+        {
+            if !loaded.encoder.as_ref().is_some_and(|e| e.holds(&media)) {
+                self.load_encoder(loaded, mmproj, &media, request.settings)?;
             }
         }
 
@@ -1078,7 +1269,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             model: &loaded.model,
             // A text call never sees a kept encoder, so its context sizing does not move with it.
             mtmd_ctx: if has_media {
-                loaded.mtmd_ctx.as_ref()
+                loaded.encoder.as_ref().map(|e| &e.ctx)
             } else {
                 None
             },
@@ -1121,7 +1312,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
         // A tool call means the agent calls again within this turn, with the same media.
         let calls_again = gen_ctx.tool_call_emitted;
         if has_media && !calls_again && !self.encoder_may_stay() {
-            self.release_encoder(loaded, "after_media_call");
+            self.release_encoder(loaded, "after_media_call", "memory_floor");
         }
         result
     }

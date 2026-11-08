@@ -366,6 +366,31 @@ fn resolve_model_path(model_id: &str) -> Option<ResolvedModelPaths> {
     None
 }
 
+/// Whether a recording can reach the encoder that hears it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HearingRoom {
+    /// An encoder that hears is loaded.
+    Loaded,
+    /// Loading one leaves room for the rest of the turn.
+    Fits { available: u64, needed: u64 },
+    /// Loading one would not; the turn is better taken as words.
+    Short { available: u64, needed: u64 },
+    /// Nothing to judge by: memory is not shared with the GPU, or the encoder is unreadable.
+    Unknown,
+}
+
+impl HearingRoom {
+    pub fn admits(self) -> bool {
+        !matches!(self, HearingRoom::Short { .. })
+    }
+}
+
+/// Whether a turn may bring a recording to the encoder at `mmproj` now, without loading it into
+/// memory the rest of the turn needs. Reads the encoder's header (~85 KB) and `/proc/meminfo`.
+pub fn hearing_room(mmproj: &std::path::Path) -> HearingRoom {
+    llamacpp::hearing_room(mmproj)
+}
+
 pub fn available_inference_memory_bytes(runtime: &InferenceRuntime) -> u64 {
     runtime.default_backend().available_memory_bytes()
 }

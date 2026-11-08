@@ -135,8 +135,8 @@ pub(super) struct LoadedModel {
     /// every request.
     pub draft_tried: Option<std::path::PathBuf>,
     pub templates: LoadedChatTemplates,
-    /// Multimodal context for vision models. None for text-only models.
-    pub mtmd_ctx: Option<MtmdContext>,
+    /// The multimodal encoder, loaded by the first turn that brings media.
+    pub encoder: Option<super::Encoder>,
     /// Generation context retained between requests for prompt prefix reuse.
     /// Dropped with the rest of the model when the slot is evicted.
     pub session: Option<SessionKv>,
