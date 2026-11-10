@@ -957,15 +957,7 @@ pub(super) fn prefill_plan(
 
 /// Output budget granted to a sacrificial generation when the model settings do
 /// not cap it.
-///
-/// A throwaway context is sized to the prompt plus this budget rather than to
-/// the full window, because it is resident *alongside* the retained cache and
-/// llama.cpp commits KV memory for the whole `n_ctx` up front. On an 8 GB Jetson
-/// two full 4096-token caches is the difference between fitting and an NvMap
-/// allocation failure. The trade is that a sacrificial turn cannot generate more
-/// than this many tokens, well above what the short side calls this path exists
-/// for ever produce.
-const SACRIFICIAL_OUTPUT_TOKENS: usize = 2048;
+const SACRIFICIAL_OUTPUT_TOKENS: usize = 8192;
 
 /// Window for a throwaway context: enough for the prompt and a full output
 /// budget, never more than the request's own effective context.
@@ -3217,6 +3209,17 @@ pub(super) fn generation_loop(
     }
 
     if exhausted_loop && hit_context_limit {
+        if output_token_count > 0 {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "generation_reached_context_limit",
+                prompt_tokens = prompt_token_count,
+                output_tokens = output_token_count,
+                effective_ctx,
+                "generation reached context headroom limit; returning generated tokens"
+            );
+            return Ok(output_token_count);
+        }
         return Err(ProviderError::ContextLengthExceeded(format!(
             "Generation exhausted context window ({} prompt + {} generated = {} of {} limit)",
             prompt_token_count,
@@ -5085,11 +5088,12 @@ pub(super) mod tests {
     #[test]
     fn sacrificial_context_is_sized_to_the_prompt_plus_an_output_budget() {
         assert_eq!(
-            sacrificial_context_size(378, None, 4096),
+            sacrificial_context_size(378, None, 16384),
             378 + SACRIFICIAL_OUTPUT_TOKENS as u32
         );
         // Never larger than the request's own window.
         assert_eq!(sacrificial_context_size(378, None, 1024), 1024);
+        assert_eq!(sacrificial_context_size(378, None, 4096), 4096);
         // An explicit output cap is respected instead of the default budget.
         assert_eq!(sacrificial_context_size(378, Some(256), 4096), 634);
         // Saturating arithmetic, not a panic.
@@ -5098,11 +5102,8 @@ pub(super) mod tests {
 
     #[test]
     fn sacrificial_context_stays_smaller_than_the_retained_window() {
-        // Sacrifice requires prompt * 2 < cached <= n_ctx, so any prompt that
-        // reaches this path is under half the window. At the Jetson's 4096 that
-        // bounds the throwaway cache strictly below a second full one.
-        let n_ctx: u32 = 4096;
-        for prompt in [1usize, 378, 1000, 2047] {
+        let n_ctx: u32 = 16384;
+        for prompt in [1usize, 378, 1000, 2047, 4096, 8191] {
             assert!(is_sacrificial_prompt(prompt, n_ctx as usize));
             let transient = sacrificial_context_size(prompt, None, n_ctx);
             assert!(
