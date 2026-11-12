@@ -404,11 +404,7 @@ impl McpClientTrait for ExtensionManagerClient {
         _next_cursor: Option<String>,
         _cancellation_token: CancellationToken,
     ) -> Result<ListToolsResult, Error> {
-        Ok(ListToolsResult {
-            tools: self.get_tools().await,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(self.get_tools().await))
     }
 
     async fn call_tool(

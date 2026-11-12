@@ -166,7 +166,7 @@ impl CodeMode {
 
         let description = mcp_client
             .peer_info()
-            .and_then(|p| p.server_info.title.clone())
+            .and_then(|p| p.server_info.as_ref().and_then(|info| info.title.clone()))
             .unwrap_or(format!("MCP server at {}", server.display_target()));
 
         let tool_set = ToolSet::new(Some(server.name.clone()), &description, tools);

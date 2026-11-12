@@ -3,8 +3,8 @@ use indoc::formatdoc;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock, ErrorCode, ErrorData, Implementation, InitializeResult, Meta,
-        ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, ErrorCode, ErrorData, Implementation, InitializeResult,
+        RequestMetaObject, ServerCapabilities, ServerConfig,
     },
     schemars::JsonSchema,
     service::RequestContext,
@@ -20,7 +20,7 @@ use std::{
 
 const WORKING_DIR_HEADER: &str = "agent-working-dir";
 
-fn extract_working_dir_from_meta(meta: &Meta) -> Option<PathBuf> {
+fn extract_working_dir_from_meta(meta: &RequestMetaObject) -> Option<PathBuf> {
     meta.0
         .get(WORKING_DIR_HEADER)
         .and_then(|v| v.as_str())
@@ -454,7 +454,7 @@ impl MemoryServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "goose-memory",

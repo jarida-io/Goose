@@ -10,8 +10,9 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         CallToolResult, ContentBlock, ErrorCode, ErrorData, Implementation, InitializeResult,
-        ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
-        Resource, ResourceContents, ServerCapabilities, ServerInfo,
+        ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+        ServerConfig,
     },
     schemars::JsonSchema,
     service::RequestContext,
@@ -1616,7 +1617,7 @@ impl ComputerControllerServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ComputerControllerServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         InitializeResult::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -1645,18 +1646,14 @@ impl ServerHandler for ComputerControllerServer {
                 )
             })
             .collect();
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourcesResult::with_all_items(resources))
     }
 
     async fn read_resource(
         &self,
         params: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         let active_resources = self.active_resources.lock().unwrap();
         let resource = active_resources.get(&params.uri).ok_or_else(|| {
             ErrorData::new(
@@ -1667,6 +1664,6 @@ impl ServerHandler for ComputerControllerServer {
         })?;
 
         // Clone the resource to return
-        Ok(ReadResourceResult::new(vec![resource.clone()]))
+        Ok(ReadResourceResult::new(vec![resource.clone()]).into())
     }
 }

@@ -37,11 +37,7 @@ impl McpClientTrait for TomClient {
         _next_cursor: Option<String>,
         _cancellation_token: CancellationToken,
     ) -> Result<ListToolsResult, Error> {
-        Ok(ListToolsResult {
-            tools: vec![],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![]))
     }
 
     async fn call_tool(

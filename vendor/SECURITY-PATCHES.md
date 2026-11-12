@@ -16,7 +16,8 @@ license. Cargo manifests are the published normalized manifests. Registry
 checksums and generated local lockfiles are omitted because these are explicit
 path patches, not replacements in the registry cache.
 
-Changes are limited to RMCP 2.1 dependency requirements, the OpenTelemetry
+Changes are limited to RMCP 3.9 dependency requirements (including reading the
+now-optional peer `server_info`), the OpenTelemetry
 0.32 release family with SDK >=0.32.1, and flattening registry content handling
 to the RMCP ContentBlock type. The PCTX HTTP client also disables redirects
 to prevent custom API headers from reaching a different endpoint; a local

@@ -48,11 +48,7 @@ impl McpClientTrait for MockClient {
         _next_cursor: Option<String>,
         _cancel_token: CancellationToken,
     ) -> Result<ListResourcesResult, Error> {
-        Ok(ListResourcesResult {
-            resources: vec![],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourcesResult::with_all_items(vec![]))
     }
 
     fn get_info(&self) -> std::option::Option<&rmcp::model::InitializeResult> {
@@ -86,11 +82,7 @@ impl McpClientTrait for MockClient {
             })
             .collect();
 
-        Ok(ListToolsResult {
-            tools: rmcp_tools,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(rmcp_tools))
     }
 
     async fn call_tool(
