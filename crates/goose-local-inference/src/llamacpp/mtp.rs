@@ -639,6 +639,302 @@ mod tests {
         }
     }
 
+    /// The target's encoder, if the developer has it.
+    fn live_encoder() -> Option<std::path::PathBuf> {
+        if let Some(path) = std::env::var_os("GIAP_TEST_MMPROJ") {
+            return Some(std::path::PathBuf::from(path)).filter(|p| p.is_file());
+        }
+        let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+        [
+            "Library/Application Support/goose-in-a-pond/models/mmproj",
+            ".local/share/goose-in-a-pond/models/mmproj",
+        ]
+        .iter()
+        .flat_map(|root| {
+            ["gemma-4-e4b-it-qat", "gemma-4-e4b-it"]
+                .map(|dir| home.join(root).join(dir).join("mmproj-BF16.gguf"))
+        })
+        .find(|p| p.is_file())
+    }
+
+    /// Two seconds of a rising tone as a 16 kHz mono WAV.
+    fn tone_wav() -> Vec<u8> {
+        const RATE: u32 = 16_000;
+        let samples = RATE * 2;
+        let data_len = samples * 2;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&RATE.to_le_bytes());
+        wav.extend_from_slice(&(RATE * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..samples {
+            let t = i as f32 / RATE as f32;
+            let sample = (std::f32::consts::TAU * (220.0 + 220.0 * t) * t).sin() * 12_000.0;
+            wav.extend_from_slice(&(sample as i16).to_le_bytes());
+        }
+        wav
+    }
+
+    /// A colour gradient as an uncompressed 24-bit BMP, which stb reads.
+    fn gradient_bmp() -> Vec<u8> {
+        const SIDE: u32 = 96;
+        let size = 54 + SIDE * SIDE * 3;
+        let mut bmp = Vec::with_capacity(size as usize);
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&size.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&54u32.to_le_bytes());
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        bmp.extend_from_slice(&(SIDE as i32).to_le_bytes());
+        bmp.extend_from_slice(&(SIDE as i32).to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&24u16.to_le_bytes());
+        bmp.extend_from_slice(&[0u8; 24]);
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                bmp.extend_from_slice(&[(x * 255 / SIDE) as u8, (y * 255 / SIDE) as u8, 128]);
+            }
+        }
+        bmp
+    }
+
+    /// Generate up to `budget` tokens on `session` and fold them into its ledger, as a turn does.
+    fn reply(
+        model: &Arc<llama_cpp_2::model::LlamaModel>,
+        session: &mut Option<SessionKv>,
+        settings: &ModelSettings,
+        prompt: &[LlamaToken],
+        prompt_token_count: usize,
+        budget: usize,
+    ) -> Vec<LlamaToken> {
+        let kv = session.as_mut().expect("a prefilled session");
+        let mut capped = settings.clone();
+        capped.max_output_tokens = Some(budget);
+        let mut decoded = Vec::new();
+        generation_loop(
+            model,
+            kv.session_ctx_mut(),
+            &capped,
+            prompt,
+            prompt_token_count,
+            settings.context_size.unwrap_or(4096) as usize,
+            &mut decoded,
+            |_| Ok(TokenAction::Continue),
+        )
+        .expect("generation");
+        kv.record_generated(&decoded);
+        decoded
+    }
+
+    fn draft_counts(session: &mut Option<SessionKv>) -> Option<DraftCounts> {
+        session
+            .as_mut()
+            .and_then(|kv| kv.session_ctx_mut().mtp_mut().map(|m| m.counts()))
+    }
+
+    /// What one media turn produced, from an empty cache and behind a text turn's cache.
+    struct MediaRun {
+        text_reply: Vec<LlamaToken>,
+        fresh: Vec<LlamaToken>,
+        resumed: Vec<LlamaToken>,
+        /// Prompt tokens the resumed turn took from the text turn's cache.
+        reused: usize,
+        drafted: usize,
+        accepted: usize,
+        tok_per_sec: f64,
+    }
+
+    /// A media prompt drafts like a text one: the drafter shares the target's cache and works from
+    /// a position, so the reply's token IDs must be the target's own whether the prompt was
+    /// evaluated into an empty cache or resumed behind a text turn that already drafted.
+    #[test]
+    #[ignore = "requires a real target GGUF, its MTP drafter and its encoder; run with --ignored"]
+    fn a_media_prompt_drafts_to_the_reply_the_target_gives_alone() {
+        use crate::llamacpp::inference_engine::{decode_tokens_for_test, prefill_media_for_test};
+        use crate::llamacpp::LlamaCppBackend;
+        use crate::multimodal::ExtractedMedia;
+
+        let _gpu = exclusive_gpu();
+        let (Some((target_src, draft_src)), Some(encoder_src)) = (live_pair(), live_encoder())
+        else {
+            eprintln!("skipping: no target, drafter and encoder found");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target_path = tmp.path().join("target.gguf");
+        let draft_path = tmp.path().join("draft.gguf");
+        let encoder_path = tmp.path().join("mmproj.gguf");
+        std::fs::hard_link(&target_src, &target_path).expect("hard link target");
+        std::fs::hard_link(&draft_src, &draft_path).expect("hard link drafter");
+        std::fs::hard_link(&encoder_src, &encoder_path).expect("hard link encoder");
+        eprintln!(
+            "target:  {}\ndraft:   {}\nencoder: {}",
+            target_src.display(),
+            draft_src.display(),
+            encoder_src.display()
+        );
+
+        let backend = shared_backend();
+        let params = LlamaModelParams::default().with_n_gpu_layers(99);
+        let load = |path: &std::path::Path| {
+            Arc::new(
+                llama_cpp_2::model::LlamaModel::load_from_file(
+                    backend.llama_backend(),
+                    path,
+                    &params,
+                )
+                .expect("load model"),
+            )
+        };
+        let model = load(&target_path);
+        let drafter = load(&draft_path);
+        // The window is pinned so both turns ask for the same context, and the micro-batch is
+        // the one the pond stamps on a model with an encoder.
+        let settings = ModelSettings {
+            context_size: Some(4096),
+            n_ubatch: Some(512),
+            ..greedy(Some(4))
+        };
+        let encoder = LlamaCppBackend::init_mtmd_context(&model, &encoder_path, &settings)
+            .expect("load encoder");
+
+        let marker = llama_cpp_2::mtmd::mtmd_default_marker();
+        // Longer than the shortest prefix a cache is resumed behind.
+        let preamble: String = (1..=60)
+            .map(|i| {
+                format!(
+                    "Note {i}: the household keeps item {i} on shelf {}.\n",
+                    i % 7
+                )
+            })
+            .collect();
+        let text_turn = format!(
+            "{preamble}<start_of_turn>user\nName one colour.<end_of_turn>\n<start_of_turn>model\n"
+        );
+        let text_tokens = model
+            .str_to_token(&text_turn, AddBos::Never)
+            .expect("tokenize");
+        let media_turn = format!(
+            "{preamble}<start_of_turn>user\n{marker}\nDescribe this in one sentence.<end_of_turn>\n<start_of_turn>model\n"
+        );
+
+        let run = |media: &[ExtractedMedia],
+                   draft: Option<&Arc<llama_cpp_2::model::LlamaModel>>| {
+            let mut fresh_session = None;
+            let (count, _) = prefill_media_for_test(
+                &mut fresh_session,
+                &model,
+                draft,
+                &encoder,
+                backend,
+                &media_turn,
+                media,
+                &settings,
+            )
+            .expect("media prefill into an empty cache");
+            let fresh = reply(&model, &mut fresh_session, &settings, &[], count, 48);
+            drop(fresh_session);
+
+            let mut session =
+                Some(SessionKv::create(&model, draft, backend, 4096, &settings).expect("context"));
+            decode_tokens_for_test(session.as_mut().expect("just created"), &text_tokens)
+                .expect("text prefill");
+            let text_reply = reply(
+                &model,
+                &mut session,
+                &settings,
+                &text_tokens,
+                text_tokens.len(),
+                24,
+            );
+            let (count, reused) = prefill_media_for_test(
+                &mut session,
+                &model,
+                draft,
+                &encoder,
+                backend,
+                &media_turn,
+                media,
+                &settings,
+            )
+            .expect("media prefill behind the text turn");
+            let before = draft_counts(&mut session);
+            assert_eq!(
+                before.is_some(),
+                draft.is_some(),
+                "the media turn's cache has a drafter exactly when one was supplied"
+            );
+            let started = std::time::Instant::now();
+            let resumed = reply(&model, &mut session, &settings, &[], count, 48);
+            let secs = started.elapsed().as_secs_f64().max(1e-3);
+            let stats = before
+                .zip(draft_counts(&mut session))
+                .map(|(before, after)| after.since(before, resumed.len()));
+            MediaRun {
+                tok_per_sec: resumed.len() as f64 / secs,
+                text_reply,
+                fresh,
+                resumed,
+                reused,
+                drafted: stats.as_ref().map_or(0, |s| s.draft_tokens),
+                accepted: stats.as_ref().map_or(0, |s| s.accepted_tokens),
+            }
+        };
+
+        for (what, item) in [
+            (
+                "recording",
+                ExtractedMedia {
+                    bytes: tone_wav(),
+                    audio: true,
+                },
+            ),
+            (
+                "picture",
+                ExtractedMedia {
+                    bytes: gradient_bmp(),
+                    audio: false,
+                },
+            ),
+        ] {
+            let media = [item];
+            let plain = run(&media, None);
+            let spec = run(&media, Some(&drafter));
+            eprintln!(
+                "{what}: plain {:.1} tok/s, drafting {:.1} tok/s ({}/{} drafts kept), {} prompt tokens reused behind the text turn",
+                plain.tok_per_sec, spec.tok_per_sec, spec.accepted, spec.drafted, spec.reused
+            );
+
+            assert!(!plain.fresh.is_empty() && !plain.resumed.is_empty());
+            assert_eq!(
+                plain.text_reply, spec.text_reply,
+                "the text turn ahead of the {what} diverged"
+            );
+            assert!(
+                spec.reused >= 256,
+                "the {what} turn did not resume behind the drafter's text cache (reused {})",
+                spec.reused
+            );
+            assert!(spec.drafted > 0, "the {what} turn never drafted");
+            assert_eq!(
+                plain.fresh, spec.fresh,
+                "a {what} evaluated into an empty cache drafted to a different reply"
+            );
+            assert_eq!(
+                plain.resumed, spec.resumed,
+                "a {what} resumed behind a text turn drafted to a different reply"
+            );
+        }
+    }
+
     /// `MemAvailable` in KB, or `None` off Linux.
     fn mem_available_kb() -> Option<u64> {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;

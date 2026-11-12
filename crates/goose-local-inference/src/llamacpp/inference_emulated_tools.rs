@@ -362,13 +362,15 @@ pub(super) fn generate_with_emulated_tools(
     code_mode_enabled: bool,
     oai_messages_json: &str,
 ) -> Result<(), ProviderError> {
-    let generation_started = std::time::Instant::now();
+    let generation_started = ctx.started;
+    // An encoder load on the way here is time before generation too.
+    let lead_in_ms = generation_started.elapsed().as_millis() as u64;
     let mut first_piece_at: Option<std::time::Instant> = None;
     let prepared = prepare_generation(ctx, oai_messages_json, None, None)?;
     let template_result = prepared.template_result;
     let prompt_token_count = prepared.prompt_token_count;
     let effective_ctx = prepared.effective_ctx;
-    let prefill_ms = prepared.prefill_ms;
+    let prefill_ms = prepared.prefill_ms + lead_in_ms;
     let reused_prefix_tokens = prepared.reused_prefix_tokens;
     let mut transient_session = prepared.transient;
 

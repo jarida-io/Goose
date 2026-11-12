@@ -1099,6 +1099,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
         loaded: &mut dyn BackendLoadedModel,
         request: LocalGenerationRequest<'_>,
     ) -> Result<(), ProviderError> {
+        let started = std::time::Instant::now();
         let loaded = loaded
             .as_any_mut()
             .downcast_mut::<LoadedModel>()
@@ -1286,6 +1287,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             log: request.log,
             media: &media,
             model_load_ms: request.model_load_ms,
+            started,
             one_shot: request.tools.is_empty(),
             tool_calls_only: request.tool_calls_only,
             helper: request.helper,

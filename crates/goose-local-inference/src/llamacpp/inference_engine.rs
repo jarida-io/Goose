@@ -105,6 +105,9 @@ pub(super) struct GenerationContext<'a> {
     /// Cold-load time for this request's model, when the load happened in this
     /// request. None when the model was already resident.
     pub model_load_ms: Option<u64>,
+    /// When the request reached the backend: an encoder load comes before generation and counts
+    /// towards its time to first token.
+    pub started: std::time::Instant,
     /// The request carries no tools: one-shot work (a compaction's summary,
     /// memory extraction, a title) rather than a turn of a chat.
     pub one_shot: bool,
@@ -2389,6 +2392,16 @@ fn read_as_leading_text(kv: &mut SessionKv) -> bool {
     true
 }
 
+/// What a prompt's pictures and recordings cost to take in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MediaCost {
+    tokens: usize,
+    /// Encoding every media chunk and decoding what the towers produced.
+    eval_ms: u64,
+    /// The towers' share of `eval_ms`, as mtmd reports it.
+    encode_ms: Option<u64>,
+}
+
 /// Evaluate every chunk from `first_media` on, starting at `n_past`; logits for the last only.
 fn eval_from_first_media(
     kv: &mut SessionKv,
@@ -2396,18 +2409,38 @@ fn eval_from_first_media(
     mtmd_ctx: &MtmdContext,
     first_media: usize,
     mut n_past: i32,
-) -> Result<i32, String> {
+) -> Result<(i32, MediaCost), String> {
     let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
     let last = chunks.len() - 1;
-    for index in first_media..chunks.len() {
-        let chunk = chunks
-            .get(index)
-            .ok_or_else(|| format!("chunk {index} is missing"))?;
-        n_past = chunk
-            .eval(mtmd_ctx, kv.ctx.ctx(), n_past, 0, n_batch, index == last)
-            .map_err(|e| format!("chunk {index}: {e}"))?;
+    let mut cost = MediaCost::default();
+    // mtmd times its towers itself and says so only in its log.
+    let (evaluated, said) = super::encoder_backend::caught_while(|| {
+        for index in first_media..chunks.len() {
+            let chunk = chunks
+                .get(index)
+                .ok_or_else(|| format!("chunk {index} is missing"))?;
+            let started = std::time::Instant::now();
+            n_past = chunk
+                .eval(mtmd_ctx, kv.ctx.ctx(), n_past, 0, n_batch, index == last)
+                .map_err(|e| format!("chunk {index}: {e}"))?;
+            if chunk.chunk_type() != MtmdInputChunkType::Text {
+                // A GPU decode returns before its graph has run; the text after would be billed for it.
+                kv.ctx.ctx().synchronize();
+                cost.tokens += chunk.n_tokens();
+                cost.eval_ms += started.elapsed().as_millis() as u64;
+            }
+        }
+        Ok::<i32, String>(n_past)
+    });
+    cost.encode_ms = super::encoder_backend::encode_ms(&said);
+    match evaluated {
+        Ok(n_past) => Ok((n_past, cost)),
+        // The reason is in mtmd's log, which was caught rather than traced.
+        Err(e) => Err(match said.last() {
+            Some(line) => format!("{e} ({})", line.trim()),
+            None => e,
+        }),
     }
-    Ok(n_past)
 }
 
 /// Serve a media prompt from the retained cache's plain-token prefix: keep the KV for the text
@@ -2427,10 +2460,6 @@ fn resume_behind_text(
     n_ctx: u32,
 ) -> Option<usize> {
     let kv = session.as_mut()?;
-    // A drafter's cache would fall behind the media decoded into its target.
-    if kv.ctx.mtp_mut().is_some() {
-        return None;
-    }
     let (lead, first_media) = leading_text(chunks)?;
     if mtmd_ctx.decode_use_non_causal() {
         // A non-causal chunk must fit one micro-batch, which the rebuild sizes for and a
@@ -2474,8 +2503,8 @@ fn resume_behind_text(
 
     let start = i32::try_from(lead.len()).ok()?;
     let eval_started = std::time::Instant::now();
-    let n_past = match eval_from_first_media(kv, chunks, mtmd_ctx, first_media, start) {
-        Ok(n_past) => n_past,
+    let (n_past, cost) = match eval_from_first_media(kv, chunks, mtmd_ctx, first_media, start) {
+        Ok(evaluated) => evaluated,
         Err(e) => {
             tracing::warn!(error = %e, "media decode behind a reused prefix failed; rebuilding");
             *session = None;
@@ -2505,6 +2534,10 @@ fn resume_behind_text(
         media_chunks = chunks.len() - first_media,
         n_past,
         eval_ms = eval_started.elapsed().as_millis() as u64,
+        media_tokens = cost.tokens,
+        media_ms = cost.eval_ms,
+        encode_ms = cost.encode_ms,
+        drafter = kv.ctx.mtp_mut().is_some(),
         "media prompt resumed behind the cached text prefix"
     );
     Some(resumed)
@@ -2582,6 +2615,7 @@ fn prefill_multimodal(
     session: &mut Option<SessionKv>,
     snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
     model: &Arc<LlamaModel>,
+    draft: Option<&Arc<LlamaModel>>,
     mtmd_ctx: Option<&MtmdContext>,
     backend: &LlamaCppBackend,
     prompt_text: &str,
@@ -2699,44 +2733,34 @@ fn prefill_multimodal(
     }
 
     // Release the retained cache before allocating its replacement so the two
-    // KV caches are never resident together. No drafter: a media prompt gives it
-    // no token sequence to draft from.
+    // KV caches are never resident together.
     *session = None;
     let mut mm_settings = settings.clone();
     if mm_settings.n_ubatch.map_or(false, |u| u < 512) {
         mm_settings.n_ubatch = Some(512);
     }
-    let mut kv = SessionKv::create(model, None, backend, n_ctx, &mm_settings)?;
+    let mut kv = SessionKv::create(model, draft, backend, n_ctx, &mm_settings)?;
 
     // The text ahead of the first media is decoded as text, so its window checkpoints let a later
     // turn resume behind it (`resume_behind_text`, and the text path once the media is gone).
     let eval_started = std::time::Instant::now();
     let mut restored = 0;
-    let n_past = match leading_text(&chunks).filter(|(lead, _)| !lead.is_empty()) {
-        Some((lead, first_media)) => {
-            // The preamble the text path saved stands in for decoding it: after a text turn with a
-            // drafter, which this cache cannot resume behind, that is most of the prompt.
-            restored = snapshot
-                .as_mut()
-                .and_then(|slot| slot.load(kv.context_mut(), &lead))
-                .unwrap_or(0);
-            if restored > 0 {
-                kv.checkpoint_window(&lead[..restored]);
-            }
-            decode_checkpointed(&mut kv, &lead, restored)?;
-            let start = i32::try_from(lead.len()).map_err(|_| {
-                ProviderError::ExecutionError("Multimodal prompt is too long".to_string())
-            })?;
-            eval_from_first_media(&mut kv, &chunks, mtmd_ctx, first_media, start)
+    let (lead, first_media) = leading_text(&chunks).unwrap_or_default();
+    if !lead.is_empty() {
+        // The preamble the text path saved stands in for decoding it.
+        restored = snapshot
+            .as_mut()
+            .and_then(|slot| slot.load(kv.context_mut(), &lead))
+            .unwrap_or(0);
+        if restored > 0 {
+            kv.checkpoint_window(&lead[..restored]);
         }
-        None => {
-            let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
-            chunks
-                .eval_chunks(mtmd_ctx, kv.ctx.ctx(), 0, 0, n_batch, true)
-                .map_err(|e| e.to_string())
-        }
+        decode_checkpointed(&mut kv, &lead, restored)?;
     }
-    .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
+    let start = i32::try_from(lead.len())
+        .map_err(|_| ProviderError::ExecutionError("Multimodal prompt is too long".to_string()))?;
+    let (n_past, cost) = eval_from_first_media(&mut kv, &chunks, mtmd_ctx, first_media, start)
+        .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
     tracing::info!(
         target: "giap::kv",
         kind = "media_prompt_rebuilt",
@@ -2744,6 +2768,10 @@ fn prefill_multimodal(
         restored_tokens = restored,
         n_past,
         eval_ms = eval_started.elapsed().as_millis() as u64,
+        media_tokens = cost.tokens,
+        media_ms = cost.eval_ms,
+        encode_ms = cost.encode_ms,
+        drafter = kv.ctx.mtp_mut().is_some(),
         "media prompt evaluated into a fresh cache"
     );
 
@@ -2953,12 +2981,12 @@ pub(super) fn prepare_generation(
 
     let (prompt_token_count, mut prefilled, prompt_tokens) = if !ctx.media.is_empty() {
         // The multimodal path prefills through mtmd chunks and never produces a
-        // flat token vector, so a speculative draft has nothing to stand on --
-        // which is consistent with the vision request bypassing KV retention too.
+        // flat token vector.
         let (ptc, prefilled) = prefill_multimodal(
             ctx.session,
             ctx.snapshot,
             ctx.model,
+            ctx.draft,
             ctx.mtmd_ctx,
             ctx.backend,
             &template_result.prompt,
@@ -3085,8 +3113,7 @@ pub(super) enum TokenAction {
 /// The token a stop condition fires on is sampled but never decoded, and is
 /// therefore absent from `decoded`.
 // `prompt_tokens` and `prompt_token_count` look redundant and are not: the
-// count includes media chunks, while the token vector is text only, which is
-// what the drafter has to be seeded with.
+// count includes media chunks, while the token vector is text only.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn generation_loop(
     model: &LlamaModel,
@@ -3123,12 +3150,14 @@ pub(super) fn generation_loop(
     // a prompt the target has moved past, so every draft is rejected and the
     // speedup silently becomes a slowdown. This is the single point every path
     // passes through with the prefill finished.
-    // A media prompt's tokens are not all text, so a session a text turn left
-    // with a drafter does not speculate on it.
-    let mut speculative = prompt_tokens.len() == prompt_token_count;
-    if let Some(mtp) = ctx.mtp_mut().filter(|_| speculative) {
+    let mut speculative = true;
+    if let Some(mtp) = ctx.mtp_mut() {
         mtp.begin(prompt_tokens)?;
     }
+    // The drafter shares the target's cache and drafts from a position, not from the prompt's
+    // tokens, so a prompt carrying media speculates too. Its end is read from the cache:
+    // `prompt_tokens` holds only its text.
+    let prompt_end = ctx.ctx().kv_cache_seq_pos_max(0) + 1;
 
     // `pending` is always UNDECODED on entry to an iteration; whichever path
     // runs is responsible for decoding it.
@@ -3166,7 +3195,7 @@ pub(super) fn generation_loop(
         sequence.push(token);
 
         let step = if speculative && ctx.mtp_mut().is_some() {
-            let n_past = (sequence.len() - 1) as i32;
+            let n_past = prompt_end + (sequence.len() - prompt_tokens.len()) as i32 - 1;
             let mtp = ctx.mtp_mut().expect("checked above");
             let step = super::mtp::speculate(mtp, model, &mut sampler, n_past, token, &sequence)?;
             // Without room for a draft this step, the rest of the turn decodes one token at a time.
@@ -3243,6 +3272,41 @@ pub(super) fn decode_tokens_for_test(
     kv.tokens.clear();
     kv.tokens.extend_from_slice(prompt);
     Ok(())
+}
+
+/// Prefill a media prompt as a turn would, for tests that need the session it leaves. Returns
+/// the prompt's size and how much of it the retained cache served.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prefill_media_for_test(
+    session: &mut Option<SessionKv>,
+    model: &Arc<LlamaModel>,
+    draft: Option<&Arc<LlamaModel>>,
+    mtmd_ctx: &MtmdContext,
+    backend: &LlamaCppBackend,
+    prompt_text: &str,
+    media: &[ExtractedMedia],
+    settings: &ModelSettings,
+) -> Result<(usize, usize), ProviderError> {
+    let window = settings.context_size.unwrap_or(4096) as usize;
+    let (prompt_tokens, prefilled) = prefill_multimodal(
+        session,
+        &mut None,
+        model,
+        draft,
+        Some(mtmd_ctx),
+        backend,
+        prompt_text,
+        media,
+        window,
+        settings,
+        None,
+    )?;
+    assert!(
+        prefilled.transient.is_none(),
+        "the media cache was not retained"
+    );
+    Ok((prompt_tokens, prefilled.reused_prefix_tokens))
 }
 
 #[cfg(test)]

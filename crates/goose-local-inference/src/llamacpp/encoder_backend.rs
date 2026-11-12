@@ -81,9 +81,33 @@ impl EncoderBackend {
     }
 }
 
+/// Milliseconds mtmd says its towers spent encoding, summed over the slices it reported.
+pub(super) fn encode_ms(said: &[String]) -> Option<u64> {
+    said.concat()
+        .lines()
+        .filter_map(|line| line.split_once(" slice encoded in "))
+        .filter_map(|(_, rest)| rest.trim().strip_suffix(" ms")?.trim().parse::<u64>().ok())
+        .fold(None, |total, ms| Some(total.unwrap_or(0) + ms))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sums_the_encode_time_of_every_slice_and_leaves_the_decodes_out() {
+        let said: Vec<String> = [
+            "encoding audio slice...\n",
+            "audio slice encoded in 212 ms\n",
+            "decoding audio batch 1/1, n_tokens_batch = 71\n",
+            "audio decoded (batch 1/1) in 164 ms\n",
+            "image slice encoded in 688 ms\n",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(encode_ms(&said), Some(900));
+        assert_eq!(encode_ms(&said[2..4]), None);
+    }
 
     /// mtmd's lines as clip.cpp prints them for an audio tower on CUDA with two ops it lacks.
     const CUDA_WITH_GAPS: &str = "\
