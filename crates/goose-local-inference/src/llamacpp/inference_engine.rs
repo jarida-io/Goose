@@ -28,6 +28,11 @@ const MIB: u64 = 1024 * 1024;
 /// the bookkeeping costs more than the decode it saves.
 const REUSE_MIN_TOKENS: usize = 256;
 
+/// Template options for every generation prompt. A tool call's reasoning stays in the rendered
+/// history: a template that drops it once a newer user message follows rewrites the prompt behind
+/// the tool result, and the cache holding that result is decoded again.
+pub(super) const STABLE_HISTORY_KWARGS: &str = r#"{"preserve_thinking":true}"#;
+
 /// How long a chat's cache stays protected from another chat's prompt. A conversation's turns,
 /// side calls and subagents come within seconds; a cache idle longer belongs to one that is over.
 const CHAT_CACHE_PROTECTED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
@@ -35,8 +40,10 @@ const CHAT_CACHE_PROTECTED_FOR: std::time::Duration = std::time::Duration::from_
 /// Sliding-window checkpoints kept per retained context, newest last. Each is
 /// the window layers' cells, 16 MiB for Gemma 4 E4B at q8_0 and 768 cells. The
 /// oldest is kept when one is dropped: it is usually the preamble's boundary,
-/// where the next conversation resumes.
-const WINDOW_CHECKPOINTS: usize = 4;
+/// where the next conversation resumes. One taken inside a prefill goes before
+/// one taken at a prompt's end: the next prompt diverges where a reply or a tool
+/// result begins, and a turn has a prompt end for each of its calls.
+const WINDOW_CHECKPOINTS: usize = 6;
 
 /// How far behind the end of a prefill window checkpoints reach, one at each
 /// batch boundary from the last one at or before the start of the span. A
@@ -56,6 +63,8 @@ struct WindowCheckpoint {
     /// under a prompt with the same prefix, whatever rewound the cache since.
     prefix: u64,
     state: SeqState,
+    /// Taken with a whole prompt in the cache, where its reply begins.
+    at_prompt_end: bool,
 }
 
 /// FNV-1a over token ids.
@@ -567,12 +576,13 @@ impl SessionKv {
 
     /// Saves the window layers' cells while the cache holds exactly `tokens`.
     /// Text-only caches: behind a media head, positions are not token indices.
-    fn checkpoint_window(&mut self, tokens: &[LlamaToken]) {
+    fn checkpoint_window(&mut self, tokens: &[LlamaToken], at_prompt_end: bool) {
         if self.n_swa == 0 || self.head.is_some() {
             return;
         }
         let pos = tokens.len();
-        if self.checkpoints.last().is_some_and(|c| c.pos == pos) {
+        if let Some(last) = self.checkpoints.last_mut().filter(|c| c.pos == pos) {
+            last.at_prompt_end |= at_prompt_end;
             return;
         }
         match self
@@ -586,9 +596,16 @@ impl SessionKv {
                     pos,
                     prefix: token_fingerprint(tokens),
                     state,
+                    at_prompt_end,
                 });
                 if self.checkpoints.len() > WINDOW_CHECKPOINTS {
-                    self.checkpoints.remove(1);
+                    let inside_a_prefill = self
+                        .checkpoints
+                        .iter()
+                        .skip(1)
+                        .position(|c| !c.at_prompt_end);
+                    self.checkpoints
+                        .remove(inside_a_prefill.map_or(1, |i| i + 1));
                 }
             }
             Err(error) => tracing::debug!(%error, pos, "window checkpoint not taken"),
@@ -1509,7 +1526,7 @@ fn decode_checkpointed(
     while pos < prompt.len() {
         let end = (pos + n_batch).min(prompt.len());
         if pos > from && end > span_start {
-            kv.checkpoint_window(&prompt[..pos]);
+            kv.checkpoint_window(&prompt[..pos], false);
         }
         decode_tokens(kv.ctx.ctx_mut(), &prompt[pos..end], pos)?;
         pos = end;
@@ -1573,9 +1590,29 @@ fn reuse_prefix(
     prompt: &[LlamaToken],
     resume_pos: usize,
 ) -> Result<usize, PrefixReuseError> {
-    let resume_pos = kv
-        .window_resume(prompt, resume_pos)
-        .ok_or(PrefixReuseError::Refused)?;
+    let wanted = resume_pos;
+    let Some(resume_pos) = kv.window_resume(prompt, resume_pos) else {
+        tracing::info!(
+            target: "giap::kv",
+            event = "rewind_refused",
+            wanted,
+            prompt_tokens = prompt.len(),
+            checkpoints = ?kv.checkpoints.iter().map(|c| c.pos).collect::<Vec<_>>(),
+            "the cache holds no point to resume from at or before where this prompt differs"
+        );
+        return Err(PrefixReuseError::Refused);
+    };
+    if resume_pos < wanted {
+        tracing::info!(
+            target: "giap::kv",
+            event = "rewound_further",
+            wanted,
+            resumed_at = resume_pos,
+            decoded_again = wanted - resume_pos,
+            prompt_tokens = prompt.len(),
+            "the cache resumed at an earlier checkpoint than where this prompt differs"
+        );
+    }
     let kept = kept_prefix_tokens(resume_pos, kv.media_pos(), prompt.len(), kv.tokens.len())
         .ok_or(PrefixReuseError::Refused)?;
     let p0 = u32::try_from(resume_pos).map_err(|_| PrefixReuseError::Refused)?;
@@ -1682,7 +1719,7 @@ fn seed_from_snapshot(
     };
 
     kv.tokens.extend_from_slice(&prompt[..restored]);
-    kv.checkpoint_window(&prompt[..restored]);
+    kv.checkpoint_window(&prompt[..restored], true);
     match decode_checkpointed(&mut kv, prompt, restored) {
         Ok(()) => {
             kv.tokens.extend_from_slice(&prompt[restored..]);
@@ -1858,7 +1895,7 @@ fn write_snapshot_if_due(
     );
 
     // Put the tail back: the turn still has to generate from the whole prompt.
-    kv.checkpoint_window(&prompt[..keep]);
+    kv.checkpoint_window(&prompt[..keep], true);
     match decode_checkpointed(kv, prompt, keep) {
         Ok(()) => kv.tokens.extend_from_slice(&prompt[keep..]),
         Err(e) => {
@@ -2159,7 +2196,7 @@ fn prefill_prompt(
                     compile_prefill.filter(|_| rebuild_preamble.is_some()),
                 );
             }
-            kv.checkpoint_window(&prompt[..keep]);
+            kv.checkpoint_window(&prompt[..keep], true);
             if let Err(e) = decode_checkpointed(kv, prompt, keep) {
                 *session = None;
                 return Err(e);
@@ -2753,7 +2790,7 @@ fn prefill_multimodal(
             .and_then(|slot| slot.load(kv.context_mut(), &lead))
             .unwrap_or(0);
         if restored > 0 {
-            kv.checkpoint_window(&lead[..restored]);
+            kv.checkpoint_window(&lead[..restored], true);
         }
         decode_checkpointed(&mut kv, &lead, restored)?;
     }
@@ -2854,7 +2891,7 @@ pub(super) fn prepare_generation(
             } else {
                 None
             },
-            chat_template_kwargs: None,
+            chat_template_kwargs: Some(STABLE_HISTORY_KWARGS),
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: false,
@@ -3064,7 +3101,7 @@ pub(super) fn prepare_generation(
                 kv.last_used = std::time::Instant::now();
                 // A rewind into this prompt's reply resumes at its end.
                 let tokens = std::mem::take(&mut kv.tokens);
-                kv.checkpoint_window(&tokens);
+                kv.checkpoint_window(&tokens, true);
                 kv.tokens = tokens;
             }
         }
@@ -3665,7 +3702,7 @@ pub(super) mod tests {
         let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
         decode_checkpointed(&mut kv, &first, 0).expect("prefill the first prompt");
         kv.tokens.extend_from_slice(&first);
-        kv.checkpoint_window(&first);
+        kv.checkpoint_window(&first, true);
         let pos_min = kv.ctx.ctx().kv_cache_seq_pos_min(0);
         assert!(
             pos_min as usize > shared.len().saturating_sub(kv.n_swa),
@@ -4972,6 +5009,111 @@ pub(super) mod tests {
             disagreements.is_empty(),
             "a rebuilt or resumed prime predicted a different next token than the cold one \
              (history, cold, rebuilt, resumed): {disagreements:?}"
+        );
+    }
+
+    /// The weights a live test checks prompt shapes against: the pond's own chat model when the
+    /// developer has it, since templates differ between releases of one model.
+    fn live_chat_model_path() -> Option<std::path::PathBuf> {
+        if let Some(path) = std::env::var_os("GIAP_TEST_GGUF") {
+            return Some(std::path::PathBuf::from(path)).filter(|p| p.is_file());
+        }
+        let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+        [
+            "Library/Application Support/goose-in-a-pond/models/gguf",
+            ".local/share/goose-in-a-pond/models/gguf",
+        ]
+        .iter()
+        .map(|root| home.join(root).join("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"))
+        .find(|p| p.is_file())
+        .or_else(live_model_path)
+    }
+
+    /// A turn that called a tool stays a prefix of the next turn's prompt up to where its reply
+    /// begins. Anything the template rewrites before that is cache decoded again, the tool's
+    /// result included.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn a_tool_turn_stays_a_prefix_of_the_next_turns_prompt() {
+        use llama_cpp_2::model::params::LlamaModelParams;
+        use serde_json::json;
+
+        let Some(src) = live_chat_model_path() else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let backend = shared_backend();
+        let model =
+            LlamaModel::load_from_file(backend.llama_backend(), &src, &LlamaModelParams::default())
+                .expect("load model");
+        let settings = ModelSettings::default();
+        let templates = crate::llamacpp::load_chat_templates(&model, &settings).expect("templates");
+        let template = templates
+            .tool_use
+            .as_ref()
+            .or(templates.default.as_ref())
+            .expect("a template");
+
+        let tools = r#"[{"type":"function","function":{"name":"lookup",
+                          "description":"Look a fact up.",
+                          "parameters":{"type":"object","properties":{"query":{"type":"string"}},
+                          "required":["query"]}}}]"#;
+        let result = "Nairobi is the capital of Kenya. ".repeat(40);
+        let mut messages = vec![
+            json!({"role": "system", "content": "You are a helpful assistant."}),
+            json!({"role": "user", "content": "What is the capital of Kenya?"}),
+            json!({"role": "assistant", "content": "", "reasoning_content": "I should look this up.",
+                   "tool_calls": [{"id": "call_1", "type": "function", "function":
+                       {"name": "lookup", "arguments": "{\"query\":\"capital of Kenya\"}"}}]}),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": result}),
+        ];
+        let tokens = |messages: &[serde_json::Value], kwargs: Option<&str>| {
+            let messages = serde_json::Value::from(messages.to_vec()).to_string();
+            let params = OpenAIChatTemplateParams {
+                messages_json: &messages,
+                tools_json: Some(tools),
+                tool_choice: None,
+                json_schema: None,
+                grammar: None,
+                reasoning_format: Some("auto"),
+                chat_template_kwargs: kwargs,
+                add_generation_prompt: true,
+                use_jinja: true,
+                parallel_tool_calls: false,
+                enable_thinking: true,
+                add_bos: false,
+                add_eos: false,
+                parse_tool_calls: true,
+            };
+            let rendered = model
+                .apply_chat_template_oaicompat(template, &params)
+                .expect("apply template");
+            model
+                .str_to_token(&rendered.prompt, AddBos::Never)
+                .expect("tokenize")
+        };
+
+        let in_turn = tokens(&messages, Some(STABLE_HISTORY_KWARGS));
+        let bare_in_turn = tokens(&messages, None);
+        messages.push(json!({"role": "assistant", "content": "Nairobi.",
+                             "reasoning_content": "The tool says Nairobi."}));
+        messages.push(json!({"role": "user", "content": "And of Uganda?"}));
+        let next = tokens(&messages, Some(STABLE_HISTORY_KWARGS));
+        let bare_next = tokens(&messages, None);
+
+        let rewritten = in_turn.len() - common_prefix_len(&in_turn, &next);
+        let bare_rewritten = bare_in_turn.len() - common_prefix_len(&bare_in_turn, &bare_next);
+        eprintln!(
+            "{}: the next turn rewrites the last {rewritten} of {} tokens; {bare_rewritten} without \
+             the template options",
+            src.display(),
+            in_turn.len()
+        );
+        // Only the generation prompt, where the turn's reply went, may differ.
+        assert!(
+            rewritten <= 8,
+            "the next turn's prompt rewrites {rewritten} tokens of the tool turn before it, so the \
+             cache holding the tool's result is decoded again"
         );
     }
 

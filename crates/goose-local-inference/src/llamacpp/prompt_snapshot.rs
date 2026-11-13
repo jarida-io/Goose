@@ -255,6 +255,16 @@ impl SnapshotIndex {
             .max_by_key(|e| e.tokens)
     }
 
+    /// The entry agreeing deepest with `prompt`, as its length and the rung they agree to; for
+    /// saying why none matched.
+    fn nearest(&self, prompt: &[LlamaToken]) -> Option<(usize, usize)> {
+        let want = ladder(prompt);
+        self.entries
+            .iter()
+            .map(|e| (e.tokens, ladder_agreement(&e.ladder, &want)))
+            .max_by_key(|&(_, agreed)| agreed)
+    }
+
     /// Adds `entry` and returns the files it replaces. The prime and every role open alike, so an
     /// opening never decides: a named shape replaces only its own, an unnamed write the unnamed one.
     fn admit(&mut self, mut entry: IndexEntry) -> Vec<String> {
@@ -707,7 +717,19 @@ impl SnapshotSlot {
         ctx: &mut LlamaContext<'_>,
         prompt: &[LlamaToken],
     ) -> Option<usize> {
-        let chosen = self.index.best_match(prompt)?.clone();
+        let Some(chosen) = self.index.best_match(prompt).cloned() else {
+            let (nearest_tokens, agreed_tokens) = self.index.nearest(prompt).unwrap_or((0, 0));
+            tracing::info!(
+                target: KV_TARGET,
+                event = "no_match",
+                prompt_tokens = prompt.len(),
+                snapshots = self.index.entries.len(),
+                nearest_tokens,
+                agreed_tokens,
+                "no kv snapshot begins this prompt; prefilling normally"
+            );
+            return None;
+        };
         let path = self.dir.join(&chosen.file);
         if !path.exists() {
             self.forget(&chosen.file, "index named a file that is gone");
