@@ -1364,6 +1364,10 @@ impl BackendLoadedModel for LoadedModel {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+
+    fn release_encoder(&mut self) -> bool {
+        self.encoder.take().is_some()
+    }
 }
 
 fn is_accelerator_device(device_type: LlamaBackendDeviceType) -> bool {

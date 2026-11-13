@@ -10,6 +10,11 @@ use super::{ResolvedModelPaths, StreamSender};
 
 pub(super) trait BackendLoadedModel: Send {
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Drops a loaded multimodal encoder; whether there was one.
+    fn release_encoder(&mut self) -> bool {
+        false
+    }
 }
 
 #[cfg_attr(not(feature = "mlx"), allow(dead_code))]

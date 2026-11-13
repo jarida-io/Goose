@@ -270,6 +270,39 @@ pub async fn loaded_model_ids() -> Result<HashSet<String>, ProviderError> {
     Ok(loaded)
 }
 
+/// Releases the multimodal encoder of every loaded model no generation holds, for a caller that
+/// needs its memory, and returns how many it released. The next media call loads it again.
+pub fn release_idle_encoders(wanted_for: &'static str) -> usize {
+    let Some(runtime) = current_runtime() else {
+        return 0;
+    };
+    let slots = {
+        let map = runtime.models.lock().expect("model cache lock poisoned");
+        map.values().cloned().collect::<Vec<_>>()
+    };
+
+    let mut released = 0;
+    for slot in slots {
+        // A contended slot is mid-generation, and its encoder may be in use.
+        let Ok(mut state) = slot.state.try_lock() else {
+            continue;
+        };
+        if let ModelSlotState::Loaded(loaded) = &mut *state {
+            if loaded.release_encoder() {
+                released += 1;
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "encoder_released",
+                    before = wanted_for,
+                    reason = "room_wanted",
+                    "released the multimodal encoder"
+                );
+            }
+        }
+    }
+    released
+}
+
 pub async fn evict_model(model_name: &str) -> Result<bool, ProviderError> {
     let Some(runtime) = current_runtime() else {
         return Ok(false);
