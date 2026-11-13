@@ -857,12 +857,18 @@ mod tests {
 
         let run = |media: &[ExtractedMedia; 2],
                    draft: Option<&Arc<llama_cpp_2::model::LlamaModel>>| {
+            let prefill_with = |session: &mut Option<SessionKv>,
+                                encoder: Option<&llama_cpp_2::mtmd::MtmdContext>,
+                                prompt: &str,
+                                media: &[ExtractedMedia]| {
+                prefill_media_for_test(
+                    session, &model, draft, encoder, backend, prompt, media, &settings,
+                )
+                .expect("media prefill")
+            };
             let prefill =
                 |session: &mut Option<SessionKv>, prompt: &str, media: &[ExtractedMedia]| {
-                    prefill_media_for_test(
-                        session, &model, draft, &encoder, backend, prompt, media, &settings,
-                    )
-                    .expect("media prefill")
+                    prefill_with(session, Some(&encoder), prompt, media)
                 };
             let first = &media[..1];
 
@@ -918,7 +924,29 @@ mod tests {
                 next_ledger.len(),
                 32,
             );
+
+            // A turn of text behind both: laid out and taken in with no encoder at all.
+            let text_turn_after = format!(
+                "{next_turn}{}<end_of_turn>\n<start_of_turn>user\nWhich of the two was first?<end_of_turn>\n<start_of_turn>model\n",
+                piece_of(&next_resumed)
+            );
+            let (after_ledger, after_reused, after_evaluated) =
+                prefill_with(&mut session, None, &text_turn_after, media);
+            assert_eq!(
+                after_evaluated, 0,
+                "a turn of text behind held media went to the encoder"
+            );
+            assert!(after_reused >= next_ledger.len());
+            let after_resumed = reply(
+                &model,
+                &mut session,
+                &settings,
+                &after_ledger,
+                after_ledger.len(),
+                24,
+            );
             drop(session);
+
             let mut fresh_session = None;
             let (fresh_ledger, _, _) = prefill(&mut fresh_session, &next_turn, media);
             assert_eq!(
@@ -932,6 +960,25 @@ mod tests {
                 &fresh_ledger,
                 fresh_ledger.len(),
                 32,
+            );
+            drop(fresh_session);
+            let mut fresh_session = None;
+            let (fresh_after, _, _) = prefill(&mut fresh_session, &text_turn_after, media);
+            assert_eq!(
+                fresh_after, after_ledger,
+                "a prompt laid out from memory differs from mtmd's own layout"
+            );
+            let after_fresh = reply(
+                &model,
+                &mut fresh_session,
+                &settings,
+                &fresh_after,
+                fresh_after.len(),
+                24,
+            );
+            assert_eq!(
+                after_fresh, after_resumed,
+                "a turn taken in without the encoder read differently from a rebuild"
             );
 
             MediaRun {

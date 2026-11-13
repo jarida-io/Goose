@@ -103,6 +103,13 @@ fn encoder_fits(available: u64, bytes: u64, freed: u64) -> bool {
     available.saturating_add(freed) >= bytes.saturating_add(ENCODER_LOAD_RESERVE_BYTES)
 }
 
+pub(crate) use inference_engine::cache_holds_media;
+
+/// See [`crate::media_content_hash`].
+pub(crate) fn media_content_hash(bytes: &[u8], audio: bool) -> u64 {
+    media_ledger::content_hash(bytes, audio)
+}
+
 /// See [`crate::hearing_room`].
 pub(crate) fn hearing_room(mmproj: &Path) -> crate::HearingRoom {
     use crate::HearingRoom;
@@ -1240,24 +1247,6 @@ impl LocalInferenceBackend for LlamaCppBackend {
         if !has_media && loaded.encoder.is_some() && !self.encoder_may_stay() {
             self.release_encoder(loaded, "text_call", "memory_floor");
         }
-        if let Some(mmproj) = request
-            .resolved_model
-            .mmproj_path
-            .as_deref()
-            .filter(|_| has_media)
-        {
-            if !loaded.encoder.as_ref().is_some_and(|e| e.holds(&media)) {
-                self.load_encoder(loaded, mmproj, &media, request.settings)?;
-            }
-        }
-
-        let template = select_generation_template(
-            &request.model_name,
-            &loaded.model,
-            &loaded.templates,
-            native_tool_calling,
-            !request.tools.is_empty(),
-        )?;
 
         tracing::debug!(
             loaded_ptr = ?(loaded as *const LoadedModel),
@@ -1265,55 +1254,83 @@ impl LocalInferenceBackend for LlamaCppBackend {
             "generate: model slot identity"
         );
         let kv_settings = memory::with_fitted_kv_type(request.settings, loaded.memory_fit);
-        let mut gen_ctx = GenerationContext {
-            draft: loaded.draft.as_ref(),
-            model: &loaded.model,
-            // A text call never sees a kept encoder, so its context sizing does not move with it.
-            mtmd_ctx: if has_media {
-                loaded.encoder.as_ref().map(|e| &e.ctx)
-            } else {
-                None
-            },
-            session: &mut loaded.session,
-            snapshot: &mut loaded.snapshot,
-            model_path: &loaded.model_path,
-            memory_fit: loaded.memory_fit,
-            backend: self,
-            template,
-            settings: &kv_settings,
-            context_limit: request.context_limit,
-            model_name: request.model_name,
-            message_id: request.message_id,
-            tx: request.tx,
-            log: request.log,
-            media: &media,
-            model_load_ms: request.model_load_ms,
-            started,
-            one_shot: request.tools.is_empty(),
-            tool_calls_only: request.tool_calls_only,
-            helper: request.helper,
-            prime_waiting: request.prime_waiting,
-            suspended: &mut loaded.suspended,
-            compile_prefill: request.compile_prefill,
-            prefill_retention_secs: request.prefill_retention_secs,
-            rebuild_prefill: request.rebuild_prefill,
-            tool_call_emitted: false,
-            stop_when: request.stop_when,
-        };
+        // The first of `media` an encoder must take in, once a call has said so: what the chat
+        // cache already holds of a prompt's media needs none.
+        let mut encode_from: Option<usize> = None;
+        let (result, calls_again) = loop {
+            if let (Some(from), Some(mmproj)) =
+                (encode_from, request.resolved_model.mmproj_path.as_deref())
+            {
+                let fresh = &media[from.min(media.len())..];
+                if !loaded.encoder.as_ref().is_some_and(|e| e.holds(fresh)) {
+                    self.load_encoder(loaded, mmproj, fresh, request.settings)?;
+                }
+            }
+            let template = select_generation_template(
+                &request.model_name,
+                &loaded.model,
+                &loaded.templates,
+                native_tool_calling,
+                !request.tools.is_empty(),
+            )?;
+            let mut gen_ctx = GenerationContext {
+                draft: loaded.draft.as_ref(),
+                model: &loaded.model,
+                // A text call never sees a kept encoder, so its context sizing does not move
+                // with it.
+                mtmd_ctx: if has_media {
+                    loaded.encoder.as_ref().map(|e| &e.ctx)
+                } else {
+                    None
+                },
+                session: &mut loaded.session,
+                snapshot: &mut loaded.snapshot,
+                model_path: &loaded.model_path,
+                memory_fit: loaded.memory_fit,
+                backend: self,
+                template,
+                settings: &kv_settings,
+                context_limit: request.context_limit,
+                model_name: request.model_name.clone(),
+                message_id: request.message_id,
+                tx: request.tx,
+                log: &mut *request.log,
+                media: &media,
+                model_load_ms: request.model_load_ms,
+                started,
+                one_shot: request.tools.is_empty(),
+                tool_calls_only: request.tool_calls_only,
+                helper: request.helper,
+                prime_waiting: request.prime_waiting,
+                suspended: &mut loaded.suspended,
+                compile_prefill: request.compile_prefill.clone(),
+                prefill_retention_secs: request.prefill_retention_secs,
+                rebuild_prefill: request.rebuild_prefill,
+                tool_call_emitted: false,
+                stop_when: request.stop_when.clone(),
+                needs_encoder_from: None,
+            };
 
-        let result = if use_emulator {
-            generate_with_emulated_tools(&mut gen_ctx, code_mode_enabled, &oai_messages_json)
-        } else {
-            generate_with_native_tools(
-                &mut gen_ctx,
-                &oai_messages_json,
-                full_tools_json.as_deref(),
-                compact_tools.as_deref(),
-                request.tools,
-            )
+            let result = if use_emulator {
+                generate_with_emulated_tools(&mut gen_ctx, code_mode_enabled, &oai_messages_json)
+            } else {
+                generate_with_native_tools(
+                    &mut gen_ctx,
+                    &oai_messages_json,
+                    full_tools_json.as_deref(),
+                    compact_tools.as_deref(),
+                    request.tools,
+                )
+            };
+            match gen_ctx.needs_encoder_from {
+                Some(from) if encode_from.is_none_or(|asked| from < asked) => {
+                    encode_from = Some(from);
+                }
+                // A tool call means the agent calls again within this turn, with the same media.
+                _ => break (result, gen_ctx.tool_call_emitted),
+            }
         };
-        // A tool call means the agent calls again within this turn, with the same media.
-        let calls_again = gen_ctx.tool_call_emitted;
+        inference_engine::note_cached_media(loaded.session.as_ref(), loaded.suspended.as_ref());
         if has_media && !calls_again && !self.encoder_may_stay() {
             self.release_encoder(loaded, "after_media_call", "memory_floor");
         }

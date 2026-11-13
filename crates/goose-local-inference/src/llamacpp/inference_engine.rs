@@ -139,6 +139,8 @@ pub(super) struct GenerationContext<'a> {
     pub tool_call_emitted: bool,
     /// Ends the generation at its next token (`LocalGenerationRequest::stop_when`).
     pub stop_when: Option<goose_provider_types::request_context::StopWhen>,
+    /// Set when the call stopped for want of an encoder: the first of `media` one must take in.
+    pub needs_encoder_from: Option<usize>,
 }
 
 impl<'a> GenerationContext<'a> {
@@ -175,6 +177,12 @@ pub(super) struct LoadedModel {
     pub model_path: std::path::PathBuf,
     /// What a context may spend on a unified-memory board, measured once after the load.
     pub memory_fit: Option<MemoryFit>,
+}
+
+impl Drop for LoadedModel {
+    fn drop(&mut self) {
+        note_cached_media(None, None);
+    }
 }
 
 pub(super) struct LoadedChatTemplates {
@@ -237,6 +245,8 @@ pub(super) struct SessionKv {
     /// The pictures and recordings among `tokens`, as the prompt that filled the cache laid
     /// them out.
     media: Vec<MediaRun>,
+    /// How the last media prompt taken in here was laid out.
+    layout: Option<MediaLayout>,
     /// The `n_ctx` this context was *requested* with. Compared against the
     /// effective context of an incoming request; llama.cpp may round the
     /// realised `n_ctx` up, so the requested value is the stable identity.
@@ -389,6 +399,7 @@ impl SessionKv {
             ctx,
             tokens: Vec::new(),
             media: Vec::new(),
+            layout: None,
             n_ctx,
             one_shot: false,
             last_used: std::time::Instant::now(),
@@ -458,18 +469,10 @@ impl SessionKv {
     /// same token prefix puts those cells back, and decoding starts there.
     /// `None`: nothing to resume from.
     fn window_resume(&mut self, prompt: &[LlamaToken], resume_pos: usize) -> Option<usize> {
-        if self.n_swa == 0 {
+        if self.resumes_in_place(resume_pos) {
             return Some(resume_pos);
         }
-        let pos_min = self.ctx.ctx().kv_cache_seq_pos_min(0);
-        if pos_min >= 0 && pos_min as usize <= resume_pos.saturating_sub(self.n_swa) {
-            return Some(resume_pos);
-        }
-        let found = self.checkpoints.iter().rposition(|c| {
-            c.pos <= resume_pos
-                && c.pos <= prompt.len()
-                && c.prefix == token_fingerprint(&prompt[..c.pos])
-        })?;
+        let found = self.resume_checkpoint(prompt, resume_pos)?;
         let checkpoint = &self.checkpoints[found];
         match self.ctx.ctx_mut().state_seq_set(&checkpoint.state, 0) {
             Ok(()) => Some(checkpoint.pos),
@@ -479,6 +482,33 @@ impl SessionKv {
                 None
             }
         }
+    }
+}
+
+impl SessionKv {
+    fn resumes_in_place(&self, resume_pos: usize) -> bool {
+        if self.n_swa == 0 {
+            return true;
+        }
+        let pos_min = self.ctx.ctx().kv_cache_seq_pos_min(0);
+        pos_min >= 0 && pos_min as usize <= resume_pos.saturating_sub(self.n_swa)
+    }
+
+    fn resume_checkpoint(&self, prompt: &[LlamaToken], resume_pos: usize) -> Option<usize> {
+        self.checkpoints.iter().rposition(|c| {
+            c.pos <= resume_pos
+                && c.pos <= prompt.len()
+                && c.prefix == token_fingerprint(&prompt[..c.pos])
+        })
+    }
+
+    /// Whether [`Self::window_resume`] at `resume_pos` would start at or after `floor`.
+    fn resumes_from(&self, prompt: &[LlamaToken], resume_pos: usize, floor: usize) -> bool {
+        if self.resumes_in_place(resume_pos) {
+            return resume_pos >= floor;
+        }
+        self.resume_checkpoint(prompt, resume_pos)
+            .is_some_and(|found| self.checkpoints[found].pos >= floor)
     }
 }
 
@@ -586,6 +616,7 @@ pub(super) struct SuspendedKv {
     path: std::path::PathBuf,
     tokens: Vec<LlamaToken>,
     media: Vec<MediaRun>,
+    layout: Option<MediaLayout>,
     n_ctx: u32,
     checkpoints: Vec<WindowCheckpoint>,
 }
@@ -653,6 +684,7 @@ fn suspend_for_helper(session: &mut Option<SessionKv>) -> Option<SuspendedKv> {
     let SessionKv {
         tokens,
         media,
+        layout,
         n_ctx,
         checkpoints,
         ..
@@ -669,6 +701,7 @@ fn suspend_for_helper(session: &mut Option<SessionKv>) -> Option<SuspendedKv> {
         path,
         tokens,
         media,
+        layout,
         n_ctx,
         checkpoints,
     })
@@ -727,6 +760,7 @@ fn resume_suspended(
         Ok((tokens, bytes)) if tokens == held.tokens => {
             kv.tokens = std::mem::take(&mut held.tokens);
             kv.media = std::mem::take(&mut held.media);
+            kv.layout = held.layout.take();
             kv.checkpoints = std::mem::take(&mut held.checkpoints);
             tracing::info!(
                 target: "giap::kv",
@@ -1586,6 +1620,7 @@ fn full_prefill(
         .expect("session was just populated or already matched n_ctx");
     kv.tokens.clear();
     kv.media.clear();
+    kv.layout = None;
     kv.checkpoints.clear();
     kv.ctx.ctx_mut().clear_kv_cache();
     match decode_checkpointed(kv, prompt, 0, media) {
@@ -1795,7 +1830,7 @@ fn fill_cache(
 
     // A non-causal encoder's output must fit one micro-batch, which a retained cache may lack.
     if media.is_some_and(|m| {
-        m.mtmd.decode_use_non_causal()
+        m.non_causal()
             && session
                 .as_ref()
                 .is_some_and(|kv| (kv.ctx.ctx().n_ubatch() as usize) < m.widest())
@@ -2102,12 +2137,41 @@ struct MediaCost {
     encode_ms: Option<u64>,
 }
 
-/// A prompt's pictures and recordings, and mtmd to put them into a cache.
+/// The media files, by hash, a retained or suspended chat cache holds the encoder's output of.
+static CACHED_MEDIA: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether a prompt whose only media are `files` is likely taken in without an encoder. A hint:
+/// it is as old as the last call, and the call itself decides.
+pub(crate) fn cache_holds_media(files: &[u64]) -> bool {
+    let cached = CACHED_MEDIA.lock().unwrap_or_else(|e| e.into_inner());
+    files.iter().all(|file| cached.contains(file))
+}
+
+pub(super) fn note_cached_media(session: Option<&SessionKv>, suspended: Option<&SuspendedKv>) {
+    let held = |layout: Option<&MediaLayout>, tokens: &[LlamaToken], runs: &[MediaRun]| {
+        layout
+            .filter(|layout| layout.held_by(tokens, runs))
+            .map(|layout| layout.files.clone())
+            .unwrap_or_default()
+    };
+    let mut files = session.map_or_else(Vec::new, |kv| {
+        held(kv.layout.as_ref(), &kv.tokens, &kv.media)
+    });
+    if let Some(kv) = suspended {
+        files.extend(held(kv.layout.as_ref(), &kv.tokens, &kv.media));
+    }
+    *CACHED_MEDIA.lock().unwrap_or_else(|e| e.into_inner()) = files;
+}
+
+/// A prompt's pictures and recordings, and mtmd to put into a cache those it lacks.
 pub(super) struct PromptMedia<'a> {
-    chunks: &'a MtmdInputChunks,
-    mtmd: &'a MtmdContext,
+    /// mtmd and its chunks for the media this call took in. A run whose `chunk` is not among
+    /// them was laid out from a [`MediaLayout`], and the cache must already hold it.
+    encoded: Option<(&'a MtmdContext, &'a MtmdInputChunks)>,
     runs: Vec<MediaRun>,
     cost: std::cell::Cell<MediaCost>,
+    /// Set when the cache turned out not to hold a run laid out from memory.
+    unmet: std::cell::Cell<bool>,
 }
 
 impl PromptMedia<'_> {
@@ -2115,17 +2179,23 @@ impl PromptMedia<'_> {
     fn eval(&self, kv: &mut SessionKv, run: &MediaRun) -> Result<(), ProviderError> {
         let failed =
             |why: String| ProviderError::ExecutionError(format!("Multimodal eval failed: {why}"));
-        let chunk = self
-            .chunks
-            .get(run.chunk)
-            .ok_or_else(|| failed(format!("chunk {} is missing", run.chunk)))?;
+        let Some((mtmd, chunk)) = self
+            .encoded
+            .and_then(|(mtmd, chunks)| Some((mtmd, chunks.get(run.chunk)?)))
+        else {
+            self.unmet.set(true);
+            return Err(failed(format!(
+                "the cache no longer holds the media at position {}",
+                run.start
+            )));
+        };
         let start =
             i32::try_from(run.start).map_err(|_| failed("the prompt is too long".to_string()))?;
         let n_batch = kv.ctx.ctx().n_batch() as i32;
         let started = std::time::Instant::now();
         // mtmd times its towers itself and says so only in its log.
         let (evaluated, said) = super::encoder_backend::caught_while(|| {
-            chunk.eval(self.mtmd, kv.ctx.ctx(), start, 0, n_batch, false)
+            chunk.eval(mtmd, kv.ctx.ctx(), start, 0, n_batch, false)
         });
         let n_past = evaluated.map_err(|e| match said.last() {
             // The reason is in mtmd's log, which was caught rather than traced.
@@ -2155,19 +2225,233 @@ impl PromptMedia<'_> {
     fn widest(&self) -> usize {
         self.runs.iter().map(|run| run.len).max().unwrap_or(0)
     }
+
+    /// A non-causal encoder's output is decoded in one micro-batch.
+    fn non_causal(&self) -> bool {
+        self.encoded
+            .is_some_and(|(mtmd, _)| mtmd.decode_use_non_causal())
+    }
+}
+
+/// A run laid out from memory: no chunk of this call's made it.
+const NO_CHUNK: usize = usize::MAX;
+
+/// A prompt one entry a position (`media_ledger`), with its pictures and recordings.
+#[derive(Debug, Clone, Default)]
+struct LaidOut {
+    ledger: Vec<LlamaToken>,
+    runs: Vec<MediaRun>,
+    /// The file each run was made from, by its hash.
+    made_from: Vec<u64>,
+}
+
+/// How mtmd laid out the last media prompt a cache took in. A later prompt that only adds
+/// behind the same pictures and recordings is laid out from this, so mtmd takes in only what
+/// is new, and nothing at all when only text was added.
+#[derive(Debug, Clone)]
+struct MediaLayout {
+    /// The prompt's text up to the end of its last media marker.
+    head: String,
+    /// Each media file's hash, in the prompt's order.
+    files: Vec<u64>,
+    /// The prompt up to the end of its last picture or recording.
+    laid_out: LaidOut,
+    /// What mtmd puts behind that one, ahead of the text after its marker.
+    tail: Vec<LlamaToken>,
+}
+
+impl MediaLayout {
+    /// `None` unless the prompt ends in the text after its last marker tokenized on its own,
+    /// which is what a later prompt is laid out by.
+    fn learn(
+        model: &LlamaModel,
+        prompt_text: &str,
+        media: &[ExtractedMedia],
+        laid_out: &LaidOut,
+    ) -> Option<Self> {
+        let marker = llama_cpp_2::mtmd::mtmd_default_marker();
+        let (before, rest) = prompt_text.rsplit_once(marker)?;
+        let rest = model.str_to_token(rest, AddBos::Never).ok()?;
+        let media_end = laid_out.runs.last()?.end();
+        let tail = laid_out.ledger.get(media_end..)?.strip_suffix(&rest[..])?;
+        Some(Self {
+            head: format!("{before}{marker}"),
+            files: media
+                .iter()
+                .map(|m| media_ledger::content_hash(&m.bytes, m.audio))
+                .collect(),
+            laid_out: LaidOut {
+                ledger: laid_out.ledger[..media_end].to_vec(),
+                runs: laid_out
+                    .runs
+                    .iter()
+                    .map(|run| MediaRun {
+                        chunk: NO_CHUNK,
+                        ..*run
+                    })
+                    .collect(),
+                made_from: laid_out.made_from.clone(),
+            },
+            tail: tail.to_vec(),
+        })
+    }
+
+    /// The text of `prompt_text` behind this layout's media, when the prompt opens with this
+    /// layout's text and media.
+    fn rest_of<'t>(&self, prompt_text: &'t str, media: &[ExtractedMedia]) -> Option<&'t str> {
+        let rest = prompt_text.strip_prefix(self.head.as_str())?;
+        let same_files = media.len() >= self.files.len()
+            && media
+                .iter()
+                .zip(&self.files)
+                .all(|(m, file)| media_ledger::content_hash(&m.bytes, m.audio) == *file);
+        same_files.then_some(rest)
+    }
+
+    /// Where the last picture or recording ends.
+    fn media_end(&self) -> usize {
+        self.laid_out.ledger.len()
+    }
+
+    /// Whether a cache holding `tokens` still has every picture and recording of this layout.
+    fn held_by(&self, tokens: &[LlamaToken], runs: &[MediaRun]) -> bool {
+        media_ledger::agreed_prefix(tokens, runs, &self.laid_out.ledger, &self.laid_out.runs)
+            >= self.media_end()
+    }
+
+    /// The prompt as far as the text after the last marker.
+    fn base(&self) -> LaidOut {
+        let mut base = self.laid_out.clone();
+        base.ledger.extend_from_slice(&self.tail);
+        base
+    }
+}
+
+fn takes_in(mtmd: &MtmdContext, media: &[ExtractedMedia]) -> bool {
+    media.iter().all(|m| {
+        if m.audio {
+            mtmd.support_audio()
+        } else {
+            mtmd.support_vision()
+        }
+    })
+}
+
+/// How a media prompt gets into a cache.
+enum MediaPlan<'a> {
+    /// Laid out one entry a position; `encoded` holds what the cache lacks.
+    Laid {
+        laid_out: LaidOut,
+        encoded: Option<(&'a MtmdContext, MtmdInputChunks)>,
+    },
+    /// mtmd's chunks do not lay out one entry a position.
+    Unmodelled {
+        mtmd: &'a MtmdContext,
+        chunks: MtmdInputChunks,
+    },
+    /// No loaded encoder takes in `media[from..]`, which is what the cache lacks.
+    NeedsEncoder { from: usize },
+}
+
+/// What `kv` or `suspended` already holds of a media prompt, laid out from its
+/// [`MediaLayout`], with mtmd taking in only what follows. `None` when neither holds the
+/// prompt's earlier media at a point it can resume behind.
+fn plan_behind_known<'a>(
+    kv: Option<&SessionKv>,
+    suspended: Option<&SuspendedKv>,
+    model: &LlamaModel,
+    mtmd: Option<&'a MtmdContext>,
+    prompt_text: &str,
+    media: &[ExtractedMedia],
+) -> Result<Option<MediaPlan<'a>>, ProviderError> {
+    let caches = [
+        kv.map(|kv| (kv.layout.as_ref(), &kv.tokens, &kv.media, Some(kv))),
+        suspended.map(|held| (held.layout.as_ref(), &held.tokens, &held.media, None)),
+    ];
+    let Some((layout, rest, cached, cached_runs, live)) =
+        caches
+            .into_iter()
+            .flatten()
+            .find_map(|(layout, tokens, runs, live)| {
+                let layout = layout.filter(|layout| layout.held_by(tokens, runs))?;
+                let rest = layout.rest_of(prompt_text, media)?;
+                Some((layout, rest, tokens, runs, live))
+            })
+    else {
+        return Ok(None);
+    };
+    let fresh = &media[layout.files.len()..];
+    let encoded = if fresh.is_empty() {
+        None
+    } else {
+        let Some(mtmd) = mtmd.filter(|mtmd| takes_in(mtmd, fresh)) else {
+            return Ok(Some(MediaPlan::NeedsEncoder {
+                from: layout.files.len(),
+            }));
+        };
+        Some(tokenize_with_media(Some(mtmd), rest, fresh)?)
+    };
+    let laid_out = match &encoded {
+        Some((_, chunks)) => lay_out(chunks, layout.base()),
+        None => {
+            let mut laid_out = layout.base();
+            laid_out.ledger.extend(
+                model
+                    .str_to_token(rest, AddBos::Never)
+                    .map_err(|e| ProviderError::ExecutionError(e.to_string()))?,
+            );
+            Some(laid_out)
+        }
+    };
+    let Some(laid_out) = laid_out else {
+        return Ok(None);
+    };
+    let agreed = media_ledger::agreed_prefix(cached, cached_runs, &laid_out.ledger, &laid_out.runs);
+    let resume = agreed.min(laid_out.ledger.len().saturating_sub(1));
+    // A suspended cache comes back whole, so it resumes wherever it agrees.
+    let behind_the_media =
+        live.is_none_or(|kv| kv.resumes_from(&laid_out.ledger, resume, layout.media_end()));
+    Ok(behind_the_media.then_some(MediaPlan::Laid { laid_out, encoded }))
+}
+
+fn plan_media<'a>(
+    kv: Option<&SessionKv>,
+    suspended: Option<&SuspendedKv>,
+    model: &LlamaModel,
+    mtmd: Option<&'a MtmdContext>,
+    prompt_text: &str,
+    media: &[ExtractedMedia],
+) -> Result<MediaPlan<'a>, ProviderError> {
+    if let Some(plan) = plan_behind_known(kv, suspended, model, mtmd, prompt_text, media)? {
+        return Ok(plan);
+    }
+    let Some(mtmd) = mtmd.filter(|mtmd| takes_in(mtmd, media)) else {
+        return Ok(MediaPlan::NeedsEncoder { from: 0 });
+    };
+    let (_, chunks) = tokenize_with_media(Some(mtmd), prompt_text, media)?;
+    Ok(match lay_out(&chunks, LaidOut::default()) {
+        Some(laid_out) => MediaPlan::Laid {
+            laid_out,
+            encoded: Some((mtmd, chunks)),
+        },
+        None => MediaPlan::Unmodelled { mtmd, chunks },
+    })
 }
 
 fn runs_of<'a>(media: Option<&'a PromptMedia<'_>>) -> &'a [MediaRun] {
     media.map_or(&[], |media| &media.runs)
 }
 
-/// The prompt one entry a position (`media_ledger`), with its pictures and recordings. `None`
-/// for chunks that cannot be laid out so: positions in two dimensions, or media mtmd gave no id.
-fn lay_out(chunks: &MtmdInputChunks) -> Option<(Vec<LlamaToken>, Vec<MediaRun>)> {
-    let mut ledger = Vec::with_capacity(chunks.total_tokens());
-    let mut runs: Vec<MediaRun> = Vec::new();
-    // A recording past 30 s is several chunks under one id.
-    let mut seen: Vec<u64> = Vec::new();
+/// `chunks` laid out behind `behind`. `None` for chunks that cannot be laid out one entry a
+/// position: positions in two dimensions, or media mtmd gave no id.
+fn lay_out(chunks: &MtmdInputChunks, behind: LaidOut) -> Option<LaidOut> {
+    let LaidOut {
+        mut ledger,
+        mut runs,
+        // A recording past 30 s is several chunks under one id.
+        made_from: mut seen,
+    } = behind;
+    ledger.reserve(chunks.total_tokens());
     for index in 0..chunks.len() {
         let chunk = chunks.get(index)?;
         let n_pos = usize::try_from(chunk.n_positions()).ok()?;
@@ -2198,7 +2482,11 @@ fn lay_out(chunks: &MtmdInputChunks) -> Option<(Vec<LlamaToken>, Vec<MediaRun>)>
             }
         }
     }
-    Some((ledger, runs))
+    Some(LaidOut {
+        ledger,
+        runs,
+        made_from: seen,
+    })
 }
 
 /// mtmd's own sniffing decides picture or sound; a sound it reads as a picture is refused,
@@ -2512,42 +2800,66 @@ pub(super) fn prepare_generation(
     // (tokenize, validate, plan+decode); absent for a prompt that could not be laid out.
     let mut text_breakdown: Option<(u128, u128, u128)> = None;
 
-    let chunks = if ctx.media.is_empty() {
+    // One entry a position, so a prompt with pictures or recordings is planned, reused,
+    // checkpointed and snapshotted exactly as a text one.
+    let plan = if ctx.media.is_empty() {
         None
     } else {
-        Some(tokenize_with_media(
+        Some(plan_media(
+            ctx.session.as_ref(),
+            ctx.suspended.as_ref(),
+            ctx.model,
             ctx.mtmd_ctx,
             &template_result.prompt,
             ctx.media,
         )?)
     };
-    // One entry a position, so a prompt with pictures or recordings is planned, reused,
-    // checkpointed and snapshotted exactly as a text one.
-    let laid_out = match chunks.as_ref() {
-        None => Some((
-            ctx.model
-                .str_to_token(&template_result.prompt, AddBos::Never)
-                .map_err(|e| ProviderError::ExecutionError(e.to_string()))?,
-            None,
-        )),
-        Some((mtmd, chunks)) => lay_out(chunks).map(|(ledger, runs)| {
-            let media = PromptMedia {
-                chunks,
-                mtmd,
-                runs,
-                cost: std::cell::Cell::default(),
-            };
-            (ledger, Some(media))
-        }),
-    };
 
-    let (prompt_token_count, mut prefilled, prompt_tokens) = match (laid_out, chunks.as_ref()) {
-        (Some((tokens, media)), _) => {
+    let (prompt_token_count, mut prefilled, prompt_tokens) = match plan {
+        Some(MediaPlan::NeedsEncoder { from }) => {
+            ctx.needs_encoder_from = Some(from);
+            return Err(ProviderError::ExecutionError(
+                "No encoder is loaded for this message's recording or picture.".to_string(),
+            ));
+        }
+        Some(MediaPlan::Unmodelled { mtmd, chunks }) => {
+            let (ptc, prefilled) = prefill_unmodelled(
+                ctx.session,
+                ctx.model,
+                mtmd,
+                &chunks,
+                ctx.backend,
+                ctx.context_limit,
+                ctx.settings,
+                ctx.memory_fit,
+            )?;
+            (ptc, prefilled, Vec::new())
+        }
+        laid => {
+            let (laid_out, encoded) = match laid {
+                Some(MediaPlan::Laid { laid_out, encoded }) => (laid_out, encoded),
+                _ => (
+                    LaidOut {
+                        ledger: ctx
+                            .model
+                            .str_to_token(&template_result.prompt, AddBos::Never)
+                            .map_err(|e| ProviderError::ExecutionError(e.to_string()))?,
+                        ..LaidOut::default()
+                    },
+                    None,
+                ),
+            };
+            let media = (!ctx.media.is_empty()).then(|| PromptMedia {
+                encoded: encoded.as_ref().map(|(mtmd, chunks)| (*mtmd, chunks)),
+                runs: laid_out.runs.clone(),
+                cost: std::cell::Cell::default(),
+                unmet: std::cell::Cell::default(),
+            });
+            let tokens = &laid_out.ledger;
             let t_tok_done = std::time::Instant::now();
-            // A non-causal encoder's output is decoded in one micro-batch.
             let widened = media
                 .as_ref()
-                .filter(|m| m.mtmd.decode_use_non_causal())
+                .filter(|m| m.non_causal())
                 .filter(|_| ctx.settings.n_ubatch.is_some_and(|u| u < 512))
                 .map(|_| ModelSettings {
                     n_ubatch: Some(512),
@@ -2556,7 +2868,9 @@ pub(super) fn prepare_generation(
             let settings = widened.as_ref().unwrap_or(ctx.settings);
             let (ptc, ectx) = validate_and_compute_context(
                 ctx.model,
-                ctx.mtmd_ctx.is_some(),
+                // By the prompt, not by what is loaded: the window must not move between a
+                // turn that loads the encoder and one the cache serves without it.
+                media.is_some(),
                 ctx.backend,
                 tokens.len(),
                 ctx.context_limit,
@@ -2565,7 +2879,7 @@ pub(super) fn prepare_generation(
                 ctx.memory_fit,
             )?;
             let t_validate_done = std::time::Instant::now();
-            let mut prefilled = prefill_prompt(
+            let filled = prefill_prompt(
                 ctx.session,
                 ctx.draft,
                 ctx.snapshot,
@@ -2573,7 +2887,7 @@ pub(super) fn prepare_generation(
                 ctx.model,
                 ctx.backend,
                 settings,
-                &tokens,
+                tokens,
                 ectx,
                 ctx.one_shot,
                 ctx.helper,
@@ -2583,7 +2897,24 @@ pub(super) fn prepare_generation(
                 ctx.prefill_retention_secs,
                 ctx.rebuild_prefill,
                 media.as_ref(),
-            )?;
+            );
+            let mut prefilled = match filled {
+                Ok(prefilled) => prefilled,
+                Err(e) => {
+                    if media.as_ref().is_some_and(|m| m.unmet.get()) {
+                        // The cache did not hold what its layout said; the next call lays the
+                        // prompt out afresh.
+                        if let Some(kv) = ctx.session.as_mut() {
+                            kv.layout = None;
+                        }
+                        if let Some(held) = ctx.suspended.as_mut() {
+                            held.layout = None;
+                        }
+                        ctx.needs_encoder_from = Some(0);
+                    }
+                    return Err(e);
+                }
+            };
             text_breakdown = Some((
                 t_tok_done.duration_since(t_log_done).as_millis(),
                 t_validate_done.duration_since(t_tok_done).as_millis(),
@@ -2606,11 +2937,27 @@ pub(super) fn prepare_generation(
                     media_ms = cost.eval_ms,
                     encode_ms = cost.encode_ms,
                     eval_ms = t_validate_done.elapsed().as_millis() as u64,
+                    encoder = media.encoded.is_some(),
                     drafter,
                     "a prompt with pictures or recordings is in the cache"
                 );
+                if prefilled.transient.is_none() {
+                    if let Some(kv) = ctx
+                        .session
+                        .as_mut()
+                        .filter(|kv| kv.tokens.len() == tokens.len())
+                    {
+                        kv.layout = MediaLayout::learn(
+                            ctx.model,
+                            &template_result.prompt,
+                            ctx.media,
+                            &laid_out,
+                        );
+                    }
+                }
             }
-            let mut tokens = tokens;
+            drop(media);
+            let mut tokens = laid_out.ledger;
             let mut ptc = ptc;
             if let Some(kv) = prefilled.transient.as_ref().or(ctx.session.as_ref()) {
                 if kv.tokens.len() < tokens.len() {
@@ -2620,20 +2967,6 @@ pub(super) fn prepare_generation(
             }
             (ptc, prefilled, tokens)
         }
-        (None, Some((mtmd, chunks))) => {
-            let (ptc, prefilled) = prefill_unmodelled(
-                ctx.session,
-                ctx.model,
-                mtmd,
-                chunks,
-                ctx.backend,
-                ctx.context_limit,
-                ctx.settings,
-                ctx.memory_fit,
-            )?;
-            (ptc, prefilled, Vec::new())
-        }
-        (None, None) => unreachable!("a prompt without media is always laid out"),
     };
 
     // Wait for the prefill to actually finish before timing it. The GPU
@@ -2872,19 +3205,23 @@ pub(super) fn prefill_media_for_test(
     session: &mut Option<SessionKv>,
     model: &Arc<LlamaModel>,
     draft: Option<&Arc<LlamaModel>>,
-    mtmd_ctx: &MtmdContext,
+    mtmd_ctx: Option<&MtmdContext>,
     backend: &LlamaCppBackend,
     prompt_text: &str,
     media: &[ExtractedMedia],
     settings: &ModelSettings,
 ) -> Result<(Vec<LlamaToken>, usize, usize), ProviderError> {
-    let (mtmd, chunks) = tokenize_with_media(Some(mtmd_ctx), prompt_text, media)?;
-    let (ledger, runs) = lay_out(&chunks).expect("a prompt laid out one entry a position");
+    let plan = plan_media(session.as_ref(), None, model, mtmd_ctx, prompt_text, media)?;
+    let MediaPlan::Laid { laid_out, encoded } = plan else {
+        return Err(ProviderError::ExecutionError(
+            "the prompt needs an encoder that was not supplied".to_string(),
+        ));
+    };
     let prompt_media = PromptMedia {
-        chunks: &chunks,
-        mtmd,
-        runs,
+        encoded: encoded.as_ref().map(|(mtmd, chunks)| (*mtmd, chunks)),
+        runs: laid_out.runs.clone(),
         cost: std::cell::Cell::default(),
+        unmet: std::cell::Cell::default(),
     };
     let prefilled = prefill_prompt(
         session,
@@ -2894,7 +3231,7 @@ pub(super) fn prefill_media_for_test(
         model,
         backend,
         settings,
-        &ledger,
+        &laid_out.ledger,
         settings.context_size.unwrap_or(4096) as usize,
         false,
         false,
@@ -2909,11 +3246,12 @@ pub(super) fn prefill_media_for_test(
         prefilled.transient.is_none(),
         "the media cache was not retained"
     );
-    Ok((
-        ledger,
-        prefilled.reused_prefix_tokens,
-        prompt_media.cost.get().tokens,
-    ))
+    if let Some(kv) = session.as_mut() {
+        kv.layout = MediaLayout::learn(model, prompt_text, media, &laid_out);
+    }
+    let evaluated = prompt_media.cost.get().tokens;
+    drop(prompt_media);
+    Ok((laid_out.ledger, prefilled.reused_prefix_tokens, evaluated))
 }
 
 #[cfg(test)]

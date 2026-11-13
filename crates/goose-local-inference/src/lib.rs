@@ -391,6 +391,18 @@ pub fn hearing_room(mmproj: &std::path::Path) -> HearingRoom {
     llamacpp::hearing_room(mmproj)
 }
 
+/// The hash the chat cache knows a picture or a recording by.
+pub fn media_content_hash(bytes: &[u8], audio: bool) -> u64 {
+    llamacpp::media_content_hash(bytes, audio)
+}
+
+/// Whether a prompt whose only media are these (by [`media_content_hash`]) is likely taken in
+/// with no encoder loaded, the chat cache already holding what the encoder made of each. As old
+/// as the last call; the call itself decides, and loads an encoder if it must.
+pub fn cache_holds_media(files: &[u64]) -> bool {
+    llamacpp::cache_holds_media(files)
+}
+
 pub fn available_inference_memory_bytes(runtime: &InferenceRuntime) -> u64 {
     runtime.default_backend().available_memory_bytes()
 }
