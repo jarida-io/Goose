@@ -3,6 +3,7 @@ mod encoder_towers;
 mod inference_emulated_tools;
 mod inference_engine;
 mod inference_native_tools;
+mod media_ledger;
 mod memory;
 pub(super) mod mtp;
 mod prompt_snapshot;

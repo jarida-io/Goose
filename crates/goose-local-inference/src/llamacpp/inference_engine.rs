@@ -8,7 +8,7 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, ChatTemplateResult, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::mtmd::{
-    MtmdBitmap, MtmdContext, MtmdInputChunk, MtmdInputChunkType, MtmdInputChunks, MtmdInputText,
+    MtmdBitmap, MtmdContext, MtmdInputChunkType, MtmdInputChunks, MtmdInputText,
 };
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
@@ -18,6 +18,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use super::super::StreamSender;
+use super::media_ledger::{self, MediaRun, Span};
 use super::memory::{MemInfo, MemoryFit, COMPUTE_RESERVE_BYTES};
 use super::LlamaCppBackend;
 use crate::load_error::LoadStage;
@@ -182,168 +183,14 @@ pub(super) struct LoadedChatTemplates {
     pub force_default: bool,
 }
 
-/// One span of a retained cache's media-bearing head, in decode order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum HeadChunk {
-    /// Text tokens, one KV position each.
-    Text(Vec<LlamaToken>),
-    /// Media embeddings. Opaque here: what they contain is pinned by the source
-    /// images `MediaHead` holds alongside, not by anything in this variant.
-    Media { n_tokens: usize, n_pos: usize },
-}
-
-impl HeadChunk {
-    fn n_pos(&self) -> usize {
-        match self {
-            Self::Text(tokens) => tokens.len(),
-            Self::Media { n_pos, .. } => *n_pos,
-        }
-    }
-}
-
-/// Why an incoming prompt could not resume from a retained media head.
-///
-/// Carried rather than collapsed to a bool so the log says which input moved.
-/// The causes have very different meanings for whoever is reading it: an image
-/// change is the user sending a different picture, or the host replaying a
-/// different number of them (both expected), whereas a chunk-shape change with
-/// identical images is the *prompt around* the pictures having been rewritten.
-///
-/// The checks in [`MediaHead::mismatch`] run narrowest-cause first, so the
-/// reported variant is the most specific one that explains the miss. A change
-/// usually trips several at once — an extra image is also an extra chunk and
-/// more positions. Order decides only which reason is logged: the head matches
-/// if and only if every check agrees.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HeadMismatch {
-    /// A different number of images. This is the growing-image-list
-    /// conversation, and the reason that shape gets no reuse.
-    ImageCount,
-    /// The same number of images, but different pixels in at least one.
-    ImageBytes,
-    /// Same images, different chunk list: the text around the pictures was
-    /// rewritten. Two routine causes, both of which also move every media
-    /// position — the chunk list is simply the narrower way to say it. The
-    /// first is `prepare_generation` flipping between the full and compact tool
-    /// schemas, which rewrites the whole rendered prompt including everything
-    /// ahead of the first image. The second is any growth in the transcript
-    /// ahead of the images. Either way no part of the head survives.
-    ChunkShape,
-    /// The head would occupy a different number of KV positions despite an
-    /// identical chunk list. Not reachable from mtmd, whose position count is
-    /// the sum over exactly those chunks on both sides. It is the tripwire for
-    /// a `MediaHead` whose recorded `n_pos` disagrees with its own chunks,
-    /// which would resume the decode at the wrong absolute position.
-    Positions,
-}
-
-/// The leading part of a retained KV cache that carries media embeddings.
-///
-/// # Why the match is all-or-nothing
-///
-/// Media KV contents are not tokens, so they cannot be compared position by
-/// position the way `SessionKv::tokens` is. The head is therefore matched
-/// atomically: a prompt may resume from it only when it reproduces the head
-/// exactly — the same chunk shape in the same order, built from the same image
-/// bytes in the same order. That suffices because mtmd's tokenization and
-/// preprocessing are deterministic functions of (prompt text, bitmaps), so
-/// equal inputs place equal pixel batches at equal positions.
-///
-/// There is deliberately no partial head match. The head ends at the last media
-/// chunk, so anything that changes it changes a chunk at or before an image, and
-/// every image after that point moves to a different KV position. Matching a
-/// prefix of the head would resume behind embeddings that no longer describe
-/// what the prompt says they do. Degrading to no reuse is the correct outcome;
-/// the cost is a rebuild, and the alternative is a wrong answer.
-///
-/// # What this actually buys, honestly
-///
-/// Only conversations whose image list is *already stable* turn by turn. The
-/// four-turn production trace that motivated caching here (1 then 2 then 3
-/// encodes per turn, prefill climbing 28s to 37s) is not one of them: its image
-/// list grows every turn, so [`MediaHead::mismatch`] returns
-/// [`HeadMismatch::ImageCount`] and reuse never fires on it. That trace is
-/// addressed upstream of this engine, by the host capping how many historical
-/// images it replays — not by this cache.
-///
-/// The shape this does serve is the one left over once that cap holds the list
-/// steady: "here is a photo" followed by questions about that same photo. Turns
-/// 2..N present a byte-identical image list, so they skip the vision encode and
-/// the prefill of everything ahead of the tail.
-///
-/// Images promoted out of tool results (a camera look) never form a stable head
-/// at all, and not only when the camera is looked at again. GIAP's provider shim
-/// re-derives them from the newest frames every turn and appends them in a fresh
-/// trailing carrier message, after the whole conversation. Two consequences:
-/// the last image sits at the very end of the prompt, so the head is
-/// effectively the entire prompt; and the transcript ahead of it grows each
-/// turn, so the chunk list moves each turn. Even a session that looks once and
-/// then asks follow-ups misses on [`HeadMismatch::ChunkShape`]. Only images
-/// carried in the conversation itself, at a position the transcript no longer
-/// changes, are reused here.
-pub(super) struct MediaHead {
-    chunks: Vec<HeadChunk>,
-    /// Positions the head occupies: `[0, n_pos)`.
-    n_pos: usize,
-    /// Source bytes of every picture and sound in the request that built this
-    /// head, in order. Compared byte for byte rather than hashed — a hash collision here
-    /// would silently answer about a different picture, and images are small
-    /// enough next to a resident model that the copy is not worth the risk.
-    images: Vec<Vec<u8>>,
-}
-
-impl MediaHead {
-    /// The tokens at positions `[0, n)`, ahead of the head's first media chunk.
-    fn leading_text(&self) -> Option<&[LlamaToken]> {
-        match self.chunks.first() {
-            Some(HeadChunk::Text(tokens)) => Some(tokens),
-            _ => None,
-        }
-    }
-
-    /// `None` when `(chunks, images)` reproduce this head exactly.
-    ///
-    /// Ordered narrowest cause first — see [`HeadMismatch`]. The byte compare
-    /// runs ahead of the chunk compare so `ChunkShape` keeps the meaning its
-    /// doc gives it ("same images, rewritten text"); that costs one memcmp of
-    /// a few hundred KB on the rewritten-prompt path, against a rebuild
-    /// measured in seconds.
-    fn mismatch(
-        &self,
-        n_pos: usize,
-        chunks: &[HeadChunk],
-        images: &[ExtractedMedia],
-    ) -> Option<HeadMismatch> {
-        if self.images.len() != images.len() {
-            return Some(HeadMismatch::ImageCount);
-        }
-        if !self
-            .images
-            .iter()
-            .zip(images)
-            .all(|(cached, incoming)| cached.as_slice() == incoming.bytes.as_slice())
-        {
-            return Some(HeadMismatch::ImageBytes);
-        }
-        if self.chunks != chunks {
-            return Some(HeadMismatch::ChunkShape);
-        }
-        if self.n_pos != n_pos {
-            return Some(HeadMismatch::Positions);
-        }
-        None
-    }
-}
-
 /// A llama context retained across generations, paired with a description of
 /// what it holds in the KV cache of sequence 0.
 ///
-/// Invariant: positions `[0, media_pos())` hold `head`, and position
-/// `media_pos() + i` holds `tokens[i]` for every `i < tokens.len()`. With no
-/// head — the text-only case — that reduces to `tokens` being a plain prefix of
-/// the cache. The cache may hold further positions beyond the recorded ones;
-/// every reuse path removes everything from its resume position onwards, so
-/// unrecorded trailing positions can never be attended to.
+/// Invariant: position `i` holds `tokens[i]` for every `i < tokens.len()`, a
+/// picture's or recording's positions under their stand-in ids (`media_ledger`).
+/// The cache may hold further positions beyond the recorded ones; every reuse
+/// path removes everything from its resume position onwards, so unrecorded
+/// trailing positions can never be attended to.
 /// Either a bare context, or a speculative wrapper that has TAKEN it.
 ///
 /// `MtpSpeculative::new` consumes both the target and draft contexts by value, so
@@ -386,8 +233,10 @@ pub(super) struct SessionKv {
     /// Declared before `_model`: fields drop in declaration order, so the
     /// context is destroyed before the model allocation it points into.
     ctx: SessionCtx,
-    head: Option<MediaHead>,
     tokens: Vec<LlamaToken>,
+    /// The pictures and recordings among `tokens`, as the prompt that filled the cache laid
+    /// them out.
+    media: Vec<MediaRun>,
     /// The `n_ctx` this context was *requested* with. Compared against the
     /// effective context of an incoming request; llama.cpp may round the
     /// realised `n_ctx` up, so the requested value is the stable identity.
@@ -538,8 +387,8 @@ impl SessionKv {
         let n_swa = sliding_window(&model);
         Ok(Self {
             ctx,
-            head: None,
             tokens: Vec::new(),
+            media: Vec::new(),
             n_ctx,
             one_shot: false,
             last_used: std::time::Instant::now(),
@@ -564,20 +413,9 @@ impl SessionKv {
         self.last_used = std::time::Instant::now();
     }
 
-    /// First position `tokens` describes.
-    fn media_pos(&self) -> usize {
-        self.head.as_ref().map_or(0, |head| head.n_pos)
-    }
-
-    /// Every position the cache is known to hold, reusable or not.
-    fn occupied(&self) -> usize {
-        self.media_pos() + self.tokens.len()
-    }
-
     /// Saves the window layers' cells while the cache holds exactly `tokens`.
-    /// Text-only caches: behind a media head, positions are not token indices.
     fn checkpoint_window(&mut self, tokens: &[LlamaToken], at_prompt_end: bool) {
-        if self.n_swa == 0 || self.head.is_some() {
+        if self.n_swa == 0 {
             return;
         }
         let pos = tokens.len();
@@ -626,9 +464,6 @@ impl SessionKv {
         let pos_min = self.ctx.ctx().kv_cache_seq_pos_min(0);
         if pos_min >= 0 && pos_min as usize <= resume_pos.saturating_sub(self.n_swa) {
             return Some(resume_pos);
-        }
-        if self.head.is_some() {
-            return None;
         }
         let found = self.checkpoints.iter().rposition(|c| {
             c.pos <= resume_pos
@@ -689,12 +524,8 @@ pub(super) enum PrefillPlan {
 /// What a retained KV cache offers an incoming prompt.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RetainedPrefix<'a> {
-    /// Positions `[0, media_pos)` hold media the prompt has *already been
-    /// shown* to reproduce. Zero for a text-only cache, and zero whenever the
-    /// prompt cannot reproduce the head — in which case `tokens` is empty too,
-    /// so nothing behind a head is ever resumed at the wrong position.
-    media_pos: usize,
-    /// Tokens held at positions `[media_pos, media_pos + tokens.len())`.
+    /// What the cache holds from position 0, as far as the incoming prompt may be served from
+    /// it: short of a picture or recording the two do not hold alike.
     tokens: &'a [LlamaToken],
     /// Every position the cache occupies, reusable or not. Only its size
     /// matters: it decides whether the cache is worth protecting.
@@ -709,34 +540,12 @@ pub(super) struct RetainedPrefix<'a> {
 }
 
 impl<'a> RetainedPrefix<'a> {
-    /// A cache the incoming prompt can resume from: either it holds no media,
-    /// or the caller has already verified the prompt reproduces the head.
-    fn resumable(kv: &'a SessionKv) -> Self {
+    /// `kv` as it serves `prompt`, whose pictures and recordings are `runs`.
+    fn serving(kv: &'a SessionKv, prompt: &[LlamaToken], runs: &[MediaRun]) -> Self {
+        let agreed = media_ledger::agreed_prefix(&kv.tokens, &kv.media, prompt, runs);
         Self {
-            media_pos: kv.media_pos(),
-            tokens: &kv.tokens,
-            occupied: kv.occupied(),
-            n_ctx: kv.n_ctx,
-            worth_protecting: !kv.one_shot,
-            protect_from_side_call: false,
-        }
-    }
-
-    /// A cache the incoming prompt cannot resume from. Its size still decides
-    /// whether it deserves protection from a small unrelated prompt.
-    ///
-    /// `occupied` counts KV *positions*, while `is_sacrificial_prompt` weighs it
-    /// against a prompt measured in tokens. The two agree for every model this
-    /// engine runs today (Gemma included: one position per image token). Under
-    /// M-RoPE, where an image occupies fewer positions than it costs tokens, the
-    /// comparison undercounts the cache and the protection is weaker than
-    /// intended — a small prompt evicts a cache it should have run beside. That
-    /// direction is a lost optimisation, never a wrong answer.
-    fn opaque(kv: &SessionKv) -> Self {
-        Self {
-            media_pos: 0,
-            tokens: &[],
-            occupied: kv.occupied(),
+            tokens: &kv.tokens[..agreed],
+            occupied: kv.tokens.len(),
             n_ctx: kv.n_ctx,
             worth_protecting: !kv.one_shot,
             protect_from_side_call: false,
@@ -776,6 +585,7 @@ fn chat_cache_protected(prompt_is_chat: bool, idle: std::time::Duration) -> bool
 pub(super) struct SuspendedKv {
     path: std::path::PathBuf,
     tokens: Vec<LlamaToken>,
+    media: Vec<MediaRun>,
     n_ctx: u32,
     checkpoints: Vec<WindowCheckpoint>,
 }
@@ -814,8 +624,8 @@ fn suspend_dir() -> std::io::Result<std::path::PathBuf> {
 /// in place, and the helper then evicts it as it would with no turn waiting.
 fn suspend_for_helper(session: &mut Option<SessionKv>) -> Option<SuspendedKv> {
     let kv = session.as_ref()?;
-    // One-shot work and a picture's head are never resumed from, so they are not worth a file.
-    if kv.one_shot || kv.head.is_some() || kv.tokens.len() < REUSE_MIN_TOKENS {
+    // One-shot work is never resumed from, so it is not worth a file.
+    if kv.one_shot || kv.tokens.len() < REUSE_MIN_TOKENS {
         return None;
     }
     let started = std::time::Instant::now();
@@ -842,6 +652,7 @@ fn suspend_for_helper(session: &mut Option<SessionKv>) -> Option<SuspendedKv> {
     };
     let SessionKv {
         tokens,
+        media,
         n_ctx,
         checkpoints,
         ..
@@ -857,6 +668,7 @@ fn suspend_for_helper(session: &mut Option<SessionKv>) -> Option<SuspendedKv> {
     Some(SuspendedKv {
         path,
         tokens,
+        media,
         n_ctx,
         checkpoints,
     })
@@ -914,6 +726,7 @@ fn resume_suspended(
     {
         Ok((tokens, bytes)) if tokens == held.tokens => {
             kv.tokens = std::mem::take(&mut held.tokens);
+            kv.media = std::mem::take(&mut held.media);
             kv.checkpoints = std::mem::take(&mut held.checkpoints);
             tracing::info!(
                 target: "giap::kv",
@@ -940,12 +753,7 @@ fn retained_cache_protected(helper: bool, prompt_is_chat: bool, idle: std::time:
     !helper && chat_cache_protected(prompt_is_chat, idle)
 }
 
-/// Decide how to prefill a prompt whose plain-token part is `prompt`.
-///
-/// For a text-only request `prompt` is the whole prompt. For a request that
-/// reproduces a retained media head it is only the tail that follows the head,
-/// and the returned position is absolute — the head's positions count towards
-/// the reuse threshold because they are the expensive ones.
+/// Decide how to prefill `prompt`, the whole prompt one entry a position.
 pub(super) fn prefill_plan(
     retained: Option<RetainedPrefix<'_>>,
     prompt: &[LlamaToken],
@@ -960,9 +768,8 @@ pub(super) fn prefill_plan(
     // llama.cpp needs a non-empty batch to produce logits, so at least the
     // final prompt token must always be decoded.
     let reusable = common_prefix_len(cached.tokens, prompt).min(prompt.len().saturating_sub(1));
-    let resume = cached.media_pos + reusable;
-    if resume >= REUSE_MIN_TOKENS && reusable < prompt.len() {
-        return PrefillPlan::ReusePrefix(resume);
+    if reusable >= REUSE_MIN_TOKENS && reusable < prompt.len() {
+        return PrefillPlan::ReusePrefix(reusable);
     }
     // Only a cache a chat filled is worth protecting. One-shot work (side calls, chores)
     // must never destroy a chat cache that is worth protecting; it runs as a sacrificial
@@ -1507,28 +1314,57 @@ fn decode_tokens(
     Ok(())
 }
 
-/// Decode `prompt[from..]` at positions `from..` into a text-only cache,
-/// checkpointing the window layers before each batch that ends inside the last
-/// [`WINDOW_CHECKPOINT_SPAN`] tokens, so a later rewind into this stretch
-/// resumes near where it lands. Behind a media head, or for a model without a
-/// sliding window, this is [`decode_tokens`].
+/// Decode `prompt[from..to]` at those positions: text as tokens, and each picture or recording
+/// whole, through mtmd.
+fn decode_span(
+    kv: &mut SessionKv,
+    prompt: &[LlamaToken],
+    from: usize,
+    to: usize,
+    media: Option<&PromptMedia<'_>>,
+) -> Result<(), ProviderError> {
+    let Some(media) = media else {
+        return decode_tokens(kv.ctx.ctx_mut(), &prompt[from..to], from);
+    };
+    let spans = media_ledger::spans(from, to, &media.runs).ok_or_else(|| {
+        ProviderError::ExecutionError(
+            "Multimodal eval failed: a picture or recording would be decoded from its middle"
+                .to_string(),
+        )
+    })?;
+    for span in spans {
+        match span {
+            Span::Text { from, to } => {
+                decode_tokens(kv.ctx.ctx_mut(), &prompt[from..to], from)?;
+            }
+            Span::Media { run } => media.eval(kv, &media.runs[run])?,
+        }
+    }
+    Ok(())
+}
+
+/// Decode `prompt[from..]` at positions `from..`, checkpointing the window layers before each
+/// batch that ends inside the last [`WINDOW_CHECKPOINT_SPAN`] tokens, so a later rewind into
+/// this stretch resumes near where it lands. No batch ends inside a picture or recording. For a
+/// model without a sliding window this is [`decode_span`].
 fn decode_checkpointed(
     kv: &mut SessionKv,
     prompt: &[LlamaToken],
     from: usize,
+    media: Option<&PromptMedia<'_>>,
 ) -> Result<(), ProviderError> {
-    if kv.n_swa == 0 || kv.head.is_some() {
-        return decode_tokens(kv.ctx.ctx_mut(), &prompt[from..], from);
+    if kv.n_swa == 0 {
+        return decode_span(kv, prompt, from, prompt.len(), media);
     }
     let n_batch = (kv.ctx.ctx().n_batch() as usize).max(1);
     let span_start = prompt.len().saturating_sub(WINDOW_CHECKPOINT_SPAN);
     let mut pos = from;
     while pos < prompt.len() {
-        let end = (pos + n_batch).min(prompt.len());
+        let end = media_ledger::batch_end(pos, (pos + n_batch).min(prompt.len()), runs_of(media));
         if pos > from && end > span_start {
             kv.checkpoint_window(&prompt[..pos], false);
         }
-        decode_tokens(kv.ctx.ctx_mut(), &prompt[pos..end], pos)?;
+        decode_span(kv, prompt, pos, end, media)?;
         pos = end;
     }
     Ok(())
@@ -1542,45 +1378,21 @@ enum PrefixReuseError {
     Poisoned(ProviderError),
 }
 
-/// How many of `prompt`'s tokens survive a resume at absolute `resume_pos`, or
-/// `None` when the position is not one this cache can honour.
+/// How many of `prompt`'s tokens survive a resume at `resume_pos`, or `None` when the position
+/// is not one this cache can honour.
 ///
-/// Three bounds, all of them load-bearing:
-///
-/// - `resume_pos >= media_pos`: a resume inside the media head would land in KV
-///   that is not token-addressable at all.
-/// - `kept <= prompt_len`: a range bound on `prompt[kept..]`, and nothing more.
-///   It does NOT establish that the kept tokens are ones the incoming prompt
-///   reproduces — no prefix equality is checked here. That property comes from
-///   the caller: `prefill_plan` derives `resume_pos` from a `common_prefix_len`
-///   of the cached and incoming tokens. A future caller that computes
-///   `resume_pos` some other way must establish prefix equality itself, or it
-///   will resume over KV the prompt no longer describes.
-/// - `kept <= cached_len`: the caller truncates the token ledger to `kept`, and
-///   `Vec::truncate` past the end is a silent no-op. Without this bound a
-///   `resume_pos` past the recorded tail would leave `tokens` claiming
-///   positions the KV cache was just trimmed of — the ledger and the cache
-///   would disagree, which is the precise failure this cache exists to avoid.
-///
-/// `prefill_plan` never produces a position that violates the last two, since
-/// its `reusable` is a common-prefix length of both slices. They are checked
-/// anyway because this function is what makes the truncate safe, and the only
-/// caller that computes `resume_pos` from something other than a fresh
-/// `prefill_plan` would be a future one.
-fn kept_prefix_tokens(
-    resume_pos: usize,
-    media_pos: usize,
-    prompt_len: usize,
-    cached_len: usize,
-) -> Option<usize> {
-    resume_pos
-        .checked_sub(media_pos)
-        .filter(|kept| *kept <= prompt_len && *kept <= cached_len)
+/// - `kept <= prompt_len`: a range bound on `prompt[kept..]`, and nothing more. It does NOT
+///   establish that the kept tokens are ones the incoming prompt reproduces. That comes from the
+///   caller: `prefill_plan` derives `resume_pos` from a common prefix of the cached and incoming
+///   tokens.
+/// - `kept <= cached_len`: the caller truncates the token ledger to `kept`, and `Vec::truncate`
+///   past the end is a silent no-op. Without this bound `tokens` would claim positions the KV
+///   cache was just trimmed of.
+fn kept_prefix_tokens(resume_pos: usize, prompt_len: usize, cached_len: usize) -> Option<usize> {
+    Some(resume_pos).filter(|kept| *kept <= prompt_len && *kept <= cached_len)
 }
 
-/// Trim the KV cache back to absolute position `resume_pos` and decode the rest
-/// of `prompt` there. `prompt` starts at the cache's `media_pos`, so the tokens
-/// it keeps are those before `resume_pos - media_pos`.
+/// Trim the KV cache back to position `resume_pos` and decode the rest of `prompt` there.
 ///
 /// With a windowed cache the decode may start earlier than `resume_pos`, at a
 /// window checkpoint (see [`SessionKv::window_resume`]); returns the position
@@ -1589,6 +1401,7 @@ fn reuse_prefix(
     kv: &mut SessionKv,
     prompt: &[LlamaToken],
     resume_pos: usize,
+    media: Option<&PromptMedia<'_>>,
 ) -> Result<usize, PrefixReuseError> {
     let wanted = resume_pos;
     let Some(resume_pos) = kv.window_resume(prompt, resume_pos) else {
@@ -1613,7 +1426,7 @@ fn reuse_prefix(
             "the cache resumed at an earlier checkpoint than where this prompt differs"
         );
     }
-    let kept = kept_prefix_tokens(resume_pos, kv.media_pos(), prompt.len(), kv.tokens.len())
+    let kept = kept_prefix_tokens(resume_pos, prompt.len(), kv.tokens.len())
         .ok_or(PrefixReuseError::Refused)?;
     let p0 = u32::try_from(resume_pos).map_err(|_| PrefixReuseError::Refused)?;
     match kv.ctx.ctx_mut().clear_kv_cache_seq(Some(0), Some(p0), None) {
@@ -1623,23 +1436,14 @@ fn reuse_prefix(
     kv.checkpoints.retain(|c| c.pos <= resume_pos);
 
     kv.tokens.truncate(kept);
-    if kv.head.is_some() {
-        decode_tokens(kv.ctx.ctx_mut(), &prompt[kept..], resume_pos)
-    } else {
-        decode_checkpointed(kv, prompt, kept)
-    }
-    .map_err(PrefixReuseError::Poisoned)?;
+    kv.media.retain(|run| run.end() <= kept);
+    decode_checkpointed(kv, prompt, kept, media).map_err(PrefixReuseError::Poisoned)?;
     kv.tokens.extend_from_slice(&prompt[kept..]);
     Ok(resume_pos)
 }
 
-/// Trim a retained cache to its first `keep` token positions.
-///
-/// Only valid for a text-only cache: with a media head the positions `tokens`
-/// describes start at `media_pos`, and a caller passing a token count as an
-/// absolute position would cut the head in half.
+/// Trim a retained cache to its first `keep` positions.
 fn trim_to_prefix(kv: &mut SessionKv, keep: usize) -> Result<(), ()> {
-    debug_assert!(kv.head.is_none(), "trim_to_prefix is text-only");
     if keep > kv.tokens.len() {
         return Err(());
     }
@@ -1647,6 +1451,7 @@ fn trim_to_prefix(kv: &mut SessionKv, keep: usize) -> Result<(), ()> {
     match kv.ctx.ctx_mut().clear_kv_cache_seq(Some(0), Some(p0), None) {
         Ok(true) => {
             kv.tokens.truncate(keep);
+            kv.media.retain(|run| run.end() <= keep);
             kv.checkpoints.retain(|c| c.pos <= keep);
             Ok(())
         }
@@ -1668,10 +1473,11 @@ fn restore_preamble(
     prompt: &[LlamaToken],
     n_ctx: u32,
     effective_ctx: usize,
+    media: Option<&PromptMedia<'_>>,
 ) -> Option<PrefilledPrompt> {
     let slot = snapshot.as_mut()?;
     match seed_from_snapshot(
-        session, draft, model, backend, settings, slot, prompt, n_ctx,
+        session, draft, model, backend, settings, slot, prompt, n_ctx, media,
     ) {
         Ok(Some(restored)) => Some(PrefilledPrompt {
             reused_prefix_tokens: restored,
@@ -1706,6 +1512,7 @@ fn seed_from_snapshot(
     slot: &mut super::prompt_snapshot::SnapshotSlot,
     prompt: &[LlamaToken],
     n_ctx: u32,
+    media: Option<&PromptMedia<'_>>,
 ) -> Result<Option<usize>, ProviderError> {
     // Released before the replacement is allocated, so two KV caches are never
     // resident at once -- the same rule `full_prefill` follows, and on an 8 GB
@@ -1720,7 +1527,7 @@ fn seed_from_snapshot(
 
     kv.tokens.extend_from_slice(&prompt[..restored]);
     kv.checkpoint_window(&prompt[..restored], true);
-    match decode_checkpointed(&mut kv, prompt, restored) {
+    match decode_checkpointed(&mut kv, prompt, restored, media) {
         Ok(()) => {
             kv.tokens.extend_from_slice(&prompt[restored..]);
             *session = Some(kv);
@@ -1756,6 +1563,7 @@ fn seed_from_snapshot(
 
 /// Decode the whole prompt from position 0, reusing the retained context when
 /// its window matches and building a new one otherwise.
+#[allow(clippy::too_many_arguments)]
 fn full_prefill(
     session: &mut Option<SessionKv>,
     draft: Option<&Arc<LlamaModel>>,
@@ -1764,6 +1572,7 @@ fn full_prefill(
     settings: &ModelSettings,
     prompt: &[LlamaToken],
     n_ctx: u32,
+    media: Option<&PromptMedia<'_>>,
 ) -> Result<(), ProviderError> {
     if session.as_ref().is_none_or(|kv| kv.n_ctx != n_ctx) {
         // Release the old context before allocating its replacement so both
@@ -1775,11 +1584,11 @@ fn full_prefill(
     let kv = session
         .as_mut()
         .expect("session was just populated or already matched n_ctx");
-    kv.head = None;
     kv.tokens.clear();
+    kv.media.clear();
     kv.checkpoints.clear();
     kv.ctx.ctx_mut().clear_kv_cache();
-    match decode_checkpointed(kv, prompt, 0) {
+    match decode_checkpointed(kv, prompt, 0, media) {
         Ok(()) => {
             kv.tokens.extend_from_slice(prompt);
             Ok(())
@@ -1825,6 +1634,7 @@ fn write_snapshot_if_due(
     class: super::prompt_snapshot::SnapshotClass,
     // A compile's shape and preamble, which a shared bucket's intersection may have shrunk below.
     compiled: Option<(&str, usize)>,
+    media: Option<&PromptMedia<'_>>,
 ) {
     // Writing is not free: measured 21.2 MiB in 314 ms, about 67 MiB/s, which is
     // ~1.6 s for a 6,000-token preamble on an 18 KiB/token model and ~5 s on a
@@ -1839,14 +1649,11 @@ fn write_snapshot_if_due(
     let (Some(slot), Some(kv)) = (snapshot.as_mut(), session.as_mut()) else {
         return;
     };
-    // Text-only: with a media head `tokens` starts at `media_pos`, so a token
-    // count is not an absolute position.
-    if kv.head.is_some() {
-        return;
-    }
     let Some(keep) = compiled
         .map(|(_, keep)| keep)
         .or_else(|| slot.writable_prefix(prompt))
+        // Every prompt of a shape shares its snapshot, so it never holds one prompt's picture.
+        .filter(|&keep| keep <= media_ledger::text_prefix_len(prompt))
     else {
         return;
     };
@@ -1896,7 +1703,7 @@ fn write_snapshot_if_due(
 
     // Put the tail back: the turn still has to generate from the whole prompt.
     kv.checkpoint_window(&prompt[..keep], true);
-    match decode_checkpointed(kv, prompt, keep) {
+    match decode_checkpointed(kv, prompt, keep, media) {
         Ok(()) => kv.tokens.extend_from_slice(&prompt[keep..]),
         Err(e) => {
             tracing::warn!(
@@ -1912,7 +1719,7 @@ fn write_snapshot_if_due(
 }
 
 /// Prepare a KV cache holding `prompt`, with logits available for its last
-/// token.
+/// token. `prompt` is one entry a position; `media` evaluates its pictures and recordings.
 #[allow(clippy::too_many_arguments)]
 fn prefill_prompt(
     session: &mut Option<SessionKv>,
@@ -1931,10 +1738,70 @@ fn prefill_prompt(
     compile_prefill: Option<&str>,
     prefill_retention_secs: Option<u64>,
     rebuild_prefill: bool,
+    media: Option<&PromptMedia<'_>>,
+) -> Result<PrefilledPrompt, ProviderError> {
+    let mut prefilled = fill_cache(
+        session,
+        draft,
+        snapshot,
+        model_path,
+        model,
+        backend,
+        settings,
+        prompt,
+        effective_ctx,
+        one_shot,
+        helper,
+        prime_waiting,
+        suspended,
+        compile_prefill,
+        prefill_retention_secs,
+        rebuild_prefill,
+        media,
+    )?;
+    if let Some(kv) = prefilled.transient.as_mut().or(session.as_mut()) {
+        kv.media = runs_of(media)
+            .iter()
+            .filter(|run| run.end() <= kv.tokens.len())
+            .copied()
+            .collect();
+    }
+    Ok(prefilled)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_cache(
+    session: &mut Option<SessionKv>,
+    draft: Option<&Arc<LlamaModel>>,
+    snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
+    model_path: &std::path::Path,
+    model: &Arc<LlamaModel>,
+    backend: &LlamaCppBackend,
+    settings: &ModelSettings,
+    prompt: &[LlamaToken],
+    effective_ctx: usize,
+    one_shot: bool,
+    helper: bool,
+    prime_waiting: bool,
+    suspended: &mut Option<SuspendedKv>,
+    compile_prefill: Option<&str>,
+    prefill_retention_secs: Option<u64>,
+    rebuild_prefill: bool,
+    media: Option<&PromptMedia<'_>>,
 ) -> Result<PrefilledPrompt, ProviderError> {
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
     })?;
+
+    // A non-causal encoder's output must fit one micro-batch, which a retained cache may lack.
+    if media.is_some_and(|m| {
+        m.mtmd.decode_use_non_causal()
+            && session
+                .as_ref()
+                .is_some_and(|kv| (kv.ctx.ctx().n_ubatch() as usize) < m.widest())
+    }) {
+        *session = None;
+    }
 
     if helper && prime_waiting {
         if suspended.is_none() {
@@ -2009,7 +1876,7 @@ fn prefill_prompt(
     if compile_fast_skip && !prompt.is_empty() {
         let one = &prompt[..1];
         if session.is_some() {
-            if let Ok(kv) = sacrificial_prefill(model, None, backend, settings, one, 64) {
+            if let Ok(kv) = sacrificial_prefill(model, None, backend, settings, one, 64, None) {
                 return Ok(PrefilledPrompt {
                     reused_prefix_tokens: 0,
                     transient: Some(kv),
@@ -2017,7 +1884,7 @@ fn prefill_prompt(
                 });
             }
         }
-        full_prefill(session, draft, model, backend, settings, one, n_ctx)?;
+        full_prefill(session, draft, model, backend, settings, one, n_ctx, None)?;
         return Ok(PrefilledPrompt {
             reused_prefix_tokens: 0,
             transient: None,
@@ -2030,47 +1897,18 @@ fn prefill_prompt(
     } else {
         super::prompt_snapshot::SnapshotClass::Shared
     };
-    fn retained_of(kv: &SessionKv, helper: bool, one_shot: bool) -> RetainedPrefix<'_> {
-        // A text-only prompt carries no media, so it can never reproduce a
-        // retained media head and nothing behind that head is resumable.
-        let mut retained = if kv.head.is_some() {
-            RetainedPrefix::opaque(kv)
-        } else {
-            RetainedPrefix::resumable(kv)
-        };
+    let runs = runs_of(media);
+    let retained_of = |kv| {
+        let mut retained = RetainedPrefix::serving(kv, prompt, runs);
         retained.worth_protecting &=
             retained_cache_protected(helper, !one_shot, kv.last_used.elapsed());
         retained.protect_from_side_call = one_shot;
         retained
-    }
-    let mut plan = prefill_plan(
-        session.as_ref().map(|kv| retained_of(kv, helper, one_shot)),
-        prompt,
-        n_ctx,
-    );
-    // About to be thrown away anyway: a cache behind a media head still holds this prompt's
-    // leading text, since the media that followed it is no longer in the conversation.
-    if matches!(
-        plan,
-        PrefillPlan::CreateContext | PrefillPlan::FullPrefillInPlace
-    ) && session
-        .as_mut()
-        .is_some_and(|kv| kv.head.is_some() && read_as_leading_text(kv))
-    {
-        plan = prefill_plan(
-            session.as_ref().map(|kv| retained_of(kv, helper, one_shot)),
-            prompt,
-            n_ctx,
-        );
-        tracing::debug!(
-            ?plan,
-            "a cache behind a media head, read as its leading text"
-        );
-    }
+    };
+    let plan = prefill_plan(session.as_ref().map(retained_of), prompt, n_ctx);
     tracing::debug!(
         ?plan,
         cached_tokens = session.as_ref().map(|kv| kv.tokens.len()),
-        cached_media_pos = session.as_ref().map(SessionKv::media_pos),
         cached_n_ctx = session.as_ref().map(|kv| kv.n_ctx),
         prompt_tokens = prompt.len(),
         n_ctx,
@@ -2093,6 +1931,7 @@ fn prefill_prompt(
             prompt,
             n_ctx,
             effective_ctx,
+            media,
         ) {
             return Ok(prefilled);
         }
@@ -2104,10 +1943,10 @@ fn prefill_prompt(
                 .as_mut()
                 .expect("ReusePrefix is only produced when a session is retained");
 
-            match reuse_prefix(kv, prompt, resume) {
+            match reuse_prefix(kv, prompt, resume, media) {
                 Ok(resumed) => {
                     // Warm by definition: this turn reused a prefix.
-                    write_snapshot_if_due(session, snapshot, prompt, false, class, None);
+                    write_snapshot_if_due(session, snapshot, prompt, false, class, None, media);
                     return Ok(PrefilledPrompt {
                         reused_prefix_tokens: resumed,
                         transient: None,
@@ -2130,6 +1969,7 @@ fn prefill_prompt(
                         prompt,
                         n_ctx,
                         effective_ctx,
+                        media,
                     ) {
                         return Ok(prefilled);
                     }
@@ -2143,7 +1983,15 @@ fn prefill_prompt(
         PrefillPlan::SacrificialContext => {
             let transient_n_ctx =
                 sacrificial_context_size(prompt.len(), settings.max_output_tokens, n_ctx);
-            match sacrificial_prefill(model, draft, backend, settings, prompt, transient_n_ctx) {
+            match sacrificial_prefill(
+                model,
+                draft,
+                backend,
+                settings,
+                prompt,
+                transient_n_ctx,
+                media,
+            ) {
                 Ok(kv) => {
                     return Ok(PrefilledPrompt {
                         reused_prefix_tokens: 0,
@@ -2170,16 +2018,21 @@ fn prefill_prompt(
                 .as_ref()
                 .and_then(|slot| slot.writable_prefix(prompt))
         })
-        .filter(|&keep| keep < prompt.len());
+        // Every prompt of a shape shares its snapshot, so it never holds one prompt's picture.
+        .filter(|&keep| keep < prompt.len() && keep <= media_ledger::text_prefix_len(prompt));
     let first = &prompt[..preamble.unwrap_or(prompt.len())];
     let retained = session.is_some();
-    match full_prefill(session, draft, model, backend, settings, first, n_ctx) {
+    match full_prefill(
+        session, draft, model, backend, settings, first, n_ctx, media,
+    ) {
         Ok(()) => {}
         Err(e) if retained => {
             // `full_prefill` dropped the poisoned context, so this attempt runs
             // against a freshly created one.
             tracing::warn!(error = %e, "prompt prefill failed; retrying with a new context");
-            full_prefill(session, draft, model, backend, settings, first, n_ctx)?;
+            full_prefill(
+                session, draft, model, backend, settings, first, n_ctx, media,
+            )?;
         }
         Err(e) => return Err(e),
     }
@@ -2197,7 +2050,7 @@ fn prefill_prompt(
                 );
             }
             kv.checkpoint_window(&prompt[..keep], true);
-            if let Err(e) = decode_checkpointed(kv, prompt, keep) {
+            if let Err(e) = decode_checkpointed(kv, prompt, keep, media) {
                 *session = None;
                 return Err(e);
             }
@@ -2211,6 +2064,7 @@ fn prefill_prompt(
             true,
             class,
             compile_prefill.zip(rebuild_preamble),
+            media,
         ),
     }
     Ok(PrefilledPrompt {
@@ -2229,207 +2083,16 @@ fn sacrificial_prefill(
     settings: &ModelSettings,
     prompt: &[LlamaToken],
     n_ctx: u32,
+    media: Option<&PromptMedia<'_>>,
 ) -> Result<SessionKv, ProviderError> {
     let mut kv = SessionKv::create(model, draft, backend, n_ctx, settings)?;
-    decode_tokens(kv.ctx.ctx_mut(), prompt, 0)?;
+    decode_span(&mut kv, prompt, 0, prompt.len(), media)?;
     kv.tokens.extend_from_slice(prompt);
     Ok(kv)
 }
 
-/// A prompt's mtmd chunk list, split at its last media chunk.
-struct SplitChunks {
-    head: Vec<HeadChunk>,
-    /// Positions the head occupies. The tail starts here.
-    head_pos: usize,
-    /// Tokens of every chunk after the last media chunk, concatenated. They
-    /// take one position each from `head_pos`, exactly where `mtmd_helper`
-    /// would place them.
-    tail: Vec<LlamaToken>,
-}
-
-/// Describe one chunk, or refuse it.
-///
-/// `None` means "this chunk cannot be modelled position for position", which
-/// makes the whole cache ineligible for reuse. An audio chunk is media like a
-/// picture: mtmd reports its positions, and its source bytes pin its contents.
-/// The text-chunk check below is a tripwire, not a live filter:
-/// mtmd returns the same value from `get_n_tokens` and `get_n_pos` for a text
-/// chunk, so `n_pos != n_tokens` is unreachable today and only earns its place
-/// if that ever stops being true.
-///
-/// # On an unrecognised chunk type
-///
-/// The `match` below is exhaustive on purpose — no `_` arm. If a future
-/// llama-cpp-2 adds a fourth `MtmdInputChunkType`, this stops compiling, which
-/// is the outcome we want: someone decides what the new type means for the
-/// position model rather than a wildcard silently refusing (or worse,
-/// mis-describing) it.
-///
-/// The other direction — llama.cpp starting to emit a chunk type the *binding*
-/// does not know — cannot be turned into a refusal here, and it is worth being
-/// precise about why rather than leaving it looking like an oversight:
-///
-/// - `MtmdInputChunkType::from` panics on an unrecognised discriminant
-///   (llama-cpp-2 0.1.146 `mtmd.rs:48`), and the release profile sets
-///   `panic = "abort"`, so `catch_unwind` cannot convert it into a refusal.
-/// - Reading the discriminant ourselves is not possible either: both
-///   `MtmdInputChunks::chunks` and `MtmdInputChunk::chunk` are `pub(crate)`, so
-///   there is no way to reach `mtmd_input_chunk_get_type` from outside the
-///   crate.
-/// - It would not help if there were. The vendored llama.cpp aborts on the same
-///   input in three places this code cannot avoid:
-///   `mtmd_input_chunk_get_n_tokens` and `mtmd_input_chunk_get_n_pos`
-///   (`mtmd.cpp:1187`, `:1199`) and `mtmd_helper_eval_chunk_single`
-///   (`mtmd-helper.cpp:378`). The first of those is reached from
-///   `MtmdInputChunks::total_tokens()`, which `prefill_multimodal` calls to size
-///   the context — before this function runs, and on the pre-cache code path
-///   too. The fallback this function's refusal leads to is `eval_chunks`, which
-///   aborts as well.
-///
-/// So an unknown chunk type kills the process either way, at the same point in
-/// the same request, with or without this cache. That is a llama.cpp property,
-/// not something this file introduced or can contain; the mitigation that does
-/// exist is the compile error above, plus keeping the vendored version pinned.
-fn describe_chunk(chunk: &MtmdInputChunk) -> Option<HeadChunk> {
-    let n_tokens = chunk.n_tokens();
-    let n_pos = usize::try_from(chunk.n_positions()).ok()?;
-    match chunk.chunk_type() {
-        MtmdInputChunkType::Text => {
-            let tokens = chunk.text_tokens().unwrap_or(&[]);
-            if tokens.len() != n_tokens || n_pos != n_tokens {
-                return None;
-            }
-            Some(HeadChunk::Text(tokens.to_vec()))
-        }
-        MtmdInputChunkType::Image | MtmdInputChunkType::Audio => {
-            Some(HeadChunk::Media { n_tokens, n_pos })
-        }
-    }
-}
-
-/// Describe every chunk mtmd produced, or refuse the list.
-fn read_chunks(chunks: &MtmdInputChunks) -> Option<Vec<HeadChunk>> {
-    let mut described = Vec::with_capacity(chunks.len());
-    for index in 0..chunks.len() {
-        described.push(describe_chunk(&chunks.get(index)?)?);
-    }
-    Some(described)
-}
-
-/// Split a described chunk list at its last media chunk.
-///
-/// Everything after that point is plain text, which is the whole reason the
-/// reuse path can run without calling mtmd again: llama-cpp-2 0.1.146 exposes
-/// no way to evaluate a subset of chunks, but ordinary token decode at an
-/// explicit position is exactly what `mtmd_helper` does for text anyway.
-fn split_at_last_media(mut chunks: Vec<HeadChunk>) -> Option<SplitChunks> {
-    let last_media = chunks
-        .iter()
-        .rposition(|chunk| matches!(chunk, HeadChunk::Media { .. }))?;
-    let rest = chunks.split_off(last_media + 1);
-    let head_pos = chunks.iter().map(HeadChunk::n_pos).sum();
-
-    let mut tail = Vec::new();
-    for chunk in &rest {
-        match chunk {
-            HeadChunk::Text(tokens) => tail.extend_from_slice(tokens),
-            // Unreachable past the last media chunk; refuse rather than drop it
-            // silently, because a dropped chunk would mis-position the tail.
-            HeadChunk::Media { .. } => return None,
-        }
-    }
-
-    Some(SplitChunks {
-        head: chunks,
-        head_pos,
-        tail,
-    })
-}
-
-/// Try to serve a media-bearing prompt from the retained cache.
-///
-/// Returns the absolute position decode resumed at. Every refusal leaves the
-/// cache exactly as it was found (or drops it, when a failed decode makes its
-/// contents untrustworthy) and the caller rebuilds, so a miss only costs the
-/// comparison.
-///
-/// A refusal is logged with the reason it refused. That is the only way the
-/// tool-schema flip described on [`HeadMismatch::ChunkShape`] is observable: it
-/// silently and permanently ends reuse for a session, and without a reason in
-/// the log the symptom is "the cache just stopped working" with nothing to point
-/// at.
-fn reuse_media_head(
-    session: &mut Option<SessionKv>,
-    split: &SplitChunks,
-    images: &[ExtractedMedia],
-    n_ctx: u32,
-) -> Option<usize> {
-    let kv = session.as_mut()?;
-    let head = kv.head.as_ref()?;
-    if let Some(reason) = head.mismatch(split.head_pos, &split.head, images) {
-        tracing::debug!(
-            ?reason,
-            cached_head_pos = head.n_pos,
-            cached_images = head.images.len(),
-            prompt_head_pos = split.head_pos,
-            prompt_images = images.len(),
-            "retained media head does not match this prompt; rebuilding it"
-        );
-        return None;
-    }
-
-    let PrefillPlan::ReusePrefix(resume) =
-        prefill_plan(Some(RetainedPrefix::resumable(kv)), &split.tail, n_ctx)
-    else {
-        return None;
-    };
-
-    match reuse_prefix(kv, &split.tail, resume) {
-        Ok(resumed) => Some(resumed),
-        Err(PrefixReuseError::Refused) => {
-            tracing::debug!(
-                resume,
-                "llama.cpp declined partial KV removal; rebuilding the multimodal prompt"
-            );
-            None
-        }
-        Err(PrefixReuseError::Poisoned(e)) => {
-            tracing::warn!(error = %e, "suffix decode failed; rebuilding the generation context");
-            *session = None;
-            None
-        }
-    }
-}
-
-/// The text tokens ahead of the first media chunk, and that chunk's index.
-fn leading_text(chunks: &MtmdInputChunks) -> Option<(Vec<LlamaToken>, usize)> {
-    let mut lead = Vec::new();
-    for index in 0..chunks.len() {
-        let chunk = chunks.get(index)?;
-        match chunk.chunk_type() {
-            MtmdInputChunkType::Text => lead.extend_from_slice(chunk.text_tokens()?),
-            MtmdInputChunkType::Image | MtmdInputChunkType::Audio => return Some((lead, index)),
-        }
-    }
-    None
-}
-
-/// Read a cache behind a media head as its leading text chunk: positions `[0, n)` hold exactly
-/// those tokens, and what follows is trailing KV every resume trims. False for a head that opens
-/// with media, which leaves no text to read.
-fn read_as_leading_text(kv: &mut SessionKv) -> bool {
-    let Some(head) = kv.head.as_ref() else {
-        return true;
-    };
-    let Some(tokens) = head.leading_text() else {
-        return false;
-    };
-    kv.tokens = tokens.to_vec();
-    kv.head = None;
-    true
-}
-
-/// What a prompt's pictures and recordings cost to take in.
+/// What the pictures and recordings a request evaluated cost to take in. One the cache already
+/// held costs nothing and is not counted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MediaCost {
     tokens: usize,
@@ -2439,145 +2102,103 @@ struct MediaCost {
     encode_ms: Option<u64>,
 }
 
-/// Evaluate every chunk from `first_media` on, starting at `n_past`; logits for the last only.
-fn eval_from_first_media(
-    kv: &mut SessionKv,
-    chunks: &MtmdInputChunks,
-    mtmd_ctx: &MtmdContext,
-    first_media: usize,
-    mut n_past: i32,
-) -> Result<(i32, MediaCost), String> {
-    let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
-    let last = chunks.len() - 1;
-    let mut cost = MediaCost::default();
-    // mtmd times its towers itself and says so only in its log.
-    let (evaluated, said) = super::encoder_backend::caught_while(|| {
-        for index in first_media..chunks.len() {
-            let chunk = chunks
-                .get(index)
-                .ok_or_else(|| format!("chunk {index} is missing"))?;
-            let started = std::time::Instant::now();
-            n_past = chunk
-                .eval(mtmd_ctx, kv.ctx.ctx(), n_past, 0, n_batch, index == last)
-                .map_err(|e| format!("chunk {index}: {e}"))?;
-            if chunk.chunk_type() != MtmdInputChunkType::Text {
-                // A GPU decode returns before its graph has run; the text after would be billed for it.
-                kv.ctx.ctx().synchronize();
-                cost.tokens += chunk.n_tokens();
-                cost.eval_ms += started.elapsed().as_millis() as u64;
-            }
+/// A prompt's pictures and recordings, and mtmd to put them into a cache.
+pub(super) struct PromptMedia<'a> {
+    chunks: &'a MtmdInputChunks,
+    mtmd: &'a MtmdContext,
+    runs: Vec<MediaRun>,
+    cost: std::cell::Cell<MediaCost>,
+}
+
+impl PromptMedia<'_> {
+    /// Evaluate one picture or recording into the cache at its positions.
+    fn eval(&self, kv: &mut SessionKv, run: &MediaRun) -> Result<(), ProviderError> {
+        let failed =
+            |why: String| ProviderError::ExecutionError(format!("Multimodal eval failed: {why}"));
+        let chunk = self
+            .chunks
+            .get(run.chunk)
+            .ok_or_else(|| failed(format!("chunk {} is missing", run.chunk)))?;
+        let start =
+            i32::try_from(run.start).map_err(|_| failed("the prompt is too long".to_string()))?;
+        let n_batch = kv.ctx.ctx().n_batch() as i32;
+        let started = std::time::Instant::now();
+        // mtmd times its towers itself and says so only in its log.
+        let (evaluated, said) = super::encoder_backend::caught_while(|| {
+            chunk.eval(self.mtmd, kv.ctx.ctx(), start, 0, n_batch, false)
+        });
+        let n_past = evaluated.map_err(|e| match said.last() {
+            // The reason is in mtmd's log, which was caught rather than traced.
+            Some(line) => failed(format!("{e} ({})", line.trim())),
+            None => failed(e.to_string()),
+        })?;
+        // A GPU decode returns before its graph has run; the text after would be billed for it.
+        kv.ctx.ctx().synchronize();
+        if usize::try_from(n_past).ok() != Some(run.end()) {
+            return Err(failed(format!(
+                "media at position {} ended at {n_past}, not {}",
+                run.start,
+                run.end()
+            )));
         }
-        Ok::<i32, String>(n_past)
-    });
-    cost.encode_ms = super::encoder_backend::encode_ms(&said);
-    match evaluated {
-        Ok(n_past) => Ok((n_past, cost)),
-        // The reason is in mtmd's log, which was caught rather than traced.
-        Err(e) => Err(match said.last() {
-            Some(line) => format!("{e} ({})", line.trim()),
-            None => e,
-        }),
+        let mut cost = self.cost.get();
+        cost.tokens += run.len;
+        cost.eval_ms += started.elapsed().as_millis() as u64;
+        if let Some(ms) = super::encoder_backend::encode_ms(&said) {
+            cost.encode_ms = Some(cost.encode_ms.unwrap_or(0) + ms);
+        }
+        self.cost.set(cost);
+        Ok(())
+    }
+
+    /// Positions the widest picture or recording fills.
+    fn widest(&self) -> usize {
+        self.runs.iter().map(|run| run.len).max().unwrap_or(0)
     }
 }
 
-/// Serve a media prompt from the retained cache's plain-token prefix: keep the KV for the text
-/// ahead of the first picture or recording, then evaluate only the chunks from there.
-///
-/// A voice note or picture sits at the end of the prompt, behind a system prompt and history the
-/// cache already holds, so this skips nearly all of the prefill a rebuild would redo. A cache
-/// behind an older media head is read as its leading text chunk: an earlier turn's picture or
-/// recording no longer sits at that position in this prompt. `None` leaves the rebuild to the
-/// caller, with the session dropped whenever the attempt changed it.
-fn resume_behind_text(
-    session: &mut Option<SessionKv>,
-    chunks: &MtmdInputChunks,
-    mtmd_ctx: &MtmdContext,
-    split: &SplitChunks,
-    media: &[ExtractedMedia],
-    n_ctx: u32,
-) -> Option<usize> {
-    let kv = session.as_mut()?;
-    let (lead, first_media) = leading_text(chunks)?;
-    if mtmd_ctx.decode_use_non_causal() {
-        // A non-causal chunk must fit one micro-batch, which the rebuild sizes for and a
-        // retained cache may not be.
-        let widest = (first_media..chunks.len())
-            .filter_map(|i| chunks.get(i))
-            .filter(|c| c.chunk_type() != MtmdInputChunkType::Text)
-            .map(|c| c.n_tokens())
-            .max()
-            .unwrap_or(0);
-        if (kv.ctx.ctx().n_ubatch() as usize) < widest {
-            return None;
-        }
-    }
-    if !read_as_leading_text(kv) {
-        *session = None;
-        return None;
-    }
-    let plan = prefill_plan(Some(RetainedPrefix::resumable(kv)), &lead, n_ctx);
-    let PrefillPlan::ReusePrefix(resume) = plan else {
-        tracing::debug!(
-            ?plan,
-            shared = common_prefix_len(&kv.tokens, &lead),
-            lead_tokens = lead.len(),
-            cached_tokens = kv.tokens.len(),
-            lead_head = ?&lead[..lead.len().min(4)],
-            cached_head = ?&kv.tokens[..kv.tokens.len().min(4)],
-            "media prompt cannot resume behind the cached text"
-        );
-        return None;
-    };
-    let resumed = match reuse_prefix(kv, &lead, resume) {
-        Ok(resumed) => resumed,
-        Err(PrefixReuseError::Refused) => return None,
-        Err(PrefixReuseError::Poisoned(e)) => {
-            tracing::warn!(error = %e, "text decode ahead of the media failed; rebuilding");
-            *session = None;
-            return None;
-        }
-    };
+fn runs_of<'a>(media: Option<&'a PromptMedia<'_>>) -> &'a [MediaRun] {
+    media.map_or(&[], |media| &media.runs)
+}
 
-    let start = i32::try_from(lead.len()).ok()?;
-    let eval_started = std::time::Instant::now();
-    let (n_past, cost) = match eval_from_first_media(kv, chunks, mtmd_ctx, first_media, start) {
-        Ok(evaluated) => evaluated,
-        Err(e) => {
-            tracing::warn!(error = %e, "media decode behind a reused prefix failed; rebuilding");
-            *session = None;
+/// The prompt one entry a position (`media_ledger`), with its pictures and recordings. `None`
+/// for chunks that cannot be laid out so: positions in two dimensions, or media mtmd gave no id.
+fn lay_out(chunks: &MtmdInputChunks) -> Option<(Vec<LlamaToken>, Vec<MediaRun>)> {
+    let mut ledger = Vec::with_capacity(chunks.total_tokens());
+    let mut runs: Vec<MediaRun> = Vec::new();
+    // A recording past 30 s is several chunks under one id.
+    let mut seen: Vec<u64> = Vec::new();
+    for index in 0..chunks.len() {
+        let chunk = chunks.get(index)?;
+        let n_pos = usize::try_from(chunk.n_positions()).ok()?;
+        if n_pos != chunk.n_tokens() {
             return None;
         }
-    };
-    if i32::try_from(split.head_pos + split.tail.len()).ok() != Some(n_past) {
-        tracing::debug!(
-            n_past,
-            "resumed media cache disagrees with its chunks; rebuilding"
-        );
-        *session = None;
-        return None;
+        match chunk.chunk_type() {
+            MtmdInputChunkType::Text => {
+                let tokens = chunk.text_tokens()?;
+                if tokens.len() != n_pos {
+                    return None;
+                }
+                ledger.extend_from_slice(tokens);
+            }
+            MtmdInputChunkType::Image | MtmdInputChunkType::Audio => {
+                let made_from = u64::from_str_radix(&chunk.id()?, 16).ok()?;
+                let ordinal = seen.iter().filter(|id| **id == made_from).count();
+                seen.push(made_from);
+                let content = media_ledger::chunk_content(made_from, ordinal);
+                let start = ledger.len();
+                ledger.extend((0..n_pos).map(|i| media_ledger::stand_in(content, i)));
+                runs.push(MediaRun {
+                    start,
+                    len: n_pos,
+                    chunk: index,
+                    content,
+                });
+            }
+        }
     }
-
-    kv.head = Some(MediaHead {
-        chunks: split.head.clone(),
-        n_pos: split.head_pos,
-        images: media.iter().map(|item| item.bytes.clone()).collect(),
-    });
-    kv.tokens = split.tail.clone();
-    tracing::info!(
-        target: "giap::kv",
-        kind = "media_prefix_reused",
-        reused = resumed,
-        lead_tokens = lead.len(),
-        media_chunks = chunks.len() - first_media,
-        n_past,
-        eval_ms = eval_started.elapsed().as_millis() as u64,
-        media_tokens = cost.tokens,
-        media_ms = cost.eval_ms,
-        encode_ms = cost.encode_ms,
-        drafter = kv.ctx.mtp_mut().is_some(),
-        "media prompt resumed behind the cached text prefix"
-    );
-    Some(resumed)
+    Some((ledger, runs))
 }
 
 /// mtmd's own sniffing decides picture or sound; a sound it reads as a picture is refused,
@@ -2587,7 +2208,15 @@ fn decode_media(
     item: &ExtractedMedia,
 ) -> Result<MtmdBitmap, ProviderError> {
     let what = if item.audio { "audio" } else { "image" };
-    let bitmap = MtmdBitmap::from_buffer(mtmd_ctx, &item.bytes, false)
+    let mut bitmap = MtmdBitmap::from_buffer(mtmd_ctx, &item.bytes, false)
+        .map_err(|e| ProviderError::ExecutionError(format!("Failed to decode {what}: {e}")))?;
+    // Its chunks carry this id, which is how `lay_out` knows what each was made from.
+    let id = format!(
+        "{:016x}",
+        media_ledger::content_hash(&item.bytes, item.audio)
+    );
+    bitmap
+        .set_id(&id)
         .map_err(|e| ProviderError::ExecutionError(format!("Failed to decode {what}: {e}")))?;
     if bitmap.is_audio() != item.audio {
         return Err(ProviderError::ExecutionError(format!(
@@ -2636,31 +2265,12 @@ fn wav_duration_ms(bytes: &[u8]) -> Option<u64> {
     None
 }
 
-/// Tokenize text + images via mtmd and prefill them.
-///
-/// When the retained cache already holds this exact image list at these exact
-/// positions, only the text that follows the last image is decoded — the encode
-/// and the prefill of everything before it are skipped. Otherwise the cache is
-/// rebuilt from scratch, which is what this always used to do.
-///
-/// "This exact image list" is a strict condition and it is the reason the win
-/// is narrower than it first looks: a conversation that accumulates pictures
-/// misses every turn. See [`MediaHead`] for which conversation shapes actually
-/// benefit and which do not.
-#[allow(clippy::too_many_arguments)]
-fn prefill_multimodal(
-    session: &mut Option<SessionKv>,
-    snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
-    model: &Arc<LlamaModel>,
-    draft: Option<&Arc<LlamaModel>>,
-    mtmd_ctx: Option<&MtmdContext>,
-    backend: &LlamaCppBackend,
+/// The prompt as mtmd's chunks: its text tokenized, each picture and recording preprocessed.
+fn tokenize_with_media<'a>(
+    mtmd_ctx: Option<&'a MtmdContext>,
     prompt_text: &str,
     media: &[ExtractedMedia],
-    context_limit: usize,
-    settings: &ModelSettings,
-    memory_fit: Option<MemoryFit>,
-) -> Result<(usize, PrefilledPrompt), ProviderError> {
+) -> Result<(&'a MtmdContext, MtmdInputChunks), ProviderError> {
     let has_audio = media.iter().any(|m| m.audio);
     let mtmd_ctx = mtmd_ctx.ok_or_else(|| {
         ProviderError::ExecutionError(if has_audio {
@@ -2683,7 +2293,6 @@ fn prefill_multimodal(
         .iter()
         .map(|item| decode_media(mtmd_ctx, item))
         .collect::<Result<_, _>>()?;
-
     let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
 
     // Tokenized exactly as the text path tokenizes a prompt (`AddBos::Never`), or no cached text
@@ -2696,34 +2305,39 @@ fn prefill_multimodal(
     let chunks = mtmd_ctx.tokenize(input_text, &bitmap_refs).map_err(|e| {
         ProviderError::ExecutionError(format!("Multimodal tokenization failed: {e}"))
     })?;
+    Ok((mtmd_ctx, chunks))
+}
 
-    // Walks every chunk and sums `mtmd_input_chunk_get_n_tokens`, which aborts
-    // inside llama.cpp on a chunk type it does not know. It runs before this
-    // function describes anything, and it ran on the pre-cache code path too —
-    // which is what makes the exhaustive match in `describe_chunk` the only
-    // unknown-chunk-type mitigation available here rather than a missing one.
+/// Evaluate a media prompt that cannot be laid out one entry a position into a cache of its own,
+/// which serves this generation and nothing after it.
+#[allow(clippy::too_many_arguments)]
+fn prefill_unmodelled(
+    session: &mut Option<SessionKv>,
+    model: &Arc<LlamaModel>,
+    mtmd_ctx: &MtmdContext,
+    chunks: &MtmdInputChunks,
+    backend: &LlamaCppBackend,
+    context_limit: usize,
+    settings: &ModelSettings,
+    memory_fit: Option<MemoryFit>,
+) -> Result<(usize, PrefilledPrompt), ProviderError> {
+    // Walks every chunk and sums `mtmd_input_chunk_get_n_tokens`, which aborts inside llama.cpp
+    // on a chunk type it does not know.
     let prompt_token_count = chunks.total_tokens();
-
-    let n_ctx_train = model.n_ctx_train() as usize;
-    let mmproj_overhead = settings.mmproj_size_bytes;
-    // The retained window counts towards what this request can spend: it is
-    // either kept (the reuse path allocates nothing) or released before its
-    // replacement is allocated.
     let memory_max_ctx = estimate_max_context_for_memory(
         model,
         backend,
-        mmproj_overhead,
+        settings.mmproj_size_bytes,
         retained_kv_tokens(session),
     );
     let effective_ctx = effective_context_size(
         prompt_token_count,
         settings,
         context_limit,
-        n_ctx_train,
+        model.n_ctx_train() as usize,
         memory_max_ctx,
         memory_fit,
     );
-
     let min_generation_headroom = 512;
     if prompt_token_count + min_generation_headroom > effective_ctx {
         return Err(ProviderError::ContextLengthExceeded(format!(
@@ -2731,142 +2345,26 @@ fn prefill_multimodal(
              context limit ({effective_ctx} tokens)",
         )));
     }
-
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
     })?;
 
-    let split = read_chunks(&chunks).and_then(split_at_last_media);
-    tracing::debug!(
-        described = split.is_some(),
-        head_pos = split.as_ref().map(|s| s.head_pos),
-        tail_tokens = split.as_ref().map(|s| s.tail.len()),
-        cached_media_pos = session.as_ref().map(SessionKv::media_pos),
-        prompt_tokens = prompt_token_count,
-        "multimodal prefill plan"
-    );
-
-    if let Some(split) = split.as_ref() {
-        if let Some(resume) = reuse_media_head(session, split, media, n_ctx) {
-            return Ok((
-                prompt_token_count,
-                PrefilledPrompt {
-                    reused_prefix_tokens: resume,
-                    transient: None,
-                    effective_ctx,
-                },
-            ));
-        }
-        if let Some(resume) = resume_behind_text(session, &chunks, mtmd_ctx, split, media, n_ctx) {
-            return Ok((
-                prompt_token_count,
-                PrefilledPrompt {
-                    reused_prefix_tokens: resume,
-                    transient: None,
-                    effective_ctx,
-                },
-            ));
-        }
-    }
-
-    // Release the retained cache before allocating its replacement so the two
-    // KV caches are never resident together.
+    // Released first, so two KV caches are never resident together.
     *session = None;
     let mut mm_settings = settings.clone();
-    if mm_settings.n_ubatch.map_or(false, |u| u < 512) {
+    if mm_settings.n_ubatch.is_some_and(|u| u < 512) {
         mm_settings.n_ubatch = Some(512);
     }
-    let mut kv = SessionKv::create(model, draft, backend, n_ctx, &mm_settings)?;
-
-    // The text ahead of the first media is decoded as text, so its window checkpoints let a later
-    // turn resume behind it (`resume_behind_text`, and the text path once the media is gone).
-    let eval_started = std::time::Instant::now();
-    let mut restored = 0;
-    let (lead, first_media) = leading_text(&chunks).unwrap_or_default();
-    if !lead.is_empty() {
-        // The preamble the text path saved stands in for decoding it.
-        restored = snapshot
-            .as_mut()
-            .and_then(|slot| slot.load(kv.context_mut(), &lead))
-            .unwrap_or(0);
-        if restored > 0 {
-            kv.checkpoint_window(&lead[..restored], true);
-        }
-        decode_checkpointed(&mut kv, &lead, restored)?;
-    }
-    let start = i32::try_from(lead.len())
-        .map_err(|_| ProviderError::ExecutionError("Multimodal prompt is too long".to_string()))?;
-    let (n_past, cost) = eval_from_first_media(&mut kv, &chunks, mtmd_ctx, first_media, start)
+    let kv = SessionKv::create(model, None, backend, n_ctx, &mm_settings)?;
+    let n_batch = kv.ctx.ctx().n_batch() as i32;
+    chunks
+        .eval_chunks(mtmd_ctx, kv.ctx.ctx(), 0, 0, n_batch, true)
         .map_err(|e| ProviderError::ExecutionError(format!("Multimodal eval failed: {e}")))?;
-    tracing::info!(
-        target: "giap::kv",
-        kind = "media_prompt_rebuilt",
-        prompt_tokens = prompt_token_count,
-        restored_tokens = restored,
-        n_past,
-        eval_ms = eval_started.elapsed().as_millis() as u64,
-        media_tokens = cost.tokens,
-        media_ms = cost.eval_ms,
-        encode_ms = cost.encode_ms,
-        drafter = kv.ctx.mtp_mut().is_some(),
-        "media prompt evaluated into a fresh cache"
-    );
-
-    // Retain the cache only when the chunk list was describable AND the position
-    // model it produced is addressable.
-    //
-    // The `i32::try_from` is the part that carries weight. Positions are
-    // `llama_pos`, an i32, everywhere in llama.cpp; a model whose end position
-    // does not fit cannot be trimmed back to or resumed at, and `reuse_prefix`
-    // would be handed a `resume_pos` it has to refuse anyway. Better to decline
-    // retention now than to hold a cache nothing can address.
-    //
-    // The `== n_past` half is NOT a ledger check, despite reading like one, and
-    // should not be relied on as a safety property. `n_past` is llama.cpp's own
-    // running sum of the very `n_pos` values this code already read: text chunks
-    // accumulate their batched token counts and media chunks add
-    // `mtmd_input_chunk_get_n_pos` (`mtmd-helper.cpp`), so the equality holds by
-    // construction whenever `eval_chunks` returns `Ok`. It says nothing about
-    // *what* is in the cache. It is kept only as a near-free tripwire against a
-    // future `mtmd_helper` that stops walking the list early without reporting
-    // an error — an eventuality with no other detector here.
-    //
-    // Failing either test means the cache must never be reused, so it becomes a
-    // throwaway context that serves this generation and is then dropped —
-    // including the token bookkeeping, which would otherwise record generated
-    // tokens against positions the prompt already occupies.
-    let retainable = split.as_ref().is_some_and(|split| {
-        i32::try_from(split.head_pos + split.tail.len()).is_ok_and(|total| total == n_past)
-    });
-    if !retainable {
-        tracing::debug!(
-            n_past,
-            "multimodal cache is not addressable by the recorded position model; not retaining it"
-        );
-        return Ok((
-            prompt_token_count,
-            PrefilledPrompt {
-                reused_prefix_tokens: restored,
-                transient: Some(kv),
-                effective_ctx,
-            },
-        ));
-    }
-
-    let split = split.expect("retainable is only true when the chunks were described");
-    kv.head = Some(MediaHead {
-        chunks: split.head,
-        n_pos: split.head_pos,
-        images: media.iter().map(|item| item.bytes.clone()).collect(),
-    });
-    kv.tokens = split.tail;
-    *session = Some(kv);
-
     Ok((
         prompt_token_count,
         PrefilledPrompt {
-            reused_prefix_tokens: restored,
-            transient: None,
+            reused_prefix_tokens: 0,
+            transient: Some(kv),
             effective_ctx,
         },
     ))
@@ -2948,9 +2446,8 @@ pub(super) fn prepare_generation(
                 //
                 // When it does succeed it rewrites the whole rendered prompt,
                 // system prefix included, invalidating every form of KV reuse
-                // for the session it fires in: the text path drops to whatever
-                // short prefix survives, and a retained media head stops
-                // matching outright (`HeadMismatch::ChunkShape`).
+                // for the session it fires in: the cache drops to whatever short
+                // prefix survives.
                 //
                 // Worth logging because the trigger is not a setting anyone
                 // turned on — the threshold moves with transcript length and
@@ -3012,76 +2509,131 @@ pub(super) fn prepare_generation(
         None,
     );
     let t_log_done = std::time::Instant::now();
-    // (tokenize, validate, plan+decode) for the text path; the multimodal path
-    // has no flat token vector to time the same way.
+    // (tokenize, validate, plan+decode); absent for a prompt that could not be laid out.
     let mut text_breakdown: Option<(u128, u128, u128)> = None;
 
-    let (prompt_token_count, mut prefilled, prompt_tokens) = if !ctx.media.is_empty() {
-        // The multimodal path prefills through mtmd chunks and never produces a
-        // flat token vector.
-        let (ptc, prefilled) = prefill_multimodal(
-            ctx.session,
-            ctx.snapshot,
-            ctx.model,
-            ctx.draft,
+    let chunks = if ctx.media.is_empty() {
+        None
+    } else {
+        Some(tokenize_with_media(
             ctx.mtmd_ctx,
-            ctx.backend,
             &template_result.prompt,
             ctx.media,
-            ctx.context_limit,
-            ctx.settings,
-            ctx.memory_fit,
-        )?;
-        (ptc, prefilled, Vec::new())
-    } else {
-        let tokens = ctx
-            .model
-            .str_to_token(&template_result.prompt, AddBos::Never)
-            .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
-        let t_tok_done = std::time::Instant::now();
-        let (ptc, ectx) = validate_and_compute_context(
-            ctx.model,
-            ctx.mtmd_ctx.is_some(),
-            ctx.backend,
-            tokens.len(),
-            ctx.context_limit,
-            ctx.settings,
-            retained_kv_tokens,
-            ctx.memory_fit,
-        )?;
-        let t_validate_done = std::time::Instant::now();
-        let prefilled = prefill_prompt(
-            ctx.session,
-            ctx.draft,
-            ctx.snapshot,
-            ctx.model_path,
-            ctx.model,
-            ctx.backend,
-            ctx.settings,
-            &tokens,
-            ectx,
-            ctx.one_shot,
-            ctx.helper,
-            ctx.prime_waiting,
-            ctx.suspended,
-            ctx.compile_prefill.as_deref(),
-            ctx.prefill_retention_secs,
-            ctx.rebuild_prefill,
-        )?;
-        text_breakdown = Some((
-            t_tok_done.duration_since(t_log_done).as_millis(),
-            t_validate_done.duration_since(t_tok_done).as_millis(),
-            t_validate_done.elapsed().as_millis(),
-        ));
-        let mut tokens = tokens;
-        let mut ptc = ptc;
-        if let Some(kv) = prefilled.transient.as_ref().or(ctx.session.as_ref()) {
-            if kv.tokens.len() < tokens.len() {
-                tokens.truncate(kv.tokens.len());
-                ptc = tokens.len();
+        )?)
+    };
+    // One entry a position, so a prompt with pictures or recordings is planned, reused,
+    // checkpointed and snapshotted exactly as a text one.
+    let laid_out = match chunks.as_ref() {
+        None => Some((
+            ctx.model
+                .str_to_token(&template_result.prompt, AddBos::Never)
+                .map_err(|e| ProviderError::ExecutionError(e.to_string()))?,
+            None,
+        )),
+        Some((mtmd, chunks)) => lay_out(chunks).map(|(ledger, runs)| {
+            let media = PromptMedia {
+                chunks,
+                mtmd,
+                runs,
+                cost: std::cell::Cell::default(),
+            };
+            (ledger, Some(media))
+        }),
+    };
+
+    let (prompt_token_count, mut prefilled, prompt_tokens) = match (laid_out, chunks.as_ref()) {
+        (Some((tokens, media)), _) => {
+            let t_tok_done = std::time::Instant::now();
+            // A non-causal encoder's output is decoded in one micro-batch.
+            let widened = media
+                .as_ref()
+                .filter(|m| m.mtmd.decode_use_non_causal())
+                .filter(|_| ctx.settings.n_ubatch.is_some_and(|u| u < 512))
+                .map(|_| ModelSettings {
+                    n_ubatch: Some(512),
+                    ..ctx.settings.clone()
+                });
+            let settings = widened.as_ref().unwrap_or(ctx.settings);
+            let (ptc, ectx) = validate_and_compute_context(
+                ctx.model,
+                ctx.mtmd_ctx.is_some(),
+                ctx.backend,
+                tokens.len(),
+                ctx.context_limit,
+                settings,
+                retained_kv_tokens,
+                ctx.memory_fit,
+            )?;
+            let t_validate_done = std::time::Instant::now();
+            let mut prefilled = prefill_prompt(
+                ctx.session,
+                ctx.draft,
+                ctx.snapshot,
+                ctx.model_path,
+                ctx.model,
+                ctx.backend,
+                settings,
+                &tokens,
+                ectx,
+                ctx.one_shot,
+                ctx.helper,
+                ctx.prime_waiting,
+                ctx.suspended,
+                ctx.compile_prefill.as_deref(),
+                ctx.prefill_retention_secs,
+                ctx.rebuild_prefill,
+                media.as_ref(),
+            )?;
+            text_breakdown = Some((
+                t_tok_done.duration_since(t_log_done).as_millis(),
+                t_validate_done.duration_since(t_tok_done).as_millis(),
+                t_validate_done.elapsed().as_millis(),
+            ));
+            if let Some(media) = media.as_ref() {
+                let cost = media.cost.get();
+                let drafter = prefilled
+                    .transient
+                    .as_mut()
+                    .or(ctx.session.as_mut())
+                    .map(|kv| kv.ctx.mtp_mut().is_some());
+                tracing::info!(
+                    target: "giap::kv",
+                    kind = "media_prompt",
+                    prompt_tokens = tokens.len(),
+                    reused_tokens = prefilled.reused_prefix_tokens,
+                    media_tokens = media.runs.iter().map(|run| run.len).sum::<usize>(),
+                    evaluated_tokens = cost.tokens,
+                    media_ms = cost.eval_ms,
+                    encode_ms = cost.encode_ms,
+                    eval_ms = t_validate_done.elapsed().as_millis() as u64,
+                    drafter,
+                    "a prompt with pictures or recordings is in the cache"
+                );
             }
+            let mut tokens = tokens;
+            let mut ptc = ptc;
+            if let Some(kv) = prefilled.transient.as_ref().or(ctx.session.as_ref()) {
+                if kv.tokens.len() < tokens.len() {
+                    tokens.truncate(kv.tokens.len());
+                    ptc = tokens.len();
+                }
+            }
+            (ptc, prefilled, tokens)
         }
-        (ptc, prefilled, tokens)
+        (None, Some((mtmd, chunks))) => {
+            let (ptc, prefilled) = prefill_unmodelled(
+                ctx.session,
+                ctx.model,
+                mtmd,
+                chunks,
+                ctx.backend,
+                ctx.context_limit,
+                ctx.settings,
+                ctx.memory_fit,
+            )?;
+            (ptc, prefilled, Vec::new())
+        }
+        (None, None) => unreachable!("a prompt without media is always laid out"),
     };
 
     // Wait for the prefill to actually finish before timing it. The GPU
@@ -3149,8 +2701,8 @@ pub(super) enum TokenAction {
 /// can extend a retained token sequence with exactly what the cache now holds.
 /// The token a stop condition fires on is sampled but never decoded, and is
 /// therefore absent from `decoded`.
-// `prompt_tokens` and `prompt_token_count` look redundant and are not: the
-// count includes media chunks, while the token vector is text only.
+// `prompt_tokens` and `prompt_token_count` look redundant and are not: a prompt that could not
+// be laid out one entry a position has a count and no tokens.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn generation_loop(
     model: &LlamaModel,
@@ -3192,8 +2744,8 @@ pub(super) fn generation_loop(
         mtp.begin(prompt_tokens)?;
     }
     // The drafter shares the target's cache and drafts from a position, not from the prompt's
-    // tokens, so a prompt carrying media speculates too. Its end is read from the cache:
-    // `prompt_tokens` holds only its text.
+    // tokens, so a prompt carrying media speculates too. Its end is read from the cache, which
+    // also holds for a prompt with no laid-out tokens.
     let prompt_end = ctx.ctx().kv_cache_seq_pos_max(0) + 1;
 
     // `pending` is always UNDECODED on entry to an iteration; whichever path
@@ -3312,7 +2864,8 @@ pub(super) fn decode_tokens_for_test(
 }
 
 /// Prefill a media prompt as a turn would, for tests that need the session it leaves. Returns
-/// the prompt's size and how much of it the retained cache served.
+/// the prompt one entry a position, how much of it the retained cache served and how many media
+/// positions were evaluated.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prefill_media_for_test(
@@ -3324,26 +2877,43 @@ pub(super) fn prefill_media_for_test(
     prompt_text: &str,
     media: &[ExtractedMedia],
     settings: &ModelSettings,
-) -> Result<(usize, usize), ProviderError> {
-    let window = settings.context_size.unwrap_or(4096) as usize;
-    let (prompt_tokens, prefilled) = prefill_multimodal(
+) -> Result<(Vec<LlamaToken>, usize, usize), ProviderError> {
+    let (mtmd, chunks) = tokenize_with_media(Some(mtmd_ctx), prompt_text, media)?;
+    let (ledger, runs) = lay_out(&chunks).expect("a prompt laid out one entry a position");
+    let prompt_media = PromptMedia {
+        chunks: &chunks,
+        mtmd,
+        runs,
+        cost: std::cell::Cell::default(),
+    };
+    let prefilled = prefill_prompt(
         session,
-        &mut None,
-        model,
         draft,
-        Some(mtmd_ctx),
+        &mut None,
+        std::path::Path::new(""),
+        model,
         backend,
-        prompt_text,
-        media,
-        window,
         settings,
+        &ledger,
+        settings.context_size.unwrap_or(4096) as usize,
+        false,
+        false,
+        false,
+        &mut None,
         None,
+        None,
+        false,
+        Some(&prompt_media),
     )?;
     assert!(
         prefilled.transient.is_none(),
         "the media cache was not retained"
     );
-    Ok((prompt_tokens, prefilled.reused_prefix_tokens))
+    Ok((
+        ledger,
+        prefilled.reused_prefix_tokens,
+        prompt_media.cost.get().tokens,
+    ))
 }
 
 #[cfg(test)]
@@ -3538,67 +3108,15 @@ pub(super) mod tests {
         ids.into_iter().map(LlamaToken::new).collect()
     }
 
-    /// A text-only retained cache: no media head, so every cached token sits at
-    /// its own index.
+    /// A retained cache the prompt may be served from as far as `tokens` goes.
     fn retained(tokens: &[LlamaToken], n_ctx: u32) -> RetainedPrefix<'_> {
         RetainedPrefix {
-            media_pos: 0,
             tokens,
             occupied: tokens.len(),
             n_ctx,
             worth_protecting: true,
             protect_from_side_call: false,
         }
-    }
-
-    /// A cache whose media head the incoming prompt reproduces: `tokens` are the
-    /// tail that follows `media_pos` positions of media-bearing prefix.
-    fn retained_behind_media(
-        media_pos: usize,
-        tokens: &[LlamaToken],
-        n_ctx: u32,
-    ) -> RetainedPrefix<'_> {
-        RetainedPrefix {
-            media_pos,
-            tokens,
-            occupied: media_pos + tokens.len(),
-            n_ctx,
-            worth_protecting: true,
-            protect_from_side_call: false,
-        }
-    }
-
-    fn image(bytes: &[u8]) -> ExtractedMedia {
-        ExtractedMedia {
-            bytes: bytes.to_vec(),
-            audio: false,
-        }
-    }
-
-    #[test]
-    fn a_media_head_reads_as_the_text_ahead_of_its_first_media() {
-        let lead: Vec<LlamaToken> = (0..300).map(LlamaToken::new).collect();
-        let head = media_head(
-            vec![
-                HeadChunk::Text(lead.clone()),
-                HeadChunk::Media {
-                    n_tokens: 176,
-                    n_pos: 176,
-                },
-                HeadChunk::Text(vec![LlamaToken::new(9)]),
-            ],
-            &[b"RIFF"],
-        );
-        assert_eq!(head.leading_text(), Some(lead.as_slice()));
-
-        let opens_with_media = media_head(
-            vec![HeadChunk::Media {
-                n_tokens: 4,
-                n_pos: 4,
-            }],
-            &[b"x"],
-        );
-        assert_eq!(opens_with_media.leading_text(), None);
     }
 
     #[test]
@@ -3609,7 +3127,6 @@ pub(super) mod tests {
         let mut new_lead = old_lead[..1_998].to_vec();
         new_lead.extend((7_000..7_040).map(LlamaToken::new));
         let retained = RetainedPrefix {
-            media_pos: 0,
             tokens: &old_lead,
             occupied: old_lead.len() + 500,
             n_ctx: 32_768,
@@ -3620,14 +3137,6 @@ pub(super) mod tests {
             prefill_plan(Some(retained), &new_lead, 32_768),
             PrefillPlan::ReusePrefix(1_998)
         );
-    }
-
-    fn media_head(chunks: Vec<HeadChunk>, images: &[&[u8]]) -> MediaHead {
-        MediaHead {
-            n_pos: chunks.iter().map(HeadChunk::n_pos).sum(),
-            chunks,
-            images: images.iter().map(|bytes| bytes.to_vec()).collect(),
-        }
     }
 
     /// A prompt whose first `shared` tokens match `cached`, then diverges.
@@ -3700,7 +3209,7 @@ pub(super) mod tests {
 
         // The cache as a turn leaves it: the first prompt, checkpointed.
         let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
-        decode_checkpointed(&mut kv, &first, 0).expect("prefill the first prompt");
+        decode_checkpointed(&mut kv, &first, 0, None).expect("prefill the first prompt");
         kv.tokens.extend_from_slice(&first);
         kv.checkpoint_window(&first, true);
         let pos_min = kv.ctx.ctx().kv_cache_seq_pos_min(0);
@@ -3709,7 +3218,7 @@ pub(super) mod tests {
             "the window no longer covers the divergence ({pos_min}), so this must need a checkpoint"
         );
 
-        let Ok(resumed) = reuse_prefix(&mut kv, &second[..last], shared.len()) else {
+        let Ok(resumed) = reuse_prefix(&mut kv, &second[..last], shared.len(), None) else {
             panic!("the resume was refused although a checkpoint covers it");
         };
         assert!(
@@ -3748,11 +3257,11 @@ pub(super) mod tests {
 
         // Without the checkpoint the same resume must be refused, never served.
         let mut bare = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("ctx");
-        decode_checkpointed(&mut bare, &first, 0).expect("prefill the first prompt");
+        decode_checkpointed(&mut bare, &first, 0, None).expect("prefill the first prompt");
         bare.tokens.extend_from_slice(&first);
         bare.checkpoints.clear();
         assert!(matches!(
-            reuse_prefix(&mut bare, &second[..last], shared.len()),
+            reuse_prefix(&mut bare, &second[..last], shared.len(), None),
             Err(PrefixReuseError::Refused)
         ));
     }
@@ -4289,6 +3798,7 @@ pub(super) mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .expect("prefill");
         }
@@ -4575,6 +4085,7 @@ pub(super) mod tests {
                     None,
                     None,
                     false,
+                    None,
                 )
                 .expect("prefill")
                 .reused_prefix_tokens
@@ -4685,6 +4196,7 @@ pub(super) mod tests {
                     $compile,
                     None,
                     false,
+                    None,
                 )
                 .expect("prefill")
                 .reused_prefix_tokens
@@ -4898,6 +4410,7 @@ pub(super) mod tests {
                 &settings,
                 &prime,
                 n_ctx,
+                None,
             )
             .expect("cold prime");
             let cold_ms = ms(t);
@@ -4925,6 +4438,7 @@ pub(super) mod tests {
                 &settings,
                 &helper,
                 side_n_ctx,
+                None,
             );
             let side_ms = ms(t);
             let side_mem = taken(before);
@@ -4942,6 +4456,7 @@ pub(super) mod tests {
                     slot,
                     &helper,
                     n_ctx,
+                    None,
                 )
                 .expect("helper seed");
                 assert_eq!(
@@ -4981,6 +4496,7 @@ pub(super) mod tests {
                 &mut slot,
                 &prime,
                 n_ctx,
+                None,
             )
             .expect("rebuild the prime");
             let rebuild_ms = ms(t);
@@ -5336,208 +4852,16 @@ pub(super) mod tests {
         );
     }
 
-    // --- media head reuse ---
-
-    #[test]
-    fn head_chunk_positions_count_text_tokens_and_media_positions() {
-        assert_eq!(HeadChunk::Text(tokens(0..7)).n_pos(), 7);
-        assert_eq!(
-            HeadChunk::Media {
-                n_tokens: 256,
-                n_pos: 64
-            }
-            .n_pos(),
-            64
-        );
-    }
-
-    #[test]
-    fn split_at_last_media_puts_every_trailing_text_chunk_in_the_tail() {
-        let split = split_at_last_media(vec![
-            HeadChunk::Text(tokens(0..10)),
-            HeadChunk::Media {
-                n_tokens: 256,
-                n_pos: 256,
-            },
-            HeadChunk::Text(tokens(100..104)),
-            HeadChunk::Text(tokens(200..203)),
-        ])
-        .expect("a list with a media chunk splits");
-
-        assert_eq!(split.head_pos, 266);
-        assert_eq!(split.head.len(), 2);
-        assert_eq!(split.tail, tokens((100..104).chain(200..203)));
-    }
-
-    #[test]
-    fn split_at_last_media_splits_after_the_last_of_several_media_chunks() {
-        let media = HeadChunk::Media {
-            n_tokens: 64,
-            n_pos: 64,
-        };
-        let split = split_at_last_media(vec![
-            HeadChunk::Text(tokens(0..5)),
-            media.clone(),
-            HeadChunk::Text(tokens(10..15)),
-            media,
-            HeadChunk::Text(tokens(20..25)),
-        ])
-        .expect("a list with media chunks splits");
-
-        // Everything up to and including the second image stays in the head, so
-        // no image ever has to be re-evaluated on the reuse path.
-        assert_eq!(split.head.len(), 4);
-        assert_eq!(split.head_pos, 5 + 64 + 5 + 64);
-        assert_eq!(split.tail, tokens(20..25));
-    }
-
-    #[test]
-    fn split_at_last_media_refuses_a_chunk_list_without_media() {
-        assert!(split_at_last_media(vec![HeadChunk::Text(tokens(0..10))]).is_none());
-        assert!(split_at_last_media(Vec::new()).is_none());
-    }
-
-    /// What `reuse_media_head` passes as the incoming head's position count:
-    /// `SplitChunks::head_pos`, i.e. the sum over the incoming chunks.
-    fn incoming_head_pos(chunks: &[HeadChunk]) -> usize {
-        chunks.iter().map(HeadChunk::n_pos).sum()
-    }
-
-    fn mismatch(
-        head: &MediaHead,
-        chunks: &[HeadChunk],
-        images: &[ExtractedMedia],
-    ) -> Option<HeadMismatch> {
-        head.mismatch(incoming_head_pos(chunks), chunks, images)
-    }
-
-    #[test]
-    fn media_head_matches_identical_shape_and_images() {
-        let head = media_head(
-            vec![
-                HeadChunk::Text(tokens(0..10)),
-                HeadChunk::Media {
-                    n_tokens: 256,
-                    n_pos: 256,
-                },
-            ],
-            &[b"png-bytes"],
-        );
-        let same = head.chunks.clone();
-        assert_eq!(mismatch(&head, &same, &[image(b"png-bytes")]), None);
-    }
-
-    #[test]
-    fn media_head_rejects_different_image_bytes() {
-        let head = media_head(
-            vec![HeadChunk::Media {
-                n_tokens: 256,
-                n_pos: 256,
-            }],
-            &[b"first-picture"],
-        );
-        let same_shape = head.chunks.clone();
-        // Same chunk shape, different picture: the token counts cannot tell
-        // these apart, so the bytes have to.
-        assert_eq!(
-            mismatch(&head, &same_shape, &[image(b"second-picture")]),
-            Some(HeadMismatch::ImageBytes)
-        );
-    }
-
-    /// One image's worth of chunks, at the size mtmd gives a fixed resolution.
-    fn media_chunk() -> HeadChunk {
-        HeadChunk::Media {
-            n_tokens: 256,
-            n_pos: 256,
-        }
-    }
-
-    /// The head a single-image prompt produces: a preamble, then the picture.
-    fn one_image_head() -> MediaHead {
-        media_head(vec![HeadChunk::Text(tokens(0..10)), media_chunk()], &[b"a"])
-    }
-
-    #[test]
-    fn media_head_rejects_a_grown_image_list() {
-        // The growing-image-list conversation, shaped the way mtmd actually
-        // presents it: a second picture arrives as a second media chunk *and* a
-        // second image, so the chunk list and the position count move with the
-        // count. All three checks would fire; ImageCount is the narrowest, and
-        // it is the reason the trace that motivated this cache gets nothing
-        // from it.
-        let head = one_image_head();
-        let two_images = vec![
-            HeadChunk::Text(tokens(0..10)),
-            media_chunk(),
-            HeadChunk::Text(tokens(20..24)),
-            media_chunk(),
-        ];
-        assert_eq!(
-            mismatch(&head, &two_images, &[image(b"a"), image(b"b")]),
-            Some(HeadMismatch::ImageCount)
-        );
-    }
-
-    #[test]
-    fn media_head_rejects_a_rewritten_preamble() {
-        // The tool-schema flip: same picture, rewritten text ahead of it. The
-        // compact schema renders shorter, so the image moves too — but the
-        // chunk list is the narrower way to say that, and it is what gets
-        // logged.
-        let head = one_image_head();
-        let shorter = vec![HeadChunk::Text(tokens(500..506)), media_chunk()];
-        assert_eq!(
-            mismatch(&head, &shorter, &[image(b"a")]),
-            Some(HeadMismatch::ChunkShape)
-        );
-
-        // A rewrite that happens to render to the same token count is caught by
-        // the same check, and only because chunks are compared token for token.
-        // Catching it is what keeps the resume from attending to a preamble the
-        // prompt no longer contains.
-        let same_length = vec![HeadChunk::Text(tokens(500..510)), media_chunk()];
-        assert_eq!(incoming_head_pos(&same_length), head.n_pos);
-        assert_eq!(
-            mismatch(&head, &same_length, &[image(b"a")]),
-            Some(HeadMismatch::ChunkShape)
-        );
-    }
-
-    #[test]
-    fn media_head_rejects_a_recorded_size_that_disagrees_with_its_chunks() {
-        // Deliberately not an input mtmd can produce: `head_pos` is the sum over
-        // exactly these chunks on both sides, so an identical chunk list always
-        // means an identical position count. This is the tripwire for a
-        // `MediaHead` built with an `n_pos` that does not describe its own
-        // chunks — the one state in which a matching head would resume the
-        // decode at the wrong absolute position.
-        let mut head = one_image_head();
-        head.n_pos += 1;
-        let same = head.chunks.clone();
-        assert_eq!(
-            mismatch(&head, &same, &[image(b"a")]),
-            Some(HeadMismatch::Positions)
-        );
-    }
-
     // --- the bound that keeps the token ledger and the KV cache in step ---
 
     #[test]
-    fn kept_prefix_tokens_counts_from_the_end_of_the_media_head() {
-        assert_eq!(kept_prefix_tokens(1040, 1000, 52, 90), Some(40));
-        // Text-only cache: the resume position is the kept count.
-        assert_eq!(kept_prefix_tokens(900, 0, 1000, 1000), Some(900));
-    }
-
-    #[test]
-    fn kept_prefix_tokens_refuses_a_resume_inside_the_media_head() {
-        assert_eq!(kept_prefix_tokens(999, 1000, 90, 90), None);
+    fn kept_prefix_tokens_is_the_resume_position() {
+        assert_eq!(kept_prefix_tokens(900, 1000, 1000), Some(900));
     }
 
     #[test]
     fn kept_prefix_tokens_refuses_a_resume_past_the_incoming_prompt() {
-        assert_eq!(kept_prefix_tokens(1050, 1000, 40, 90), None);
+        assert_eq!(kept_prefix_tokens(50, 40, 90), None);
     }
 
     #[test]
@@ -5545,67 +4869,16 @@ pub(super) mod tests {
         // The bound that matters most: `Vec::truncate` past the end is a silent
         // no-op, so allowing this would leave the ledger claiming tokens at
         // positions `clear_kv_cache_seq` had just removed.
-        assert_eq!(kept_prefix_tokens(1090, 1000, 200, 80), None);
+        assert_eq!(kept_prefix_tokens(90, 200, 80), None);
         // Exactly at the end of the tail is fine — nothing is dropped.
-        assert_eq!(kept_prefix_tokens(1080, 1000, 200, 80), Some(80));
+        assert_eq!(kept_prefix_tokens(80, 200, 80), Some(80));
     }
 
     #[test]
-    fn prefill_plan_resumes_at_an_absolute_position_behind_a_media_head() {
-        // Turn 2 of an image conversation: the head and the first 40 tail tokens
-        // are already in the cache, so decode resumes at 1000 + 40.
-        let cached = tokens(0..90);
-        let prompt = diverging_prompt(40, 12);
-        assert_eq!(
-            prefill_plan(
-                Some(retained_behind_media(1000, &cached, 4096)),
-                &prompt,
-                4096
-            ),
-            PrefillPlan::ReusePrefix(1040)
-        );
-    }
-
-    #[test]
-    fn a_media_head_alone_can_carry_the_prompt_over_the_reuse_threshold() {
-        // Only two tail tokens match, but they sit behind 900 positions of image
-        // that would otherwise be re-encoded and re-prefilled from scratch.
-        let cached = tokens(0..80);
-        let prompt = diverging_prompt(2, 30);
-        assert_eq!(
-            prefill_plan(
-                Some(retained_behind_media(900, &cached, 4096)),
-                &prompt,
-                4096
-            ),
-            PrefillPlan::ReusePrefix(902)
-        );
-    }
-
-    #[test]
-    fn a_media_head_too_short_to_reach_the_threshold_does_not_reuse() {
-        // The head is real but small, and the tail shares nothing with it, so
-        // the resume position stays under REUSE_MIN. Sized so the cache is not
-        // worth sacrificing for either, which isolates the threshold.
-        let cached = tokens(0..80);
-        let prompt = diverging_prompt(0, 180);
-        assert_eq!(
-            prefill_plan(
-                Some(retained_behind_media(100, &cached, 4096)),
-                &prompt,
-                4096
-            ),
-            PrefillPlan::FullPrefillInPlace
-        );
-    }
-
-    #[test]
-    fn a_media_cache_the_prompt_cannot_reproduce_offers_no_tokens() {
-        // What `RetainedPrefix::opaque` produces: a text-only prompt facing a
-        // media cache. The tail tokens must not be matched against it, because
-        // they sit at positions the text prompt would not put them at.
+    fn a_cache_that_opens_with_another_picture_offers_no_tokens() {
+        // What `RetainedPrefix::serving` produces when the cache's first picture is not the
+        // prompt's: nothing behind it is the prompt's either.
         let opaque = RetainedPrefix {
-            media_pos: 0,
             tokens: &[],
             occupied: 3000,
             n_ctx: 4096,
@@ -5680,10 +4953,9 @@ pub(super) mod tests {
     #[test]
     fn a_side_call_is_sacrificed_against_the_positions_a_media_cache_occupies() {
         // The memory-extraction interleave, now against an image conversation.
-        // `occupied` counts the media head, so the expensive cache is protected
-        // even though its recorded token tail is short.
+        // `occupied` counts everything the cache holds, so the expensive cache is
+        // protected even though none of it serves this prompt.
         let opaque = RetainedPrefix {
-            media_pos: 0,
             tokens: &[],
             occupied: 3000,
             n_ctx: 4096,
@@ -5706,46 +4978,6 @@ pub(super) mod tests {
         assert_eq!(
             prefill_plan(Some(ret), &large_side_call, 4096),
             PrefillPlan::SacrificialContext
-        );
-    }
-
-    #[test]
-    fn a_media_cache_of_a_different_window_is_rebuilt() {
-        let cached = tokens(0..90);
-        let prompt = diverging_prompt(40, 12);
-        assert_eq!(
-            prefill_plan(
-                Some(retained_behind_media(1000, &cached, 2048)),
-                &prompt,
-                4096
-            ),
-            PrefillPlan::CreateContext
-        );
-    }
-
-    #[test]
-    fn reuse_behind_a_media_head_always_leaves_a_token_to_decode() {
-        // The tail is fully cached. llama.cpp still needs a non-empty batch for
-        // logits, so the last tail token is re-decoded.
-        let cached = tokens(0..90);
-        let prompt = tokens(0..90);
-        assert_eq!(
-            prefill_plan(
-                Some(retained_behind_media(1000, &cached, 4096)),
-                &prompt,
-                4096
-            ),
-            PrefillPlan::ReusePrefix(1089)
-        );
-    }
-
-    #[test]
-    fn an_empty_tail_behind_a_media_head_is_never_reused() {
-        // No token left to decode means no logits, so the prompt has to be
-        // rebuilt rather than resumed at the end of the head.
-        assert_eq!(
-            prefill_plan(Some(retained_behind_media(1000, &[], 4096)), &[], 4096),
-            PrefillPlan::FullPrefillInPlace
         );
     }
 }

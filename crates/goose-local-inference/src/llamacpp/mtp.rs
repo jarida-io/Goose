@@ -657,8 +657,8 @@ mod tests {
         .find(|p| p.is_file())
     }
 
-    /// Two seconds of a rising tone as a 16 kHz mono WAV.
-    fn tone_wav() -> Vec<u8> {
+    /// Two seconds of a tone rising from `base_hz` as a 16 kHz mono WAV.
+    fn tone_wav(base_hz: f32) -> Vec<u8> {
         const RATE: u32 = 16_000;
         let samples = RATE * 2;
         let data_len = samples * 2;
@@ -677,14 +677,14 @@ mod tests {
         wav.extend_from_slice(&data_len.to_le_bytes());
         for i in 0..samples {
             let t = i as f32 / RATE as f32;
-            let sample = (std::f32::consts::TAU * (220.0 + 220.0 * t) * t).sin() * 12_000.0;
+            let sample = (std::f32::consts::TAU * (base_hz + base_hz * t) * t).sin() * 12_000.0;
             wav.extend_from_slice(&(sample as i16).to_le_bytes());
         }
         wav
     }
 
     /// A colour gradient as an uncompressed 24-bit BMP, which stb reads.
-    fn gradient_bmp() -> Vec<u8> {
+    fn gradient_bmp(blue: u8) -> Vec<u8> {
         const SIDE: u32 = 96;
         let size = 54 + SIDE * SIDE * 3;
         let mut bmp = Vec::with_capacity(size as usize);
@@ -700,7 +700,7 @@ mod tests {
         bmp.extend_from_slice(&[0u8; 24]);
         for y in 0..SIDE {
             for x in 0..SIDE {
-                bmp.extend_from_slice(&[(x * 255 / SIDE) as u8, (y * 255 / SIDE) as u8, 128]);
+                bmp.extend_from_slice(&[blue, (y * 255 / SIDE) as u8, (x * 255 / SIDE) as u8]);
             }
         }
         bmp
@@ -750,15 +750,30 @@ mod tests {
         drafted: usize,
         accepted: usize,
         tok_per_sec: f64,
+        next: NextTurn,
+    }
+
+    /// The turn after a media turn, which adds a second picture or recording.
+    struct NextTurn {
+        fresh: Vec<LlamaToken>,
+        resumed: Vec<LlamaToken>,
+        /// Where the first picture or recording ends in the prompt.
+        first_media_end: usize,
+        reused: usize,
+        /// Media positions the resumed turn put through the encoder.
+        evaluated_media: usize,
+        new_media: usize,
     }
 
     /// A media prompt drafts like a text one: the drafter shares the target's cache and works from
     /// a position, so the reply's token IDs must be the target's own whether the prompt was
-    /// evaluated into an empty cache or resumed behind a text turn that already drafted.
+    /// evaluated into an empty cache or resumed behind a text turn that already drafted. And a
+    /// turn that adds a picture or recording pays for that one alone.
     #[test]
     #[ignore = "requires a real target GGUF, its MTP drafter and its encoder; run with --ignored"]
     fn a_media_prompt_drafts_to_the_reply_the_target_gives_alone() {
         use crate::llamacpp::inference_engine::{decode_tokens_for_test, prefill_media_for_test};
+        use crate::llamacpp::media_ledger::is_stand_in;
         use crate::llamacpp::LlamaCppBackend;
         use crate::multimodal::ExtractedMedia;
 
@@ -826,21 +841,41 @@ mod tests {
             "{preamble}<start_of_turn>user\n{marker}\nDescribe this in one sentence.<end_of_turn>\n<start_of_turn>model\n"
         );
 
-        let run = |media: &[ExtractedMedia],
+        let piece_of = |tokens: &[LlamaToken]| {
+            let mut decoder = encoding_rs::UTF_8.new_decoder();
+            tokens
+                .iter()
+                .map(|token| {
+                    model
+                        .token_to_piece(*token, &mut decoder, true, None)
+                        .expect("a piece")
+                })
+                .collect::<String>()
+        };
+        let media_positions =
+            |ledger: &[LlamaToken]| ledger.iter().filter(|t| is_stand_in(**t)).count();
+
+        let run = |media: &[ExtractedMedia; 2],
                    draft: Option<&Arc<llama_cpp_2::model::LlamaModel>>| {
+            let prefill =
+                |session: &mut Option<SessionKv>, prompt: &str, media: &[ExtractedMedia]| {
+                    prefill_media_for_test(
+                        session, &model, draft, &encoder, backend, prompt, media, &settings,
+                    )
+                    .expect("media prefill")
+                };
+            let first = &media[..1];
+
             let mut fresh_session = None;
-            let (count, _) = prefill_media_for_test(
-                &mut fresh_session,
+            let (ledger, _, _) = prefill(&mut fresh_session, &media_turn, first);
+            let fresh = reply(
                 &model,
-                draft,
-                &encoder,
-                backend,
-                &media_turn,
-                media,
+                &mut fresh_session,
                 &settings,
-            )
-            .expect("media prefill into an empty cache");
-            let fresh = reply(&model, &mut fresh_session, &settings, &[], count, 48);
+                &ledger,
+                ledger.len(),
+                48,
+            );
             drop(fresh_session);
 
             let mut session =
@@ -855,17 +890,7 @@ mod tests {
                 text_tokens.len(),
                 24,
             );
-            let (count, reused) = prefill_media_for_test(
-                &mut session,
-                &model,
-                draft,
-                &encoder,
-                backend,
-                &media_turn,
-                media,
-                &settings,
-            )
-            .expect("media prefill behind the text turn");
+            let (ledger, reused, _) = prefill(&mut session, &media_turn, first);
             let before = draft_counts(&mut session);
             assert_eq!(
                 before.is_some(),
@@ -873,11 +898,42 @@ mod tests {
                 "the media turn's cache has a drafter exactly when one was supplied"
             );
             let started = std::time::Instant::now();
-            let resumed = reply(&model, &mut session, &settings, &[], count, 48);
+            let resumed = reply(&model, &mut session, &settings, &ledger, ledger.len(), 48);
             let secs = started.elapsed().as_secs_f64().max(1e-3);
             let stats = before
                 .zip(draft_counts(&mut session))
                 .map(|(before, after)| after.since(before, resumed.len()));
+
+            let next_turn = format!(
+                "{media_turn}{}<end_of_turn>\n<start_of_turn>user\n{marker}\nAnd this one, in one sentence?<end_of_turn>\n<start_of_turn>model\n",
+                piece_of(&resumed)
+            );
+            let (next_ledger, next_reused, evaluated_media) =
+                prefill(&mut session, &next_turn, media);
+            let next_resumed = reply(
+                &model,
+                &mut session,
+                &settings,
+                &next_ledger,
+                next_ledger.len(),
+                32,
+            );
+            drop(session);
+            let mut fresh_session = None;
+            let (fresh_ledger, _, _) = prefill(&mut fresh_session, &next_turn, media);
+            assert_eq!(
+                fresh_ledger, next_ledger,
+                "one prompt was laid out two ways"
+            );
+            let next_fresh = reply(
+                &model,
+                &mut fresh_session,
+                &settings,
+                &fresh_ledger,
+                fresh_ledger.len(),
+                32,
+            );
+
             MediaRun {
                 tok_per_sec: resumed.len() as f64 / secs,
                 text_reply,
@@ -886,31 +942,46 @@ mod tests {
                 reused,
                 drafted: stats.as_ref().map_or(0, |s| s.draft_tokens),
                 accepted: stats.as_ref().map_or(0, |s| s.accepted_tokens),
+                next: NextTurn {
+                    fresh: next_fresh,
+                    resumed: next_resumed,
+                    first_media_end: ledger.len()
+                        - ledger
+                            .iter()
+                            .rev()
+                            .position(|t| is_stand_in(*t))
+                            .unwrap_or(0),
+                    reused: next_reused,
+                    evaluated_media,
+                    new_media: media_positions(&next_ledger) - media_positions(&ledger),
+                },
             }
         };
 
-        for (what, item) in [
-            (
-                "recording",
-                ExtractedMedia {
-                    bytes: tone_wav(),
-                    audio: true,
-                },
-            ),
-            (
-                "picture",
-                ExtractedMedia {
-                    bytes: gradient_bmp(),
-                    audio: false,
-                },
-            ),
+        let recording = |base_hz| ExtractedMedia {
+            bytes: tone_wav(base_hz),
+            audio: true,
+        };
+        let picture = |blue| ExtractedMedia {
+            bytes: gradient_bmp(blue),
+            audio: false,
+        };
+        for (what, media) in [
+            ("recording", [recording(220.0), recording(330.0)]),
+            ("picture", [picture(128), picture(16)]),
         ] {
-            let media = [item];
             let plain = run(&media, None);
             let spec = run(&media, Some(&drafter));
             eprintln!(
                 "{what}: plain {:.1} tok/s, drafting {:.1} tok/s ({}/{} drafts kept), {} prompt tokens reused behind the text turn",
                 plain.tok_per_sec, spec.tok_per_sec, spec.accepted, spec.drafted, spec.reused
+            );
+            eprintln!(
+                "{what}: the next turn reused {} tokens (the first {what} ends at {}) and encoded {} of its media positions, {} of them new",
+                spec.next.reused,
+                spec.next.first_media_end,
+                spec.next.evaluated_media,
+                spec.next.new_media
             );
 
             assert!(!plain.fresh.is_empty() && !plain.resumed.is_empty());
@@ -932,6 +1003,23 @@ mod tests {
                 plain.resumed, spec.resumed,
                 "a {what} resumed behind a text turn drafted to a different reply"
             );
+            for (how, run) in [("plain", &plain), ("drafting", &spec)] {
+                let next = &run.next;
+                assert!(
+                    next.reused >= next.first_media_end,
+                    "{how}: the turn after a {what} did not keep it (reused {}, it ends at {})",
+                    next.reused,
+                    next.first_media_end
+                );
+                assert_eq!(
+                    next.evaluated_media, next.new_media,
+                    "{how}: the turn after a {what} encoded more than the one it added"
+                );
+                assert_eq!(
+                    next.fresh, next.resumed,
+                    "{how}: a second {what} behind a kept one read differently from a rebuild"
+                );
+            }
         }
     }
 
