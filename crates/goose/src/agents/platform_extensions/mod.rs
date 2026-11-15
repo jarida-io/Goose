@@ -272,7 +272,9 @@ impl PlatformExtensionContext {
                 }
             }
         } else {
-            result.meta = Some(rmcp::model::Meta(meta_value.as_object().unwrap().clone()));
+            result.meta = Some(rmcp::model::MetaObject(
+                meta_value.as_object().unwrap().clone(),
+            ));
         }
 
         result

@@ -50,7 +50,7 @@ use crate::prompt_template;
 use crate::subprocess::configure_subprocess;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, GetPromptResult,
-    Meta, Prompt, Resource, ResourceContents, ServerInfo, Tool,
+    MetaObject, Prompt, Resource, ResourceContents, ServerConfig, Tool,
 };
 use rmcp::transport::auth::{AuthClient, CredentialStore};
 use schemars::_private::NoSerialize;
@@ -124,7 +124,7 @@ struct Extension {
     resolved_config: ExtensionConfig,
 
     client: McpClientBox,
-    server_info: Option<ServerInfo>,
+    server_info: Option<ServerConfig>,
     _temp_dir: Option<tempfile::TempDir>,
 }
 
@@ -133,7 +133,7 @@ impl Extension {
         config: ExtensionConfig,
         resolved_config: ExtensionConfig,
         client: McpClientBox,
-        server_info: Option<ServerInfo>,
+        server_info: Option<ServerConfig>,
         temp_dir: Option<tempfile::TempDir>,
     ) -> Self {
         Self {
@@ -364,7 +364,7 @@ fn insert_trusted_tool_update_meta(
         TRUSTED_TOOL_UPDATE_META_KEY.to_string(),
         Value::Object(trusted_meta),
     );
-    result.meta = Some(Meta(meta_map));
+    result.meta = Some(MetaObject(meta_map));
 }
 
 fn is_unprefixed_extension(config: &ExtensionConfig) -> bool {
@@ -1220,7 +1220,7 @@ impl ExtensionManager {
         name: String,
         config: ExtensionConfig,
         client: McpClientBox,
-        info: Option<ServerInfo>,
+        info: Option<ServerConfig>,
         temp_dir: Option<TempDir>,
     ) {
         let normalized = name_to_key(&name);
@@ -1461,7 +1461,7 @@ impl ExtensionManager {
                             );
 
                             tool.name = public_name.into();
-                            tool.meta = Some(rmcp::model::Meta(meta_map));
+                            tool.meta = Some(rmcp::model::MetaObject(meta_map));
 
                             tools.push(tool);
                         }
@@ -2208,41 +2208,37 @@ mod tests {
         ) -> Result<ListToolsResult, Error> {
             use serde_json::json;
             use std::sync::Arc;
-            Ok(ListToolsResult {
-                tools: vec![
-                    Tool::new(
-                        "tool".to_string(),
-                        "A basic tool".to_string(),
+            Ok(ListToolsResult::with_all_items(vec![
+                Tool::new(
+                    "tool".to_string(),
+                    "A basic tool".to_string(),
+                    Arc::new(json!({}).as_object().unwrap().clone()),
+                ),
+                Tool::new(
+                    "available_tool".to_string(),
+                    "An available tool".to_string(),
+                    Arc::new(json!({}).as_object().unwrap().clone()),
+                ),
+                Tool::new(
+                    "hidden_tool".to_string(),
+                    "hidden tool".to_string(),
+                    Arc::new(json!({}).as_object().unwrap().clone()),
+                ),
+                {
+                    let mut t = Tool::new(
+                        "render_chart".to_string(),
+                        "Render a chart".to_string(),
                         Arc::new(json!({}).as_object().unwrap().clone()),
-                    ),
-                    Tool::new(
-                        "available_tool".to_string(),
-                        "An available tool".to_string(),
-                        Arc::new(json!({}).as_object().unwrap().clone()),
-                    ),
-                    Tool::new(
-                        "hidden_tool".to_string(),
-                        "hidden tool".to_string(),
-                        Arc::new(json!({}).as_object().unwrap().clone()),
-                    ),
-                    {
-                        let mut t = Tool::new(
-                            "render_chart".to_string(),
-                            "Render a chart".to_string(),
-                            Arc::new(json!({}).as_object().unwrap().clone()),
-                        );
-                        t.meta = Some(Meta(
-                            json!({ "ui": { "resourceUri": "ui://autovisualiser/chart" } })
-                                .as_object()
-                                .unwrap()
-                                .clone(),
-                        ));
-                        t
-                    },
-                ],
-                next_cursor: None,
-                meta: None,
-            })
+                    );
+                    t.meta = Some(MetaObject(
+                        json!({ "ui": { "resourceUri": "ui://autovisualiser/chart" } })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ));
+                    t
+                },
+            ]))
         }
 
         async fn call_tool(
@@ -2744,22 +2740,18 @@ mod tests {
         ) -> Result<ListToolsResult, Error> {
             use serde_json::json;
             use std::sync::Arc;
-            Ok(ListToolsResult {
-                tools: vec![
-                    Tool::new(
-                        "db.query".to_string(),
-                        "A tool with a dotted name".to_string(),
-                        Arc::new(json!({}).as_object().unwrap().clone()),
-                    ),
-                    Tool::new(
-                        "db__query".to_string(),
-                        "A sibling with the separator name".to_string(),
-                        Arc::new(json!({}).as_object().unwrap().clone()),
-                    ),
-                ],
-                next_cursor: None,
-                meta: None,
-            })
+            Ok(ListToolsResult::with_all_items(vec![
+                Tool::new(
+                    "db.query".to_string(),
+                    "A tool with a dotted name".to_string(),
+                    Arc::new(json!({}).as_object().unwrap().clone()),
+                ),
+                Tool::new(
+                    "db__query".to_string(),
+                    "A sibling with the separator name".to_string(),
+                    Arc::new(json!({}).as_object().unwrap().clone()),
+                ),
+            ]))
         }
 
         async fn call_tool(
@@ -2905,7 +2897,7 @@ mod tests {
     #[test]
     fn test_remove_untrusted_mcp_app_meta_strips_spoofed_payload() {
         let mut result = CallToolResult::success(vec![]);
-        result.meta = Some(Meta(
+        result.meta = Some(MetaObject(
             serde_json::from_value(serde_json::json!({
                 "goose": {
                     "mcpApp": {

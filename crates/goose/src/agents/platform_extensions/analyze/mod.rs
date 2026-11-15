@@ -229,11 +229,7 @@ impl McpClientTrait for AnalyzeClient {
             Some(false),
         ));
 
-        Ok(ListToolsResult {
-            tools: vec![tool],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![tool]))
     }
 
     async fn call_tool(

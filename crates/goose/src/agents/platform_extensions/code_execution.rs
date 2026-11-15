@@ -556,11 +556,7 @@ impl McpClientTrait for CodeExecutionClient {
             }
         };
 
-        Ok(ListToolsResult {
-            meta: None,
-            next_cursor: None,
-            tools,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(

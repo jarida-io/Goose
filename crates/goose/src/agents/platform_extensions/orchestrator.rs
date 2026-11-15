@@ -622,11 +622,7 @@ impl McpClientTrait for OrchestratorClient {
             ),
         ];
 
-        Ok(ListToolsResult {
-            tools,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
