@@ -41,9 +41,14 @@ pub enum ModelLoadError {
         needed_mb: u64,
         free_mb: u64,
     },
+    /// Memory is too short to load the multimodal encoder a call's recording or picture needs,
+    /// with the reserve kept for the reply after it. Nothing is wrong with the media or the
+    /// encoder: the same call fits once memory comes back or the call needs fewer towers.
+    NoRoomForEncoder { needed_mb: u64, available_mb: u64 },
 }
 
 const OUT_OF_GPU_MEMORY: &str = "out of GPU memory for the ";
+const NO_ROOM_FOR_ENCODER: &str = "no room for the multimodal encoder";
 const NEEDS: &str = ": needs about ";
 const MIB_COMMA: &str = " MiB, ";
 const MIB_FREE: &str = " MiB free";
@@ -59,6 +64,13 @@ impl fmt::Display for ModelLoadError {
                 f,
                 "{OUT_OF_GPU_MEMORY}{}{NEEDS}{needed_mb}{MIB_COMMA}{free_mb}{MIB_FREE}",
                 stage.as_str()
+            ),
+            Self::NoRoomForEncoder {
+                needed_mb,
+                available_mb,
+            } => write!(
+                f,
+                "{NO_ROOM_FOR_ENCODER}{NEEDS}{needed_mb}{MIB_COMMA}{available_mb}{MIB_FREE}"
             ),
         }
     }
@@ -82,6 +94,14 @@ impl ModelLoadError {
     }
 
     fn parse(text: &str) -> Option<Self> {
+        if let Some(rest) = text.strip_prefix(NO_ROOM_FOR_ENCODER) {
+            let (needed, rest) = rest.strip_prefix(NEEDS)?.split_once(MIB_COMMA)?;
+            let available = rest.strip_suffix(MIB_FREE)?;
+            return Some(Self::NoRoomForEncoder {
+                needed_mb: needed.parse().ok()?,
+                available_mb: available.parse().ok()?,
+            });
+        }
         let rest = text.strip_prefix(OUT_OF_GPU_MEMORY)?;
         let (stage, rest) = [LoadStage::Weights, LoadStage::Context]
             .into_iter()
@@ -129,6 +149,20 @@ mod tests {
             error.to_string(),
             "out of GPU memory for the context: needs about 1664 MiB, 251 MiB free"
         );
+    }
+
+    #[test]
+    fn no_room_for_the_encoder_survives_the_provider_boundary() {
+        let error = ModelLoadError::NoRoomForEncoder {
+            needed_mb: 1_201,
+            available_mb: 1_021,
+        };
+        assert_eq!(
+            error.to_string(),
+            "no room for the multimodal encoder: needs about 1201 MiB, 1021 MiB free"
+        );
+        let crossed = ProviderError::from(error);
+        assert_eq!(ModelLoadError::from_provider_error(&crossed), Some(error));
     }
 
     #[test]

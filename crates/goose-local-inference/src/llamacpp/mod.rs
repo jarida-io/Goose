@@ -928,19 +928,21 @@ impl LlamaCppBackend {
         let freed = loaded.encoder.as_ref().map_or(0, |e| e.bytes);
         if let Some(info) = MemInfo::read().filter(|_| self.memory.unified_memory) {
             if !encoder_fits(info.available, bytes, freed) {
+                let available_mb = info.available.saturating_add(freed) / MIB;
+                let needed_mb = bytes.saturating_add(ENCODER_LOAD_RESERVE_BYTES) / MIB;
                 tracing::warn!(
                     target: "giap::trace",
                     kind = "encoder_load_refused",
-                    available_mb = info.available.saturating_add(freed) / MIB,
-                    needed_mb = bytes.saturating_add(ENCODER_LOAD_RESERVE_BYTES) / MIB,
+                    available_mb,
+                    needed_mb,
                     file = %file.display(),
                     "too little memory is available to load the multimodal encoder"
                 );
-                return Err(ProviderError::ExecutionError(
-                    "Too little memory is free right now to take in this message's recording or \
-                     picture. Try again in a moment."
-                        .to_string(),
-                ));
+                return Err(crate::load_error::ModelLoadError::NoRoomForEncoder {
+                    needed_mb,
+                    available_mb,
+                }
+                .into());
             }
         }
         if loaded.encoder.is_some() {
