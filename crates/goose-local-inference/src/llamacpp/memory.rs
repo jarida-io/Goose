@@ -535,10 +535,10 @@ pub(super) fn kv_geometry(
 /// A GGUF file's metadata, read with ggml's own reader (`gguf_init_from_file` with no tensor
 /// data); freed on drop. Every getter checks the stored type first, since ggml aborts the
 /// process on a getter of the wrong type.
-struct GgufHeader(std::ptr::NonNull<llama_cpp_sys_2::gguf_context>);
+pub(super) struct GgufHeader(std::ptr::NonNull<llama_cpp_sys_2::gguf_context>);
 
 impl GgufHeader {
-    fn open(path: &Path) -> Result<Self, String> {
+    pub(super) fn open(path: &Path) -> Result<Self, String> {
         let name = path
             .to_str()
             .and_then(|p| std::ffi::CString::new(p).ok())
@@ -573,7 +573,7 @@ impl GgufHeader {
     }
 
     /// An unsigned or non-negative integer scalar.
-    fn uint(&self, key: &str) -> Option<u64> {
+    pub(super) fn uint(&self, key: &str) -> Option<u64> {
         use llama_cpp_sys_2 as sys;
         let (id, kind) = self.find(key)?;
         let ctx = self.ctx();
@@ -591,7 +591,7 @@ impl GgufHeader {
         }
     }
 
-    fn string(&self, key: &str) -> Option<String> {
+    pub(super) fn string(&self, key: &str) -> Option<String> {
         let (id, kind) = self.find(key)?;
         (kind == llama_cpp_sys_2::GGUF_TYPE_STRING).then(|| {
             // SAFETY: a string-typed key; ggml returns a NUL-terminated string the context owns.
@@ -648,6 +648,42 @@ impl GgufHeader {
             _ => None,
         }
     }
+}
+
+impl GgufHeader {
+    /// Every tensor's name, ggml type name, stored bytes and bits per value, from the header's
+    /// tensor table; no tensor data is read.
+    pub(super) fn tensors(&self) -> Vec<GgufTensor> {
+        use llama_cpp_sys_2 as sys;
+        let ctx = self.ctx();
+        // SAFETY: a live context; every id below is within `gguf_get_n_tensors`, and ggml's type
+        // name, size and block functions take any type the header stores.
+        unsafe {
+            (0..sys::gguf_get_n_tensors(ctx))
+                .map(|id| {
+                    let ggml_type = sys::gguf_get_tensor_type(ctx, id);
+                    let block = sys::ggml_blck_size(ggml_type).max(1);
+                    GgufTensor {
+                        name: std::ffi::CStr::from_ptr(sys::gguf_get_tensor_name(ctx, id))
+                            .to_string_lossy()
+                            .into_owned(),
+                        type_name: std::ffi::CStr::from_ptr(sys::ggml_type_name(ggml_type))
+                            .to_string_lossy()
+                            .into_owned(),
+                        bytes: sys::gguf_get_tensor_size(ctx, id) as u64,
+                        bits_per_value: (sys::ggml_type_size(ggml_type) * 8) as f32 / block as f32,
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
+pub(super) struct GgufTensor {
+    pub name: String,
+    pub type_name: String,
+    pub bytes: u64,
+    pub bits_per_value: f32,
 }
 
 impl Drop for GgufHeader {
@@ -725,7 +761,7 @@ impl KvCost {
 
 /// Bytes per 32 cache elements for a ggml KV type name; f16 when unset or unknown, which is
 /// what `build_context_params` falls back to.
-fn bytes_per_32(type_name: Option<&str>) -> u64 {
+pub(super) fn bytes_per_32(type_name: Option<&str>) -> u64 {
     match type_name.map(str::to_ascii_lowercase).as_deref() {
         Some("f32") => 128,
         Some("q8_0") => 34,

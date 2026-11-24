@@ -436,6 +436,20 @@ pub fn cache_holds_media(files: &[u64]) -> bool {
     llamacpp::cache_holds_media(files)
 }
 
+/// What the backend serving `model_id` makes of it, read from its files and settings without
+/// loading it.
+pub fn model_profile(
+    model_id: &str,
+) -> Result<goose_provider_types::model_profile::ModelProfile, ProviderError> {
+    let resolved = resolve_model_path(model_id)
+        .ok_or_else(|| ProviderError::ExecutionError(format!("Model not found: {model_id}")))?;
+    let runtime = InferenceRuntime::get_or_init()
+        .map_err(|error| ProviderError::ExecutionError(error.to_string()))?;
+    runtime
+        .backend_for_model(&resolved)?
+        .profile(model_id, &resolved)
+}
+
 pub fn available_inference_memory_bytes(runtime: &InferenceRuntime) -> u64 {
     runtime.default_backend().available_memory_bytes()
 }

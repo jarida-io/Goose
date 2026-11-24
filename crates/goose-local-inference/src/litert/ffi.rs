@@ -70,6 +70,9 @@ struct Api {
     loaded_file_has_speculative_decoding_support:
         unsafe extern "C" fn(*const RawLoadedFile, *mut bool) -> Status,
     loaded_file_max_context_tokens: unsafe extern "C" fn(*const RawLoadedFile, *mut u32) -> Status,
+    loaded_file_supports_thinking: unsafe extern "C" fn(*const RawLoadedFile, *mut bool) -> Status,
+    loaded_file_supports_function_calling:
+        unsafe extern "C" fn(*const RawLoadedFile, *mut bool) -> Status,
     engine_settings_create: unsafe extern "C" fn(
         *const c_char,
         *const c_char,
@@ -158,6 +161,8 @@ struct Api {
         Option<unsafe extern "C" fn(*mut RawConversationConfig, bool) -> Status>,
     /// GIAP's additions, when the library is built from giap-main.
     giap: Option<GiapApi>,
+    /// The directory the library was opened from, which holds the GPU accelerators it loads.
+    dir: PathBuf,
     /// Never unloaded: the function pointers above point into it.
     _library: Library,
 }
@@ -210,7 +215,7 @@ impl GiapApi {
 }
 
 macro_rules! resolve_api {
-    ($library:ident; $($field:ident),* $(,)?) => {
+    ($library:ident, $dir:expr; $($field:ident),* $(,)?) => {
         Api {
             $( $field: symbol(&$library, concat!("litert_lm_", stringify!($field)))?, )*
             conversation_config_set_return_error_on_parse_failure: symbol(
@@ -219,6 +224,7 @@ macro_rules! resolve_api {
             )
             .ok(),
             giap: GiapApi::resolve(&$library),
+            dir: $dir,
             _library: $library,
         }
     };
@@ -238,12 +244,15 @@ impl Api {
     /// Runs the library's initialisers; `path` must be a LiteRT-LM C API 1.0.0 build.
     unsafe fn load(path: &Path) -> Result<Self, String> {
         let library = open_library(path).map_err(|error| error.to_string())?;
-        Ok(resolve_api!(library;
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        Ok(resolve_api!(library, dir;
             get_last_error_message,
             loaded_file_create,
             loaded_file_delete,
             loaded_file_has_speculative_decoding_support,
             loaded_file_max_context_tokens,
+            loaded_file_supports_thinking,
+            loaded_file_supports_function_calling,
             engine_settings_create,
             engine_settings_delete,
             engine_settings_set_max_num_tokens,
@@ -433,6 +442,13 @@ fn load_bounded(path: PathBuf) -> Result<Api, ProviderError> {
     }
 }
 
+/// The loaded library's directory, and whether it carries giap-main's prompt-prefill and KV
+/// snapshot calls.
+pub(super) fn library() -> Result<(&'static Path, bool), ProviderError> {
+    let api = api()?;
+    Ok((api.dir.as_path(), api.giap.is_some()))
+}
+
 /// Search order: `GOOSE_LITERT_LIB_DIR`, `<exe dir>/litert-lm`, `<exe dir>`,
 /// then goose's data directory.
 fn library_dirs() -> Vec<PathBuf> {
@@ -515,6 +531,22 @@ impl LoadedFile {
                 self.handle.as_ptr(),
                 &mut supported,
             )
+        };
+        status == STATUS_OK && supported
+    }
+
+    pub(super) fn supports_thinking(&self) -> bool {
+        let mut supported = false;
+        let status = unsafe {
+            (self.api.loaded_file_supports_thinking)(self.handle.as_ptr(), &mut supported)
+        };
+        status == STATUS_OK && supported
+    }
+
+    pub(super) fn supports_function_calling(&self) -> bool {
+        let mut supported = false;
+        let status = unsafe {
+            (self.api.loaded_file_supports_function_calling)(self.handle.as_ptr(), &mut supported)
         };
         status == STATUS_OK && supported
     }

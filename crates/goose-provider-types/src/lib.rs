@@ -8,6 +8,7 @@ pub mod images;
 pub mod json;
 pub(crate) mod mcp_utils;
 pub mod model;
+pub mod model_profile;
 pub mod permission;
 pub mod request_context;
 pub mod request_log;

@@ -267,6 +267,16 @@ mod imp {
         fn available_memory_bytes(&self) -> u64 {
             0
         }
+
+        fn profile(
+            &self,
+            _model_id: &str,
+            _resolved: &ResolvedModelPaths,
+        ) -> Result<goose_provider_types::model_profile::ModelProfile, ProviderError> {
+            Err(ProviderError::ExecutionError(
+                "The MLX backend does not describe its models".to_string(),
+            ))
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -1038,6 +1048,16 @@ mod imp {
 
         fn available_memory_bytes(&self) -> u64 {
             0
+        }
+
+        fn profile(
+            &self,
+            _model_id: &str,
+            _resolved: &ResolvedModelPaths,
+        ) -> Result<goose_provider_types::model_profile::ModelProfile, ProviderError> {
+            Err(ProviderError::ExecutionError(
+                "The MLX backend does not describe its models".to_string(),
+            ))
         }
     }
 }

@@ -14,6 +14,8 @@
 mod convert;
 pub(crate) mod fc_repair;
 mod ffi;
+mod file;
+mod profile;
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -532,6 +534,14 @@ impl LocalInferenceBackend for LiteRtBackend {
 
     fn available_memory_bytes(&self) -> u64 {
         0
+    }
+
+    fn profile(
+        &self,
+        model_id: &str,
+        resolved: &ResolvedModelPaths,
+    ) -> Result<goose_provider_types::model_profile::ModelProfile, ProviderError> {
+        profile::profile(model_id, resolved)
     }
 }
 
