@@ -4,6 +4,7 @@ use std::any::Any;
 use crate::local_model_registry::ModelSettings;
 use goose_provider_types::conversation::message::Message;
 use goose_provider_types::errors::ProviderError;
+use goose_provider_types::model_profile::ModelProfile;
 use goose_provider_types::request_log::RequestLogHandle;
 
 use super::{ResolvedModelPaths, StreamSender};
@@ -80,4 +81,12 @@ pub(super) trait LocalInferenceBackend: Send + Sync {
     ) -> Result<(), ProviderError>;
 
     fn available_memory_bytes(&self) -> u64;
+
+    /// What this backend makes of the model at `resolved`, read from its files and settings
+    /// without loading it.
+    fn profile(
+        &self,
+        model_id: &str,
+        resolved: &ResolvedModelPaths,
+    ) -> Result<ModelProfile, ProviderError>;
 }

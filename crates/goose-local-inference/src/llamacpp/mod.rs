@@ -6,6 +6,7 @@ mod inference_native_tools;
 mod media_ledger;
 mod memory;
 pub(super) mod mtp;
+mod profile;
 mod prompt_snapshot;
 mod written_tool_calls;
 
@@ -1337,6 +1338,14 @@ impl LocalInferenceBackend for LlamaCppBackend {
             self.release_encoder(loaded, "after_media_call", "memory_floor");
         }
         result
+    }
+
+    fn profile(
+        &self,
+        model_id: &str,
+        resolved: &ResolvedModelPaths,
+    ) -> Result<goose_provider_types::model_profile::ModelProfile, ProviderError> {
+        profile::profile(model_id, resolved, &list_llama_ggml_backend_devices())
     }
 
     fn available_memory_bytes(&self) -> u64 {
